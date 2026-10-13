@@ -2046,7 +2046,28 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    { int _irql = xbox_IrqlEnterInterrupt(2); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    {
+        /* RECOMP_DPC_TRACE: DPCs that hold DISPATCH_LEVEL for 5 ms or more
+         * -- every device interrupt waits that long. */
+        static int trace = -1;
+        LARGE_INTEGER t0, t1, f;
+        if (trace < 0)
+            trace = getenv("RECOMP_DPC_TRACE") != NULL;
+        QueryPerformanceCounter(&t0);
+        { int _irql = xbox_IrqlEnterInterrupt(2); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+        if (trace) {
+            static int shown;
+            long us;
+            QueryPerformanceCounter(&t1);
+            QueryPerformanceFrequency(&f);
+            us = (long)((t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart);
+            if (us >= 5000 && shown++ < 60) {
+                fprintf(stderr, "  [DPC] routine %08X (dpc %08X) ran %ld us\n",
+                        routine, dpc_va, us);
+                fflush(stderr);
+            }
+        }
+    }
     return 1;
 }
 

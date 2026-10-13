@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #if defined(_WIN32)
 #include <intrin.h>
+#include <dbghelp.h>
 #endif
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma intrinsic(_ReturnAddress)
@@ -82,6 +83,20 @@ static volatile LONG g_irql_raised_count = 0;
 int xbox_IrqlBlocksInterrupts(void)
 {
     return InterlockedCompareExchange(&g_irql_raised_count, 0, 0) != 0;
+}
+
+/* Threads above DISPATCH_LEVEL: in an ISR, or raised to a device IRQL (as
+ * KeSynchronizeExecution does). This is what masks a device interrupt on the
+ * hardware; DISPATCH_LEVEL holds off DPCs and thread switches, not ISRs.
+ * Gating the APU on the DISPATCH count above kept its interrupt out for as
+ * long as any DPC ran -- D3D's GPU-interrupt DPC loops for 15-180 ms here --
+ * and with the front end trapped waiting on that interrupt, the voice
+ * processor output silence meanwhile: the crackle. */
+static volatile LONG g_irql_device_count = 0;
+
+int xbox_IrqlBlocksDeviceInterrupts(void)
+{
+    return InterlockedCompareExchange(&g_irql_device_count, 0, 0) != 0;
 }
 
 /* The raw depth, for callers that want to report it. A count that only ever
@@ -158,11 +173,28 @@ void xbox_IrqlDumpHolders(void)
             xbox_IrqlRaisedCount(), xbox_IrqlTransitions());
     for (i = 0; i < IRQL_HOLDERS; i++) {
         LONG t = InterlockedCompareExchange(&s_holders[i].tid, 0, 0);
-        if (t)
-            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p, "
+        if (t) {
+            /* The host function too: a delivery thread's guest stack is
+             * fresh, so its guest return address says nothing. */
+            char sb[sizeof(SYMBOL_INFO) + 128];
+            SYMBOL_INFO *sym = (SYMBOL_INFO *)sb;
+            DWORD64 disp = 0;
+            static int sym_ready;
+            if (!sym_ready) {
+                sym_ready = 1;
+                SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                SymInitialize(GetCurrentProcess(), NULL, TRUE);
+            }
+            memset(sb, 0, sizeof sb);
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = 127;
+            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p (%s), "
                     "guest ret %08X (esp %08X)\n",
                     (unsigned long)t, s_holders[i].ra,
+                    SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)s_holders[i].ra,
+                                &disp, sym) ? sym->Name : "?",
                     s_holders[i].guest_ra, s_holders[i].guest_esp);
+        }
     }
     fflush(stderr);
 }
@@ -172,6 +204,15 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     int was = (old_level >= DISPATCH_LEVEL);
     int now = (new_level >= DISPATCH_LEVEL);
     LONG d;
+
+    /* Above DISPATCH_LEVEL -- device IRQLs -- counted on its own; see
+     * xbox_IrqlBlocksDeviceInterrupts. */
+    if ((old_level > DISPATCH_LEVEL) != (new_level > DISPATCH_LEVEL)) {
+        if (new_level > DISPATCH_LEVEL)
+            InterlockedIncrement(&g_irql_device_count);
+        else
+            InterlockedDecrement(&g_irql_device_count);
+    }
 
     if (now == was)
         return;

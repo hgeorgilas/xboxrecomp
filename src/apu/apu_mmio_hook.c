@@ -254,11 +254,92 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
  * Public API (called from VEH in main.c)
  * ============================================================ */
 
+/* RECOMP_APU_SECTL_TRACE: how long the title keeps the sample counter off
+ * (SECTL XCNTMODE 0) -- the voice processor cannot run meanwhile -- and which
+ * host code switched it off and on for the long windows. */
+#include <dbghelp.h>
+static const char *sectl_sym(uint64_t rip, char *buf, size_t n)
+{
+    char sb[sizeof(SYMBOL_INFO) + 128];
+    SYMBOL_INFO *sym = (SYMBOL_INFO *)sb;
+    DWORD64 disp = 0;
+    static int init;
+    if (!init) {
+        init = 1;
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        SymInitialize(GetCurrentProcess(), NULL, TRUE);
+    }
+    memset(sb, 0, sizeof sb);
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+    sym->MaxNameLen = 127;
+    if (SymFromAddr(GetCurrentProcess(), rip, &disp, sym))
+        snprintf(buf, n, "%s+0x%llX", sym->Name, (unsigned long long)disp);
+    else
+        snprintf(buf, n, "%p", (void *)rip);
+    return buf;
+}
+
+static void sectl_trace(PCONTEXT ctx)
+{
+    static int on = -1;
+    static LARGE_INTEGER freq;
+    static int64_t off_t0, last_report, off_total;
+    static uint64_t off_rip;
+    static unsigned hist[5], logged;
+    LARGE_INTEGER q;
+    int64_t now;
+    uint32_t v;
+    if (on < 0) {
+        on = getenv("RECOMP_APU_SECTL_TRACE") != NULL;
+        QueryPerformanceFrequency(&freq);
+    }
+    if (!on)
+        return;
+    QueryPerformanceCounter(&q);
+    now = (int64_t)(q.QuadPart * 1000000 / freq.QuadPart);
+    v = (uint32_t)mcpx_apu_mmio_read(g_apu_state, 0x2000, 4);
+    if (!(v & 0x18)) {
+        if (!off_t0) {
+            off_t0 = now;
+            off_rip = ctx->Rip;
+        }
+    } else if (off_t0) {
+        int64_t dur = now - off_t0;
+        off_total += dur;
+        hist[dur < 1000 ? 0 : dur < 5000 ? 1 : dur < 20000 ? 2 : dur < 100000 ? 3 : 4]++;
+        if (dur >= 5000 && logged++ < 40) {
+            char a[160], b[160];
+            fprintf(stderr, "  [SECTL] off %lld us: off at %s, on at %s\n", (long long)dur,
+                    sectl_sym(off_rip, a, sizeof a), sectl_sym(ctx->Rip, b, sizeof b));
+        }
+        off_t0 = 0;
+    }
+    if (!last_report)
+        last_report = now;
+    if (now - last_report >= 2000000) {
+        fprintf(stderr, "  [SECTL] 2 s: off %lld%% of the time; windows <1ms %u, 1-5ms %u,"
+                " 5-20ms %u, 20-100ms %u, >100ms %u\n",
+                (long long)(off_total * 100 / (now - last_report)),
+                hist[0], hist[1], hist[2], hist[3], hist[4]);
+        memset(hist, 0, sizeof hist);
+        off_total = 0;
+        last_report = now;
+    }
+}
+
 bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                           uint32_t fault_xbox_va, int is_write)
 {
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
+    uint64_t rip = ctx->Rip;
     bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
+
+    if (ok && is_write && mmio_offset == 0x2000) {
+        DWORD64 saved = ctx->Rip;
+        ctx->Rip = rip;
+        sectl_trace(ctx);
+        ctx->Rip = saved;
+    }
 
     /* What the title actually asks the APU for. The DSPs are stubbed here, so
      * a title that waits on one waits forever, and the only way to work out

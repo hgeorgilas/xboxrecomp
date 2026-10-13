@@ -1,4 +1,4 @@
-/*
+﻿/*
  * MCPX APU DSP (GP/EP) - Stub implementation
  *
  * The DSP Global Processor (GP) and Encode Processor (EP) handle effects
@@ -27,8 +27,9 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
-/* ── DSP command doorbell acknowledgement ────────────────────────────────
+/* â”€â”€ DSP command doorbell acknowledgement â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
  *
  * DirectSound does not stop at creating the device. It hands the audio DSP a
  * command block in guest RAM, writes a command word, and spins until the DSP
@@ -199,22 +200,66 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * counts. This is not what a real EP does; it is the cheapest
              * mixdown that stops discarding audio. */
             float left, right;
-            if (mcpx_apu_mixdown_all()) {
-                left = 0.0f;
-                right = 0.0f;
-                for (int b = 0; b < NUM_MIXBINS; ++b) {
-                    if (b & 1) right += mixbins[b][i];
-                    else       left  += mixbins[b][i];
+            {
+                /* RECOMP_APU_BIN_STATS: per-bin RMS and peak, every 2 s. */
+                static int on = -1;
+                static double sq[NUM_MIXBINS];
+                static float pk[NUM_MIXBINS];
+                static unsigned n;
+                if (on < 0)
+                    on = getenv("RECOMP_APU_BIN_STATS") != NULL;
+                if (on) {
+                    for (int b = 0; b < NUM_MIXBINS; ++b) {
+                        float v = mixbins[b][i];
+                        sq[b] += (double)v * v;
+                        if (fabsf(v) > pk[b]) pk[b] = fabsf(v);
+                    }
+                    if (++n == 96000) {
+                        fprintf(stderr, "[APU-BINS]");
+                        for (int b = 0; b < NUM_MIXBINS; ++b)
+                            if (pk[b] > 0)
+                                fprintf(stderr, " %d:%.3f/%.2f", b, sqrt(sq[b] / n), pk[b]);
+                        fprintf(stderr, "\n");
+                        memset(sq, 0, sizeof sq);
+                        memset(pk, 0, sizeof pk);
+                        n = 0;
+                    }
                 }
+            }
+            if (mcpx_apu_mixdown_all()) {
+                /* DirectSound's bin layout, folded to stereo: 0/1 front L/R,
+                 * 2 centre, 3 LFE, 4/5 rear L/R, 6-9 the crosstalk (3D)
+                 * front and rear pairs the GP would filter, 10 the I3DL2
+                 * reverb send, 11 and up effect sends. Sends are inputs to
+                 * DSP effects that do not run here -- each is a copy of a
+                 * signal already in an output bin -- so they stay out:
+                 * summing every even bin left and odd bin right counted
+                 * Spartan's 3D effects one and a half times on the left
+                 * (bins 6 and 10) and once on the right, and combat peaked
+                 * at three times full scale. LFE stays out as a stereo
+                 * downmix leaves it. */
+                const float k = 0.7071f;
+                left  = mixbins[0][i] + mixbins[6][i]
+                      + k * (mixbins[2][i] + mixbins[4][i] + mixbins[8][i]);
+                right = mixbins[1][i] + mixbins[7][i]
+                      + k * (mixbins[2][i] + mixbins[5][i] + mixbins[9][i]);
             } else {
                 left = mixbins[0][i];
                 right = mixbins[1][i];
             }
-            /* Clamp to [-1, 1] range */
-            if (left > 1.0f) left = 1.0f;
-            if (left < -1.0f) left = -1.0f;
-            if (right > 1.0f) right = 1.0f;
-            if (right < -1.0f) right = -1.0f;
+            /* Soft limit rather than clip: linear to 0.8, then a tanh knee
+             * that reaches full scale only asymptotically. A hard clip on a
+             * loud mix is heard as crackle. */
+            {
+                float *ch[2] = { &left, &right };
+                for (int c = 0; c < 2; ++c) {
+                    float v = *ch[c], a = fabsf(v);
+                    if (a > 0.8f) {
+                        a = 0.8f + 0.2f * tanhf((a - 0.8f) / 0.2f);
+                        *ch[c] = v < 0 ? -a : a;
+                    }
+                }
+            }
 
             /* Convert to 16-bit and write (not accumulate) into frame buffer.
              * Each of the 8 sub-frames writes its own 32-sample slice. */

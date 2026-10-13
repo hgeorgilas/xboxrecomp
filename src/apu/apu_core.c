@@ -116,7 +116,7 @@ extern int  xbox_worker_stack_alloc(void);
 extern void xbox_worker_stack_free(int slot);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 extern uint32_t xbox_AllocThreadTib(void);
-extern int xbox_IrqlBlocksInterrupts(void);
+extern int xbox_IrqlBlocksDeviceInterrupts(void);
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
 #if defined(_MSC_VER)
@@ -133,6 +133,10 @@ extern APU_TLS uint32_t g_fs_base;
  * while a guest thread sits at raised IRQL, which is when the single-CPU
  * console could not have taken the interrupt. The routine acknowledges by
  * writing ISTS, which drops the line through update_irq. */
+/* Frames an APU interrupt waited on guest IRQL, and the longest wait, for
+ * the F10 recorder's report. */
+static volatile long g_rec_irq_held, g_rec_irq_held_max;
+
 static void apu_deliver_irq(MCPXAPUState *d)
 {
     static int tib_ready;
@@ -143,8 +147,20 @@ static void apu_deliver_irq(MCPXAPUState *d)
 
     if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
         return;
-    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50)
+    /* Held off only by a device IRQL, as on the hardware: a DPC at
+     * DISPATCH_LEVEL does not mask an interrupt. */
+    if (xbox_IrqlBlocksDeviceInterrupts() && ++held_off <= 50) {
+        g_rec_irq_held++;
+        if ((long)held_off > g_rec_irq_held_max)
+            g_rec_irq_held_max = (long)held_off;
+        if (held_off == 50 && getenv("RECOMP_APU_IRQ_TRACE")) {
+            extern void xbox_IrqlDumpHolders(void);
+            static unsigned dumps;
+            if (dumps++ < 20)
+                xbox_IrqlDumpHolders();
+        }
         return;
+    }
     held_off = 0;
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
@@ -381,6 +397,9 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
  * to capture\audio_NNN.wav, and log what could have made it crackle while
  * it ran -- buffers dropped, underruns, frames the VP did not run. */
 static volatile long g_rec_idle_frames;
+/* Why: counter off, front end trapped, front end halted; and interrupts held
+ * off by guest IRQL (frames waited, longest wait). */
+static volatile long g_rec_idle_off, g_rec_idle_trap, g_rec_idle_halt;
 
 static void rec_audio(const int16_t *buf, int n, int sent)
 {
@@ -408,6 +427,13 @@ static void rec_audio(const int16_t *buf, int n, int sent)
             xa2_take_underruns();               /* start the count afresh */
             underruns = 0;
             idle0 = g_rec_idle_frames;
+            g_rec_idle_off = g_rec_idle_trap = g_rec_idle_halt = 0;
+            g_rec_irq_held = g_rec_irq_held_max = 0;
+            {
+                extern void xbox_InputTakeSlowStats(long *slow, long *max_us);
+                long a, b;
+                xbox_InputTakeSlowStats(&a, &b);
+            }
             fprintf(stderr, "[APU] F10: recording 30 s of audio -> %s\n", path);
         }
     }
@@ -425,9 +451,18 @@ static void rec_audio(const int16_t *buf, int n, int sent)
         fseek(wav, 40, SEEK_SET); fwrite(&bytes, 4, 1, wav);
         fclose(wav);
         wav = NULL;
-        fprintf(stderr, "[APU] audio written to %s: %d buffers dropped, %d"
-                " underruns, %ld idle VP frames\n", path, dropped, underruns,
-                g_rec_idle_frames - idle0);
+        {
+            extern void xbox_InputTakeSlowStats(long *slow, long *max_us);
+            long xi_slow, xi_max;
+            xbox_InputTakeSlowStats(&xi_slow, &xi_max);
+            fprintf(stderr, "[APU] audio written to %s: %d buffers dropped, %d"
+                    " underruns, %ld idle VP frames (counter off %ld, FE trapped %ld,"
+                    " FE halted %ld); APU irq held off %ld frames (longest %ld);"
+                    " XInput calls >= 1 ms: %ld (longest %ld us)\n", path, dropped,
+                    underruns, g_rec_idle_frames - idle0, g_rec_idle_off,
+                    g_rec_idle_trap, g_rec_idle_halt, g_rec_irq_held,
+                    g_rec_irq_held_max, xi_slow, xi_max);
+        }
     }
 }
 
@@ -834,6 +869,12 @@ static void *mcpx_apu_frame_thread(void *arg)
             /* Counted for the F10 recording's summary: an idle frame is
              * 32 samples of silence in the output. */
             g_rec_idle_frames++;
+            if (xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF)
+                g_rec_idle_off++;
+            else if ((fectl & NV_PAPU_FECTL_FEMETHMODE) == NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+                g_rec_idle_trap++;
+            else
+                g_rec_idle_halt++;
             /* Lightweight: just monitor frame (test tone + software mixer) */
             if (getenv("RECOMP_APU_VP_TRACE")) {
                 static unsigned off, trap, halt, n;

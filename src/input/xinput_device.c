@@ -25,6 +25,30 @@
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
 static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
 
+/* Host XInput calls that took a millisecond or more, and the longest, for
+ * the audio recorder's report: a wireless pad can block in these, and the
+ * title calls them from its own threads. */
+static volatile LONG g_xi_slow, g_xi_max_us;
+
+static void xi_timed(LARGE_INTEGER t0)
+{
+    LARGE_INTEGER t1, f;
+    LONG us;
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    us = (LONG)((t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart);
+    if (us >= 1000)
+        InterlockedIncrement(&g_xi_slow);
+    if (us > g_xi_max_us)
+        g_xi_max_us = us;
+}
+
+void xbox_InputTakeSlowStats(long *slow, long *max_us)
+{
+    *slow = InterlockedExchange(&g_xi_slow, 0);
+    *max_us = InterlockedExchange(&g_xi_max_us, 0);
+}
+
 /* ---- keyboard, when there is no pad --------------------------------------
  *
  * A title that waits on PRESS START is unreachable on a machine with no
@@ -141,7 +165,12 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetState(dwPort, &xi_state);
+    {
+        LARGE_INTEGER t0;
+        QueryPerformanceCounter(&t0);
+        result = XInputGetState(dwPort, &xi_state);
+        xi_timed(t0);
+    }
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
         if (dwPort == 0 && keyboard_enabled()) {
@@ -210,16 +239,56 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     return ERROR_SUCCESS;
 }
 
+/* Rumble goes out on its own thread. XInputSetState can block for
+ * milliseconds on a wireless pad, and titles call XInputSetState from the
+ * game loop -- often every frame, with unchanged values. The caller only
+ * records the latest speeds; the thread sends a port's speeds when they
+ * change. */
+static volatile LONG g_rumble[XBOX_MAX_CONTROLLERS];     /* left << 16 | right */
+static HANDLE g_rumble_event;
+
+static DWORD WINAPI rumble_thread(LPVOID unused)
+{
+    LONG sent[XBOX_MAX_CONTROLLERS];
+    DWORD p;
+    (void)unused;
+    for (p = 0; p < XBOX_MAX_CONTROLLERS; p++)
+        sent[p] = -1;
+    for (;;) {
+        WaitForSingleObject(g_rumble_event, INFINITE);
+        for (p = 0; p < XBOX_MAX_CONTROLLERS; p++) {
+            LONG v = g_rumble[p];
+            if (v != sent[p]) {
+                XINPUT_VIBRATION xi_vib;
+                LARGE_INTEGER t0;
+                xi_vib.wLeftMotorSpeed = (WORD)((ULONG)v >> 16);
+                xi_vib.wRightMotorSpeed = (WORD)v;
+                QueryPerformanceCounter(&t0);
+                XInputSetState(p, &xi_vib);
+                xi_timed(t0);
+                sent[p] = v;
+            }
+        }
+    }
+}
+
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 {
-    XINPUT_VIBRATION xi_vib;
+    static volatile LONG started;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
-
-    xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
-    xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
-    return XInputSetState(dwPort, &xi_vib);
+    if (!InterlockedExchange(&started, 1)) {
+        g_rumble_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+        CloseHandle(CreateThread(NULL, 0, rumble_thread, NULL, 0, NULL));
+    }
+    if (!g_rumble_event)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    InterlockedExchange(&g_rumble[dwPort],
+                        (LONG)(((ULONG)pVibration->wLeftMotorSpeed << 16)
+                               | pVibration->wRightMotorSpeed));
+    SetEvent(g_rumble_event);
+    return g_controller_connected[dwPort] ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)

@@ -1677,6 +1677,7 @@ out:
 typedef struct {
     uint64_t hash;
     ID3D11VertexShader *vs;           /* NULL: translation or compile failed */
+    int ui_const;                     /* oPos = r + c[ui_const], or -1 */
 } PgEntry;
 static PgEntry   s_pg[PG_MAX_PROGS];
 static int       s_npg;
@@ -1690,11 +1691,13 @@ typedef struct {
     uint32_t info[4];                 /* stride (float4s), first element */
     int32_t  slot[16][4];             /* attribute -> slot in a vertex, or -1 */
     float    vdef[16][4];             /* value of an absent attribute */
+    float    ui[4];                   /* safe-area fill: x' = (x - ui.x) * ui.z + ui.w */
+    float    ui2[4];                  /* y' = (y - ui2.x) * ui2.z + ui2.w; ui.z 0: off */
 } PgConsts;
 
 static const char k_pg_head[] =
 "cbuffer P : register(b0) { float4 vp; float4 fogp; uint4 info;\n"
-"  int4 slot[16]; float4 vdef[16]; };\n"
+"  int4 slot[16]; float4 vdef[16]; float4 ui; float4 ui2; };\n"
 "cbuffer K : register(b1) { float4 C[192]; };\n"
 "StructuredBuffer<float4> Attr : register(t0);\n"
 "struct VO { float4 p:SV_Position; float4 d0:COLOR0; float4 d1:COLOR1;\n"
@@ -1732,6 +1735,8 @@ static const char k_pg_head[] =
 static const char k_pg_tail[] =
 "  VO r; float w = oPos.w;\n"
 "  if (isinf(w) || isnan(w)) w = 1.0;\n"
+"  if (ui.z != 0) { oPos.x = (oPos.x - ui.x) * ui.z + ui.w;\n"
+"    oPos.y = (oPos.y - ui2.x) * ui2.z + ui2.w; }\n"
 "  float x = oPos.x * vp.x - 1.0, y = 1.0 - oPos.y * vp.y, z = oPos.z * vp.z;\n"
 "  r.p = float4(x * w, y * w, z * w, w);\n"
 "  r.cd = w - 1e-3;\n"
@@ -1739,6 +1744,75 @@ static const char k_pg_tail[] =
 "  r.t0 = o[9]; r.t1 = o[10]; r.t2 = o[11]; r.t3 = o[12];\n"
 "  r.f = fogf(o[5].x);\n"
 "  return r; }\n";
+
+/* The program pg_get last returned. */
+static PgEntry *s_pg_cur;
+
+/* A screen-space program -- one whose last position write is a register plus
+ * a constant, oPos = r + c[N] -- returns N, else -1. Titles draw their 2D
+ * layer (text, HUD, menus) this way, inside a TV title-safe box placed by
+ * that constant; see ui_fill. */
+static int ui_const_of(const char *body)
+{
+    const char *p = NULL, *q = body, *blk, *c;
+    while ((q = strstr(q, "oPos.")) != NULL)
+        p = q++;
+    if (!p)
+        return -1;
+    for (blk = p; blk > body && strncmp(blk, "{ float4 A", 10); blk--)
+        ;
+    if (strncmp(blk, "{ float4 A", 10))
+        return -1;
+    {
+        size_t n = (size_t)(p - blk);
+        char tmp[512];
+        if (n >= sizeof tmp)
+            return -1;
+        memcpy(tmp, blk, n);
+        tmp[n] = 0;
+        if (!strstr(tmp, "m = A + Cc;") || strstr(tmp, "float4 A = C[")
+                || strstr(tmp, "a0") || !(c = strstr(tmp, "float4 Cc = C[")))
+            return -1;
+        return atoi(c + 14);
+    }
+}
+
+/* Safe-area fill. A console title keeps its 2D layer inside the TV's title-
+ * safe area: Spartan lays text out in a 512x448 box and offsets it into the
+ * 640x480 screen with c15 = (63.5, 15.5), which leaves subtitles straddling
+ * the edge of the letterbox bar. On a PC display there is no overscan, so the
+ * box is scaled (uniformly, keeping glyph shapes) to fill the target and
+ * centred -- from whatever the target's size and shape. The offset constant
+ * is recognised by its shape: positive half-pixel x/y margins, zero z/w.
+ * RECOMP_SAFE_AREA_FILL=0 keeps the console layout. */
+static void ui_fill(const PgEntry *e, float W, float H, PgConsts *pg)
+{
+    static int on = -1;
+    const float *c;
+    float ox, oy, bw, bh, sc;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_SAFE_AREA_FILL");
+        on = !v || atoi(v) != 0;
+    }
+    if (!on || !e || e->ui_const < 0)
+        return;
+    c = nv2a_vsh_constant((uint32_t)e->ui_const);
+    ox = c[0] + 0.5f;
+    oy = c[1] + 0.5f;
+    if (c[2] != 0 || c[3] != 0 || ox < 1 || oy < 1
+            || ox != floorf(ox) || oy != floorf(oy)
+            || ox * 4 > W || oy * 4 > H)
+        return;
+    bw = W - 2 * ox;
+    bh = H - 2 * oy;
+    sc = W / bw < H / bh ? W / bw : H / bh;
+    pg->ui[0] = c[0];
+    pg->ui[2] = sc;
+    pg->ui[3] = (W - bw * sc) * 0.5f - 0.5f;
+    pg->ui2[0] = c[1];
+    pg->ui2[2] = sc;
+    pg->ui2[3] = (H - bh * sc) * 0.5f - 0.5f;
+}
 
 static ID3D11VertexShader *pg_get(void)
 {
@@ -1751,19 +1825,25 @@ static ID3D11VertexShader *pg_get(void)
     PgEntry *e;
 
     for (i = 0; i < s_npg; i++)
-        if (s_pg[i].hash == h)
+        if (s_pg[i].hash == h) {
+            s_pg_cur = &s_pg[i];
             return s_pg[i].vs;
+        }
+    s_pg_cur = NULL;
     if (s_npg == PG_MAX_PROGS)
         return NULL;
     e = &s_pg[s_npg++];
     e->hash = h;
     e->vs = NULL;
+    e->ui_const = -1;
+    s_pg_cur = e;
     n = nv2a_vsh_hlsl(body, sizeof body, NULL);
     if (!n) {
         fprintf(stderr, "  [PBGPU] vertex program %016llX not translated;"
                 " it stays on the CPU\n", (unsigned long long)h);
         return NULL;
     }
+    e->ui_const = ui_const_of(body);
     snprintf(full, sizeof full, "%s%s%s", k_pg_head, body, k_pg_tail);
     code = compile(full, "vs_5_0");
     if (code) {
@@ -1945,6 +2025,11 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
         pg.vp[1] = 2.0f * (float)fy / (float)s->h;
     }
     pg.vp[2] = 1.0f / (float)(st->zeta_format == 1 ? 0xFFFFu : 0xFFFFFFu);
+    {
+        uint32_t fx, fy;
+        aa_factor(st, &fx, &fy);
+        ui_fill(s_pg_cur, (float)s->w / (float)fx, (float)s->h / (float)fy, &pg);
+    }
     memcpy(pg.fog, fog, sizeof pg.fog);
     pg.info[0] = stride;
     pg.info[1] = (uint32_t)aoff;
