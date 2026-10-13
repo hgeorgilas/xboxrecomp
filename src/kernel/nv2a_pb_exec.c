@@ -2414,9 +2414,19 @@ static void flip_pace(void)
     LARGE_INTEGER now;
     LONGLONG period;
 
-    if (hz < 0) {
-        const char *e = getenv("RECOMP_FLIP_HZ");
-        hz = e ? atoi(e) : 0;
+    {
+        /* Live: the overlay's frame-rate setting changes it. */
+        extern long xbox_settings_gen(void);
+        static long gen;
+        if (gen != xbox_settings_gen()) {
+            const char *e = getenv("RECOMP_FLIP_HZ");
+            gen = xbox_settings_gen();
+            hz = e ? atoi(e) : 0;
+            next = 0;
+            fprintf(stderr, "  [FLIP] pacing at %d Hz\n", hz);
+        }
+    }
+    if (!freq.QuadPart) {
         QueryPerformanceFrequency(&freq);
         /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: sub-millisecond waits
          * without raising the system timer resolution. */

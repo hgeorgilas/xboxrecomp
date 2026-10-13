@@ -2305,7 +2305,13 @@ static void kernel_vblank_tick(void)
         enabled = getenv("RECOMP_VBLANK") != NULL;
         trace = getenv("RECOMP_VBLANK_TRACE") != NULL;
         QueryPerformanceFrequency(&freq);
-        period = freq.QuadPart / 60;
+        {
+            /* RECOMP_VBLANK_HZ: a display faster than NTSC's 60, for a
+             * title whose frame rate has been raised to match. */
+            const char *hz = getenv("RECOMP_VBLANK_HZ");
+            int n = hz ? atoi(hz) : 60;
+            period = freq.QuadPart / (n >= 30 && n <= 1000 ? n : 60);
+        }
     }
     if (!enabled)
         return;
@@ -7692,8 +7698,31 @@ static VOID CALLBACK bridge_user_apc(ULONG_PTR param)
     uint32_t s_eax = g_eax, s_ecx = g_ecx, s_edx = g_edx, s_esp = g_esp;
     uint32_t s_ebx = g_ebx, s_esi = g_esi, s_edi = g_edi;
 
+    int slot = -1;
+
     if (!fn) fn = recomp_lookup_manual(a->routine);
     if (!fn) fn = recomp_lookup_kernel(a->routine);
+    if (fn && !g_esp) {
+        /* Delivered to a host thread that has never run guest code -- a
+         * thread handle resolving to one of the runtime's own threads. It
+         * has no guest stack (and esp 0 wraps to 0xFFFFFFFC), so lend it
+         * one, and a TIB, rather than fault. */
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [KERNEL] user APC 0x%08X on host thread %lu with no"
+                            " guest stack; running it on a worker stack\n",
+                    a->routine, GetCurrentThreadId());
+        if ((slot = xbox_worker_stack_alloc()) < 0) {
+            free(a);
+            return;
+        }
+        g_esp = XBOX_WORKER_STACK_TOP(slot);
+        if (!g_fs_base) {
+            uint32_t tib = xbox_AllocThreadTib();
+            if (tib)
+                g_fs_base = tib;
+        }
+    }
     if (fn) {
         g_esp -= 4; BRIDGE_MEM32(g_esp) = a->arg3;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = a->arg2;
@@ -7706,6 +7735,8 @@ static VOID CALLBACK bridge_user_apc(ULONG_PTR param)
     }
     g_eax = s_eax; g_ecx = s_ecx; g_edx = s_edx; g_esp = s_esp;
     g_ebx = s_ebx; g_esi = s_esi; g_edi = s_edi;
+    if (slot >= 0)
+        xbox_worker_stack_free(slot);
     free(a);
 }
 

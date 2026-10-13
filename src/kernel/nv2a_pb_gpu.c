@@ -16,6 +16,7 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <dxgi1_5.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -2380,6 +2381,7 @@ static ID3D11VertexShader     *s_blit_vs;
 static ID3D11PixelShader      *s_blit_ps;
 static ID3D11SamplerState     *s_blit_smp;
 static ID3D11Buffer           *s_blit_cb;
+static UINT                    s_swap_flags;   /* ALLOW_TEARING if supported */
 static int                     s_present_state;   /* 0 untried, 1 on, -1 off */
 
 static const char k_blit_vs[] =
@@ -2532,6 +2534,20 @@ static int present_init(HWND hwnd)
     sd.BufferCount = 2;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.Scaling = DXGI_SCALING_NONE;
+    {
+        /* Tearing allowed where the system supports it: a windowed flip
+         * chain otherwise presents at most once per desktop refresh even
+         * with no vsync wait, which held a raised frame rate at 60. */
+        IDXGIFactory5 *f5 = NULL;
+        BOOL allow = FALSE;
+        if (SUCCEEDED(IDXGIFactory2_QueryInterface(fac, &IID_IDXGIFactory5, (void **)&f5))) {
+            if (SUCCEEDED(IDXGIFactory5_CheckFeatureSupport(f5, DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                                            &allow, sizeof allow)) && allow)
+                s_swap_flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+            IDXGIFactory5_Release(f5);
+        }
+        sd.Flags = s_swap_flags;
+    }
     hr = IDXGIFactory2_CreateSwapChainForHwnd(fac, (IUnknown *)s_dev, hwnd, &sd,
                                               NULL, NULL, &s_swap);
     if (SUCCEEDED(hr))   /* the window's own Alt+Enter is not ours to give */
@@ -2591,7 +2607,7 @@ int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height)
         }
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
         if (FAILED(IDXGISwapChain1_ResizeBuffers(s_swap, 0, cw, ch,
-                                                 DXGI_FORMAT_UNKNOWN, 0)))
+                                                 DXGI_FORMAT_UNKNOWN, s_swap_flags)))
             goto out;
         if (FAILED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D,
                                              (void **)&bb)))
@@ -2665,7 +2681,8 @@ int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height)
                 gen = xbox_settings_gen();
                 interval = xbox_setting_int("RECOMP_VSYNC", 0) ? 1 : 0;
             }
-            IDXGISwapChain1_Present(s_swap, interval, 0);
+            IDXGISwapChain1_Present(s_swap, interval,
+                                    interval == 0 && s_swap_flags ? DXGI_PRESENT_ALLOW_TEARING : 0);
         }
     }
 out_ok:
