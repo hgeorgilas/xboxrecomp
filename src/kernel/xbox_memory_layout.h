@@ -197,6 +197,11 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
  * RECOMP_DSP_ACK and RECOMP_PEEK accept. Returns 1 and sets *out on success. */
 int xbox_EvalChain(const char *expr, uint32_t *out);
 
+/* Keep the NV2A interrupt-status registers (PMC_INTR, PCRTC_INTR) from being
+ * acknowledged by the runtime while a vblank is delivered (on = 1), then
+ * release (on = 0). Lapses on its own after 1 ms. */
+void xbox_Nv2aIntrHold(int on);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**

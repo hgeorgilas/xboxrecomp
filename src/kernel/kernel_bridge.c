@@ -2251,36 +2251,88 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* Vblanks delivered so far: the clock behind the display field (port 0x80C0). */
+static volatile LONG g_vblank_count;
+uint32_t xbox_VblankCount(void) { return (uint32_t)g_vblank_count; }
+
+static void kernel_drain_dpcs(void);   /* below: the timer thread runs DPCs */
+extern void xbox_Nv2aIntrHold(int on);
+
 static void kernel_vblank_tick(void)
 {
-    static int enabled = -1;
-    static long long next_ms;
-    long long now;
+    static int enabled = -1, trace;
+    static LARGE_INTEGER freq;
+    static LONGLONG next, period, stat_t0;
+    static unsigned stat_raised, stat_claimed;
+    LARGE_INTEGER now;
+    int due = 0;
 
-    if (enabled < 0)
+    if (enabled < 0) {
         enabled = getenv("RECOMP_VBLANK") != NULL;
+        trace = getenv("RECOMP_VBLANK_TRACE") != NULL;
+        QueryPerformanceFrequency(&freq);
+        period = freq.QuadPart / 60;
+    }
     if (!enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
+    /* An exact 60 Hz off the performance counter, catching up on vblanks
+     * the timer thread was too late for (bounded, so a long stall does not
+     * deliver a burst). This was GetTickCount64 + 16 ms, checked from a
+     * Sleep(10) loop: both run at the 15.6 ms system tick, so it averaged
+     * ~32 Hz in menus -- and a title that times anything by the D3D vblank
+     * count (Spartan's XMV player paces every movie frame on it) ran at
+     * half speed or stopped. */
+    QueryPerformanceCounter(&now);
+    if (!next || now.QuadPart - next > period * 30)
+        next = now.QuadPart;
+    while (now.QuadPart >= next && due < 4) {
+        next += period;
+        due++;
+    }
+    if (!due)
         return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    if (now.QuadPart >= next)
+        next = now.QuadPart + period;   /* still behind after the cap: resync */
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
-
-    {
+    while (due--) {
         static unsigned n;
-        int claimed = kernel_raise_interrupt(NV2A_VECTOR);
-        if (n++ < 3)
+        int claimed;
+        /* Hold the status registers across ISR and DPC (see
+         * xbox_Nv2aIntrHold): the DPC reads them to decide whether this was
+         * a vblank, and the runtime's acknowledger would zero them first. */
+        InterlockedIncrement(&g_vblank_count);
+        xbox_Nv2aIntrHold(1);
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+        claimed = kernel_raise_interrupt(NV2A_VECTOR);
+        kernel_drain_dpcs();      /* the ISR's DPC is what services it */
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) &= ~NV2A_PCRTC_INTR_VBLANK;
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   &= ~NV2A_PMC_INTR_PCRTC;
+        xbox_Nv2aIntrHold(0);
+        stat_raised++;
+        if (claimed > 0)
+            stat_claimed++;
+        if (n++ < 3) {
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
-        fflush(stderr);
+            fflush(stderr);
+        }
+    }
+    if (trace) {
+        if (!stat_t0)
+            stat_t0 = now.QuadPart;
+        if (now.QuadPart - stat_t0 >= freq.QuadPart * 5) {
+            fprintf(stderr, "  [NV2A] vblank: %u raised, %u claimed in 5 s\n",
+                    stat_raised, stat_claimed);
+            fflush(stderr);
+            stat_raised = stat_claimed = 0;
+            stat_t0 = now.QuadPart;
+        }
     }
 }
 
@@ -2569,8 +2621,21 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     for (;;) {
         long long now;
         int i;
-
-        Sleep(10);
+        /* 2 ms on a high-resolution timer. Sleep(10) is a 15.6 ms tick on
+         * Windows, too coarse for a 16.7 ms vblank (and timeBeginPeriod is
+         * ignored without a visible window on Windows 11). */
+        static HANDLE tick;
+        if (!tick)
+            tick = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */,
+                                          TIMER_ALL_ACCESS);
+        if (tick) {
+            LARGE_INTEGER due;
+            due.QuadPart = -20000;                 /* 2 ms, relative */
+            SetWaitableTimer(tick, &due, 0, NULL, NULL, FALSE);
+            WaitForSingleObject(tick, INFINITE);
+        } else {
+            Sleep(10);
+        }
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();

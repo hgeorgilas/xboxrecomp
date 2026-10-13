@@ -934,13 +934,58 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* A vblank in flight (RECOMP_VBLANK).
+ *
+ * The table above zeroes PMC_INTR and PCRTC_INTR because nothing raised GPU
+ * interrupts -- until the kernel's vblank tick did. It sets both, calls the
+ * D3D ISR, and the ISR queues a DPC that reads PMC_INTR to decide what to
+ * service; this thread usually zeroed them first, so the DPC found nothing
+ * and skipped the vblank handler. The D3D vblank count (what
+ * GetDisplayFieldStatus reports, and what Spartan's XMV player paces every
+ * frame on) then advanced at ~2 Hz and movies never showed a frame.
+ *
+ * So the tick holds the two registers while it delivers: from setting the
+ * bits until it has drained the DPC. The hold lapses after 1 ms regardless,
+ * because one DPC path acknowledges by writing 1 to PCRTC_INTR and waiting
+ * for PMC_INTR to drop -- write-1-to-clear on hardware, which plain memory
+ * cannot express, so the clearing has to come from here. */
+static volatile LONGLONG g_nv2a_intr_hold;   /* QPC at hold start, 0 = none */
+
+void xbox_Nv2aIntrHold(int on)
+{
+    LARGE_INTEGER t;
+    if (!on) {
+        InterlockedExchange64(&g_nv2a_intr_hold, 0);
+        return;
+    }
+    QueryPerformanceCounter(&t);
+    InterlockedExchange64(&g_nv2a_intr_hold, t.QuadPart ? t.QuadPart : 1);
+}
+
+static int nv2a_intr_held(void)
+{
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    LONGLONG since = g_nv2a_intr_hold;
+    if (!since)
+        return 0;
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return now.QuadPart - since < freq.QuadPart / 1000;
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        int intr_held = nv2a_intr_held();
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            if (intr_held && (NV2A_ACK[i].offset == 0x000100
+                              || NV2A_ACK[i].offset == 0x600100))
+                continue;          /* a vblank is being delivered: see below */
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
             }
