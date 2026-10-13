@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(xboxrecomp VERSION 0.9.0 LANGUAGES C)
+project(xboxrecomp VERSION 0.9.0 LANGUAGES C CXX)
 
 # Xbox Static Recompilation Runtime Library
 # Provides link-time libraries for statically recompiled Xbox games.
@@ -55,6 +55,9 @@ add_subdirectory(src/input)
 
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
+if(WIN32)
+    add_subdirectory(src/ui)
+endif()
 
 # ── Umbrella target ───────────────────────────────────────────
 
@@ -70,4 +73,7 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_nv2a
     xbox_video
 )
+if(WIN32)
+    target_link_libraries(xboxrecomp INTERFACE xbox_ui)
+endif()
 

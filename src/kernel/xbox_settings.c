@@ -1,0 +1,158 @@
+/*
+ * Runtime settings: an ini file of KEY=VALUE lines, applied as environment
+ * variables.
+ *
+ * Everything in the runtime is already configured through RECOMP_* variables,
+ * so the file feeds the same mechanism instead of a second one: at startup
+ * each line becomes a variable unless the environment already sets it -- a
+ * launcher script or a shell still wins, which keeps one-off experiments
+ * easy. The settings overlay changes values live with xbox_setting_set and
+ * writes the file back with xbox_settings_save. Code that caches a value
+ * re-reads it when xbox_settings_gen() moves.
+ */
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define SET_MAX 128
+
+typedef struct {
+    char key[64];
+    char val[192];
+    int  from_env;                  /* the environment overrode the file */
+} Setting;
+
+static Setting s_set[SET_MAX];
+static int s_n;
+static char s_path[MAX_PATH];
+static volatile LONG s_gen = 1;
+static SRWLOCK s_lock = SRWLOCK_INIT;
+
+static void trim(char *s)
+{
+    char *e;
+    while (*s == ' ' || *s == '\t')
+        memmove(s, s + 1, strlen(s));
+    e = s + strlen(s);
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n'))
+        *--e = 0;
+}
+
+static Setting *find(const char *key)
+{
+    int i;
+    for (i = 0; i < s_n; i++)
+        if (!_stricmp(s_set[i].key, key))
+            return &s_set[i];
+    return NULL;
+}
+
+static Setting *add(const char *key)
+{
+    Setting *s = find(key);
+    if (s || s_n == SET_MAX)
+        return s;
+    s = &s_set[s_n++];
+    memset(s, 0, sizeof *s);
+    strncpy(s->key, key, sizeof s->key - 1);
+    return s;
+}
+
+void xbox_settings_load(const char *path)
+{
+    FILE *f;
+    char line[300];
+
+    strncpy(s_path, path, sizeof s_path - 1);
+    f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "[SETTINGS] %s not found; defaults (it is written on Save)\n", path);
+        return;
+    }
+    while (fgets(line, sizeof line, f)) {
+        char *eq;
+        Setting *s;
+        trim(line);
+        if (!line[0] || line[0] == '#' || line[0] == ';' || line[0] == '[')
+            continue;
+        if (!(eq = strchr(line, '=')))
+            continue;
+        *eq = 0;
+        trim(line);
+        trim(eq + 1);
+        if (!line[0] || !(s = add(line)))
+            continue;
+        if (getenv(line)) {
+            s->from_env = 1;
+            strncpy(s->val, getenv(line), sizeof s->val - 1);
+            fprintf(stderr, "[SETTINGS] %s=%s from the environment (file says %s)\n",
+                    line, s->val, eq + 1);
+        } else {
+            strncpy(s->val, eq + 1, sizeof s->val - 1);
+            _putenv_s(line, s->val);
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "[SETTINGS] loaded %d setting(s) from %s\n", s_n, path);
+}
+
+/* The current value: the variable, which the file and the overlay both set. */
+const char *xbox_setting_get(const char *key)
+{
+    return getenv(key);
+}
+
+int xbox_setting_int(const char *key, int def)
+{
+    const char *v = getenv(key);
+    return v && *v ? atoi(v) : def;
+}
+
+float xbox_setting_float(const char *key, float def)
+{
+    const char *v = getenv(key);
+    return v && *v ? (float)atof(v) : def;
+}
+
+void xbox_setting_set(const char *key, const char *val)
+{
+    Setting *s;
+    AcquireSRWLockExclusive(&s_lock);
+    if ((s = add(key)) != NULL) {
+        strncpy(s->val, val, sizeof s->val - 1);
+        s->val[sizeof s->val - 1] = 0;
+    }
+    _putenv_s(key, val);
+    ReleaseSRWLockExclusive(&s_lock);
+    InterlockedIncrement(&s_gen);
+}
+
+long xbox_settings_gen(void)
+{
+    return InterlockedCompareExchange(&s_gen, 0, 0);
+}
+
+int xbox_settings_save(void)
+{
+    FILE *f;
+    int i;
+    if (!s_path[0])
+        return 0;
+    if (!(f = fopen(s_path, "w")))
+        return 0;
+    fprintf(f, "# Settings, written by the in-game settings overlay (F1).\n"
+               "# KEY=VALUE; a variable set in the environment overrides a line here.\n");
+    AcquireSRWLockShared(&s_lock);
+    for (i = 0; i < s_n; i++)
+        fprintf(f, "%s=%s\n", s_set[i].key, s_set[i].val);
+    ReleaseSRWLockShared(&s_lock);
+    fclose(f);
+    fprintf(stderr, "[SETTINGS] saved %d setting(s) to %s\n", s_n, s_path);
+    return 1;
+}
+
+const char *xbox_settings_path(void)
+{
+    return s_path;
+}

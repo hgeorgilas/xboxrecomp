@@ -165,6 +165,18 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
+    /* The settings overlay has the pad while it is open: the title sees it
+     * connected and at rest. */
+    {
+        extern int xbox_overlay_visible(void);
+        static DWORD packet = 0x40000000u;
+        if (xbox_overlay_visible() && g_controller_connected[dwPort]) {
+            memset(pState, 0, sizeof *pState);
+            pState->dwPacketNumber = ++packet;
+            return ERROR_SUCCESS;
+        }
+    }
+
     {
         LARGE_INTEGER t0;
         QueryPerformanceCounter(&t0);

@@ -30,6 +30,10 @@ static CRITICAL_SECTION     s_lock;
 static pD3DCompile          s_compile;
 static uint32_t             s_flip;        /* flips seen, for ageing */
 
+/* Settings (xbox_settings.c): read live, re-read when the generation moves. */
+extern long xbox_settings_gen(void);
+extern int  xbox_setting_int(const char *key, int def);
+
 /* ---- small helpers ----------------------------------------------------- */
 
 /* Guest addresses arrive through the contiguous (0x80000000) or tiled
@@ -832,7 +836,19 @@ static ID3D11SamplerState *sampler_get(const PbGpuTexture *t)
     uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
     /* rc_texel: bilinear when either direction asks for TENT. */
     int lin = mag == 2 || min == 2 || min == 4 || min == 6;
-    uint64_t key = ((uint64_t)lin << 16) | ((t->addr_u & 0xFF) << 8) | (t->addr_v & 0xFF);
+    /* RECOMP_ANISO=<2..16>: anisotropic filtering on filtered textures --
+     * ground and walls at grazing angles stay sharp. A settings change
+     * makes new samplers; the key carries the level. */
+    static long gen;
+    static int aniso;
+    uint64_t key;
+    if (gen != xbox_settings_gen()) {
+        gen = xbox_settings_gen();
+        aniso = xbox_setting_int("RECOMP_ANISO", 0);
+        aniso = aniso < 2 ? 0 : aniso > 16 ? 16 : aniso;
+    }
+    key = ((uint64_t)(lin ? aniso : 0) << 20) | ((uint64_t)lin << 16)
+        | ((t->addr_u & 0xFF) << 8) | (t->addr_v & 0xFF);
     ID3D11SamplerState *s = (ID3D11SamplerState *)cache_find(s_samp, key);
     D3D11_SAMPLER_DESC sd;
 
@@ -840,6 +856,10 @@ static ID3D11SamplerState *sampler_get(const PbGpuTexture *t)
         return s;
     memset(&sd, 0, sizeof sd);
     sd.Filter = lin ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
+    if (lin && aniso) {
+        sd.Filter = D3D11_FILTER_ANISOTROPIC;
+        sd.MaxAnisotropy = (UINT)aniso;
+    }
     sd.AddressU = addr_map(t->addr_u);
     sd.AddressV = addr_map(t->addr_v);
     sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -1802,12 +1822,13 @@ static int ui_const_of(const char *body)
  * RECOMP_SAFE_AREA_FILL=0 keeps the console layout. */
 static void ui_fill(const PgEntry *e, float W, float H, PgConsts *pg)
 {
-    static int on = -1;
+    static int on;
+    static long gen;
     const float *c;
     float ox, oy, bw, bh, sc;
-    if (on < 0) {
-        const char *v = getenv("RECOMP_SAFE_AREA_FILL");
-        on = !v || atoi(v) != 0;
+    if (gen != xbox_settings_gen()) {
+        gen = xbox_settings_gen();
+        on = xbox_setting_int("RECOMP_SAFE_AREA_FILL", 1) != 0;
     }
     if (!on || !e || e->ui_const < 0)
         return;
@@ -2260,6 +2281,10 @@ static int present_init(HWND hwnd)
     if (!s_blit_vs || !s_blit_ps || !s_blit_smp || !s_blit_cb)
         return 0;
     fprintf(stderr, "  [PBGPU] presenting through a D3D11 swap chain\n");
+    {
+        extern void xbox_overlay_init(HWND, ID3D11Device *, ID3D11DeviceContext *);
+        xbox_overlay_init(hwnd, s_dev, s_ctx);
+    }
     return 1;
 }
 
@@ -2357,6 +2382,13 @@ int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height)
         {
             ID3D11ShaderResourceView *none = NULL;
             ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+        }
+        /* The settings overlay, over the frame (full-window viewport). */
+        {
+            extern void xbox_overlay_render(void);
+            D3D11_VIEWPORT full = { 0, 0, (float)cw, (float)ch, 0, 1 };
+            ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &full);
+            xbox_overlay_render();
         }
         /* No vsync wait: the executor already paces flips to 60 Hz. */
         IDXGISwapChain1_Present(s_swap, 0, 0);

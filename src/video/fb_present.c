@@ -150,6 +150,16 @@ int xbox_FramebufferKeyDown(int vk)
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    /* The settings overlay (F1) sees input first; what it takes -- all of
+     * it while it is open -- the title does not, and keys held when it
+     * opened read as released. */
+    {
+        extern int xbox_overlay_msg(HWND, UINT, WPARAM, LPARAM);
+        if (xbox_overlay_msg(h, m, w, l)) {
+            memset((void *)s_key_down, 0, sizeof s_key_down);
+            return 0;
+        }
+    }
     switch (m) {
     case WM_CLOSE:
         /* Closing the game's only window is quitting the game. This used to
