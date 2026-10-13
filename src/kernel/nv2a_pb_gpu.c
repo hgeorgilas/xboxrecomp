@@ -1376,6 +1376,8 @@ static struct {
 } s_cap;
 
 static void rt_dump(Surface *s, const char *name);
+/* After a capture: the next presented frame, as the window shows it. */
+static char s_cap_present[300];
 
 static void cap_poll(void)
 {
@@ -1392,6 +1394,7 @@ static void cap_poll(void)
         }
         fclose(s_cap.log);
         fprintf(stderr, "  [CAPTURE] frame written to %s\n", s_cap.dir);
+        snprintf(s_cap_present, sizeof s_cap_present, "%spresented.bmp", s_cap.dir);
         s_cap.active = 0;
     }
     if (env_flip == -2) {
@@ -1684,6 +1687,11 @@ static int draw_begin(const PbGpuState *st, Surface **so, Zeta **zo)
                     h = rt->h;
                     if (t->color == 0x41 || t->color == 0x40 || t->color == 0x3F)
                         key.rt_swizzle[st_i] = t->color;
+                    if (s_cap.active && s_flip == s_cap.flip && s_cap.log
+                            && (rt->w != t->width || rt->h != t->height))
+                        fprintf(s_cap.log, "          t%u %08X %ux%u read from surface %ux%u"
+                                " (texture %ux%u, norm %d)\n", st_i, t->addr, rt->w, rt->h,
+                                rt->pw, rt->ph, t->width, t->height, t->normalized);
                 }
                 pc.texsize[st_i][0] = 1.0f / (float)w;
                 pc.texsize[st_i][1] = 1.0f / (float)h;
@@ -2733,6 +2741,45 @@ int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height)
         {
             ID3D11ShaderResourceView *none = NULL;
             ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+        }
+        if (s_cap_present[0]) {
+            /* F12 also keeps what was on screen: scaling, aspect and the
+             * 2D layer's placement only show here, not in the guest-size
+             * surfaces. */
+            ID3D11Texture2D *bb = NULL, *st = NULL;
+            D3D11_TEXTURE2D_DESC td;
+            D3D11_MAPPED_SUBRESOURCE mm;
+            if (SUCCEEDED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&bb))) {
+                ID3D11Texture2D_GetDesc(bb, &td);
+                td.Usage = D3D11_USAGE_STAGING;
+                td.BindFlags = 0;
+                td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                td.MiscFlags = 0;
+                if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st))) {
+                    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)bb);
+                    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
+                                                          D3D11_MAP_READ, 0, &mm))) {
+                        FILE *fp = fopen(s_cap_present, "wb");
+                        if (fp) {
+                            uint32_t hdr[13], y;
+                            memset(hdr, 0, sizeof hdr);
+                            fwrite("BM", 1, 2, fp);
+                            hdr[0] = 54 + td.Width * td.Height * 4; hdr[2] = 54; hdr[3] = 40;
+                            hdr[4] = td.Width; hdr[5] = (uint32_t)-(int32_t)td.Height;
+                            hdr[6] = 1 | (32 << 16);
+                            fwrite(hdr, 4, 13, fp);
+                            for (y = 0; y < td.Height; y++)
+                                fwrite((const uint8_t *)mm.pData + (size_t)y * mm.RowPitch, 4,
+                                       td.Width, fp);
+                            fclose(fp);
+                        }
+                        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+                    }
+                    ID3D11Texture2D_Release(st);
+                }
+                ID3D11Texture2D_Release(bb);
+            }
+            s_cap_present[0] = 0;
         }
         /* The settings overlay, over the frame (full-window viewport). */
         {
