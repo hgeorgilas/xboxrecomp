@@ -3746,9 +3746,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             draws_at_flip = s_gpu.draws;
         }
         if (pbgpu_enabled()) {
+            uint32_t done = dma_resolve(s_gpu.drawn_offset ? s_gpu.drawn_offset
+                                                           : s_gpu.color_offset);
+            uint32_t bpp = s_gpu.drawn_offset ? s_gpu.drawn_bpp : surface_bpp();
+            uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch : s_gpu.pitch;
             gpu_flush();
-            pbgpu_readback(dma_resolve(s_gpu.drawn_offset ? s_gpu.drawn_offset
-                                                          : s_gpu.color_offset));
+            /* Straight from the GPU to the window (pbgpu_present); the copy
+             * back to guest memory no longer stalls for it. */
+            if (bpp && pitch)
+                pbgpu_present(done, pitch / bpp, 480);
+            pbgpu_readback_async(done);
             pbgpu_flip();
         }
         if (s_gpu.pitch) {

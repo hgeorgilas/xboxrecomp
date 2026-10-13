@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <dxgi1_2.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1957,6 +1958,243 @@ void pbgpu_readback(uint32_t addr)
     LeaveCriticalSection(&s_lock);
 }
 
+/* ---- presenting ----------------------------------------------------------
+ *
+ * The finished frame goes to the window straight from the GPU: a DXGI swap
+ * chain on the framebuffer window, the frame's surface drawn into it scaled
+ * to the client area at the frame's own aspect ratio.
+ *
+ * Before this, every flip copied the frame back to guest memory -- a stall
+ * until the GPU had finished it -- and the window thread converted and drew
+ * it with GDI. The copy back still happens (guest memory should hold what
+ * the title rendered: screenshots, dumps, old targets read as textures), but
+ * asynchronously, one flip late, so it never waits (pbgpu_readback_async).
+ *
+ * This is also where a higher internal resolution would be resolved to the
+ * window. RECOMP_PRESENT_GDI=1 keeps the old path. */
+static IDXGISwapChain1        *s_swap;
+static ID3D11RenderTargetView *s_swap_rtv;
+static UINT                    s_swap_w, s_swap_h;
+static ID3D11VertexShader     *s_blit_vs;
+static ID3D11PixelShader      *s_blit_ps;
+static ID3D11SamplerState     *s_blit_smp;
+static ID3D11Buffer           *s_blit_cb;
+static int                     s_present_state;   /* 0 untried, 1 on, -1 off */
+
+static const char k_blit_vs[] =
+"struct VO { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
+"VO main(uint id : SV_VertexID) { VO o;\n"
+"  float2 t = float2((id << 1) & 2, id & 2);\n"
+"  o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = t; return o; }\n";
+static const char k_blit_ps[] =
+"cbuffer B : register(b0) { float4 uvmax; };\n"
+"Texture2D t : register(t0); SamplerState s : register(s0);\n"
+"float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+"  return float4(t.Sample(s, uv * uvmax.xy).rgb, 1); }\n";
+
+static int present_init(HWND hwnd)
+{
+    IDXGIDevice *dd = NULL;
+    IDXGIAdapter *ad = NULL;
+    IDXGIFactory2 *fac = NULL;
+    DXGI_SWAP_CHAIN_DESC1 sd;
+    D3D11_SAMPLER_DESC smd;
+    D3D11_BUFFER_DESC bd;
+    ID3DBlob *code;
+    HRESULT hr;
+
+    if (FAILED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&dd)))
+        return 0;
+    hr = IDXGIDevice_GetAdapter(dd, &ad);
+    IDXGIDevice_Release(dd);
+    if (FAILED(hr))
+        return 0;
+    hr = IDXGIAdapter_GetParent(ad, &IID_IDXGIFactory2, (void **)&fac);
+    IDXGIAdapter_Release(ad);
+    if (FAILED(hr))
+        return 0;
+    memset(&sd, 0, sizeof sd);
+    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.Scaling = DXGI_SCALING_NONE;
+    hr = IDXGIFactory2_CreateSwapChainForHwnd(fac, (IUnknown *)s_dev, hwnd, &sd,
+                                              NULL, NULL, &s_swap);
+    if (SUCCEEDED(hr))   /* the window's own Alt+Enter is not ours to give */
+        IDXGIFactory2_MakeWindowAssociation(fac, hwnd, DXGI_MWA_NO_ALT_ENTER);
+    IDXGIFactory2_Release(fac);
+    if (FAILED(hr)) {
+        fprintf(stderr, "  [PBGPU] swap chain not created (0x%08lX); presenting"
+                        " through GDI\n", hr);
+        return 0;
+    }
+    if ((code = compile(k_blit_vs, "vs_5_0")) != NULL) {
+        ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                        ID3D10Blob_GetBufferSize(code), NULL, &s_blit_vs);
+        ID3D10Blob_Release(code);
+    }
+    if ((code = compile(k_blit_ps, "ps_5_0")) != NULL) {
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                       ID3D10Blob_GetBufferSize(code), NULL, &s_blit_ps);
+        ID3D10Blob_Release(code);
+    }
+    memset(&smd, 0, sizeof smd);
+    smd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    smd.AddressU = smd.AddressV = smd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    smd.MaxLOD = D3D11_FLOAT32_MAX;
+    ID3D11Device_CreateSamplerState(s_dev, &smd, &s_blit_smp);
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = 16;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_blit_cb);
+    if (!s_blit_vs || !s_blit_ps || !s_blit_smp || !s_blit_cb)
+        return 0;
+    fprintf(stderr, "  [PBGPU] presenting through a D3D11 swap chain\n");
+    return 1;
+}
+
+int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height)
+{
+    extern void *xbox_FramebufferWindowHwnd(void);
+    extern void xbox_FramebufferWindowGpuOwned(int on);
+    HWND hwnd;
+    RECT rc;
+    UINT cw, ch;
+    Surface *s;
+    int ok = 0;
+
+    if (!pbgpu_enabled() || s_present_state < 0)
+        return 0;
+    hwnd = (HWND)xbox_FramebufferWindowHwnd();
+    if (!hwnd)
+        return 0;                          /* window not up yet */
+    EnterCriticalSection(&s_lock);
+    if (s_present_state == 0) {
+        if (getenv("RECOMP_PRESENT_GDI") || !present_init(hwnd)) {
+            s_present_state = -1;
+            goto out;
+        }
+        s_present_state = 1;
+        xbox_FramebufferWindowGpuOwned(1);
+    }
+    if (!(s = surface_find(addr)) || !width || !height)
+        goto out;
+    GetClientRect(hwnd, &rc);
+    cw = (UINT)(rc.right - rc.left);
+    ch = (UINT)(rc.bottom - rc.top);
+    if (!cw || !ch)
+        goto out_ok;                       /* minimised: nothing to show */
+    if (cw != s_swap_w || ch != s_swap_h || !s_swap_rtv) {
+        ID3D11Texture2D *bb = NULL;
+        if (s_swap_rtv) {
+            ID3D11RenderTargetView_Release(s_swap_rtv);
+            s_swap_rtv = NULL;
+        }
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+        if (FAILED(IDXGISwapChain1_ResizeBuffers(s_swap, 0, cw, ch,
+                                                 DXGI_FORMAT_UNKNOWN, 0)))
+            goto out;
+        if (FAILED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D,
+                                             (void **)&bb)))
+            goto out;
+        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)bb, NULL, &s_swap_rtv);
+        ID3D11Texture2D_Release(bb);
+        s_swap_w = cw;
+        s_swap_h = ch;
+    }
+    {
+        static const float black[4] = { 0, 0, 0, 1 };
+        D3D11_VIEWPORT vp;
+        D3D11_MAPPED_SUBRESOURCE m;
+        float uv[4];
+        float sw = (float)width, sh = (float)height;
+        float scale = (float)cw / sw < (float)ch / sh ? (float)cw / sw : (float)ch / sh;
+        ID3D11Buffer *cb = s_blit_cb;
+
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_swap_rtv, NULL);
+        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_swap_rtv, black);
+        vp.Width = sw * scale;
+        vp.Height = sh * scale;
+        vp.TopLeftX = ((float)cw - vp.Width) * 0.5f;
+        vp.TopLeftY = ((float)ch - vp.Height) * 0.5f;
+        vp.MinDepth = 0;
+        vp.MaxDepth = 1;
+        ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+        {
+            D3D11_RECT r = { 0, 0, (LONG)cw, (LONG)ch };
+            ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &r);
+        }
+        uv[0] = sw / (float)s->w;
+        uv[1] = sh / (float)s->h;
+        uv[2] = uv[3] = 0;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
+                                              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            memcpy(m.pData, uv, sizeof uv);
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_blit_cb, 0);
+        }
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+        ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &cb);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s->srv);
+        ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
+        ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+        {
+            ID3D11ShaderResourceView *none = NULL;
+            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+        }
+        /* No vsync wait: the executor already paces flips to 60 Hz. */
+        IDXGISwapChain1_Present(s_swap, 0, 0);
+    }
+out_ok:
+    ok = 1;
+out:
+    LeaveCriticalSection(&s_lock);
+    return ok;
+}
+
+/* The flip's copy back to guest memory, one flip late: copy this frame to
+ * staging now, and map the copy started at the previous flip -- which the
+ * GPU has long finished -- so nothing waits. */
+void pbgpu_readback_async(uint32_t addr)
+{
+    static Surface *pending;
+    D3D11_MAPPED_SUBRESOURCE m;
+    Surface *s;
+    uint32_t y;
+
+    if (!pbgpu_enabled())
+        return;
+    EnterCriticalSection(&s_lock);
+    if (pending && pending->staging) {
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)pending->staging,
+                                              0, D3D11_MAP_READ, 0, &m))) {
+            for (y = 0; y < pending->h; y++)
+                from_bgra((const uint32_t *)((const uint8_t *)m.pData + (size_t)y * m.RowPitch),
+                          pending->bpp, pending->w,
+                          guest(pending->addr) + (size_t)y * pending->pitch);
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)pending->staging, 0);
+        }
+        pending = NULL;
+    }
+    s = surface_find(addr);
+    if (s && s->drawn && s->staging) {
+        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s->staging,
+                                         (ID3D11Resource *)s->tex);
+        s->drawn = 0;
+        pending = s;
+    }
+    LeaveCriticalSection(&s_lock);
+}
+
 void pbgpu_flip(void)
 {
     cap_poll();
@@ -1974,6 +2212,8 @@ int pbgpu_draw_program(const PbGpuState *st, const float *a, uint32_t nv, uint32
 void pbgpu_clear(const PbGpuState *s, uint32_t f, uint32_t c, float d, uint32_t t)
 { (void)s; (void)f; (void)c; (void)d; (void)t; }
 void pbgpu_readback(uint32_t a) { (void)a; }
+void pbgpu_readback_async(uint32_t a) { (void)a; }
+int  pbgpu_present(uint32_t a, uint32_t w, uint32_t h) { (void)a; (void)w; (void)h; return 0; }
 void pbgpu_flip(void) {}
 
 #endif

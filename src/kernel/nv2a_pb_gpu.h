@@ -114,6 +114,13 @@ void pbgpu_clear(const PbGpuState *st, uint32_t flags, uint32_t color,
 /* Copy the GPU's copy of the surface at `addr` back into guest memory, if
  * it has one. Called at a flip for the presented surface. */
 void pbgpu_readback(uint32_t addr);
+/* The same copy back, without waiting: this flip's frame is copied to
+ * staging and the previous flip's is written to guest memory. */
+void pbgpu_readback_async(uint32_t addr);
+/* Show the surface at addr (width x height of it) in the framebuffer window
+ * through a D3D11 swap chain. 0 if not presenting this way (no window yet,
+ * RECOMP_PRESENT_GDI, or the swap chain could not be made). */
+int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height);
 
 /* A flip happened: ages render-target aliases and texture checks. */
 void pbgpu_flip(void);

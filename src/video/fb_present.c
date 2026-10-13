@@ -25,6 +25,14 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static volatile LONG s_fb_running;
+/* The window, once created, and whether the GPU back end now presents into
+ * it through a swap chain (nv2a_pb_gpu.c). While it does, this thread must
+ * not draw with GDI: the two would fight over the same window. */
+static volatile HWND s_fb_hwnd;
+static volatile LONG s_gpu_owns_window;
+
+void *xbox_FramebufferWindowHwnd(void) { return (void *)s_fb_hwnd; }
+void  xbox_FramebufferWindowGpuOwned(int on) { InterlockedExchange(&s_gpu_owns_window, on); }
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 
@@ -332,6 +340,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         return 0;
     }
     hdc = GetDC(hwnd);
+    s_fb_hwnd = hwnd;
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
@@ -360,14 +369,16 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
-            fb_blit(hwnd, hdc, &bi);
+            if (!s_gpu_owns_window)
+                fb_blit(hwnd, hdc, &bi);
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
-            fb_blit(hwnd, hdc, &bi);
+            if (!s_gpu_owns_window)
+                fb_blit(hwnd, hdc, &bi);
         }
         {
             /* One dump a few seconds in, so the title has had time to render
@@ -439,4 +450,6 @@ void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
+void *xbox_FramebufferWindowHwnd(void) { return 0; }
+void  xbox_FramebufferWindowGpuOwned(int on) { (void)on; }
 #endif
