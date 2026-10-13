@@ -2292,6 +2292,16 @@ uint32_t xbox_VblankCount(void) { return (uint32_t)g_vblank_count; }
 static void kernel_drain_dpcs(void);   /* below: the timer thread runs DPCs */
 extern void xbox_Nv2aIntrHold(int on);
 
+/* The vblank rate, changeable at run time: a title whose frame rate is
+ * raised needs vblanks to match (Spartan steps once per frame and waits on
+ * the vblank), except while something paced on vblanks -- a movie -- runs. */
+static volatile LONG s_vblank_hz;
+
+void xbox_SetVblankHz(int hz)
+{
+    InterlockedExchange(&s_vblank_hz, hz >= 30 && hz <= 1000 ? hz : 60);
+}
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1, trace;
@@ -2309,12 +2319,21 @@ static void kernel_vblank_tick(void)
             /* RECOMP_VBLANK_HZ: a display faster than NTSC's 60, for a
              * title whose frame rate has been raised to match. */
             const char *hz = getenv("RECOMP_VBLANK_HZ");
-            int n = hz ? atoi(hz) : 60;
-            period = freq.QuadPart / (n >= 30 && n <= 1000 ? n : 60);
+            if (!s_vblank_hz)
+                xbox_SetVblankHz(hz ? atoi(hz) : 60);
         }
     }
     if (!enabled)
         return;
+    {
+        static LONG cur;
+        LONG want = InterlockedCompareExchange(&s_vblank_hz, 0, 0);
+        if (want != cur) {
+            cur = want;
+            period = freq.QuadPart / (want ? want : 60);
+            next = 0;
+        }
+    }
 
     /* An exact 60 Hz off the performance counter, catching up on vblanks
      * the timer thread was too late for (bounded, so a long stall does not

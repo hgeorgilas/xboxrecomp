@@ -128,18 +128,19 @@ void panel()
     }
 
     if (xbox_setting_int("RECOMP_GAME_HZ_SUPPORTED", 0)) {
-        static const char *names[] = { "60 (original)", "120", "144", "165", "240" };
-        static const int values[] = { 60, 120, 144, 165, 240 };
-        int cur = xbox_setting_int("RECOMP_GAME_HZ", 60), sel = 0;
-        for (int i = 0; i < 5; i++)
+        static const char *names[] = { "30 (as on Xbox)", "60", "120", "144" };
+        static const int values[] = { 30, 60, 120, 144 };
+        int cur = xbox_setting_int("RECOMP_GAME_HZ", 60), sel = 1;
+        for (int i = 0; i < 4; i++)
             if (values[i] == cur)
                 sel = i;
-        if (ImGui::Combo("Frame rate", &sel, names, 5)) {
+        if (ImGui::Combo("Frame rate", &sel, names, 4)) {
             set_int("RECOMP_GAME_HZ", values[sel]);
             set_int("RECOMP_FLIP_HZ", values[sel]);
         }
-        ImGui::SetItemTooltip("Game speed stays the same: the simulation runs at this"
-                              " rate. Pair with V-sync off or a matching display.");
+        ImGui::SetItemTooltip("The game steps once per frame at this rate, so game speed"
+                              " stays right while your PC holds it; if it cannot, the"
+                              " game slows down, as the console did.");
     }
 
     ImGui::SeparatorText("Textures");
