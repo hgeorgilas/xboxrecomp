@@ -630,6 +630,13 @@ static const uint32_t MCPX_COUNTERS[] = {
 };
 
 static void *g_mcpx_regs = NULL;
+
+/* Host address of the MCPX aperture (0xFE800000), for the APU model's view of
+ * the DSP memories, which stay plain memory. */
+void *xbox_McpxMemory(void)
+{
+    return g_mcpx_regs;
+}
 /* Set when the APU's registers are unmapped so they can be routed to the
  * emulated APU. Once that happens they are no longer plain memory, and the
  * counter ticking below must leave them alone -- writing through the pointer

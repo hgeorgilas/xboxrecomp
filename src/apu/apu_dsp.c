@@ -98,6 +98,18 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
 {
     int i;
 
+    extern void *xbox_McpxMemory(void);
+    uint8_t *mcpx = (uint8_t *)xbox_McpxMemory();
+
+    /* The EP has to look alive. Its program keeps 0xCCCCCC at X-memory 0xA018
+     * while it runs, DirectSound's low-priority service checks for it, and
+     * when it is missing resets both DSPs -- with a 10 ms busy stall on the
+     * calling thread, several times a second, which is most of a game frame
+     * and a gap in the audio each time. The reset reloads EP memory, so keep
+     * it there rather than set it once. */
+    if (mcpx)
+        *(volatile uint32_t *)(mcpx + 0x5A018) = 0xCCCCCC;
+
     if (s_dsp_ack_count < 0)
         dsp_ack_init();
     if (!d->ram_ptr)

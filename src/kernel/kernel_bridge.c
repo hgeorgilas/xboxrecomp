@@ -4250,6 +4250,15 @@ static void bridge_KeSetBasePriorityThread(void)
 /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */
 static void bridge_KeStallExecutionProcessor(void)
 {
+    /* RECOMP_STALL_TRACE: who stalls, for how long (first 200 calls). */
+    static int trace = -1, n;
+    if (trace < 0)
+        trace = getenv("RECOMP_STALL_TRACE") != NULL;
+    if (trace && n++ < 200) {
+        fprintf(stderr, "[STALL] %u us from %08X ep=%08X t=%lu\n", STACK_ARG(0),
+                g_xbox_kernel_caller, BRIDGE_MEM32(0x2558C0), GetTickCount());
+        fflush(stderr);
+    }
     xbox_KeStallExecutionProcessor(STACK_ARG(0));
     g_eax = 0;
 }
