@@ -1862,6 +1862,11 @@ class Lifter:
             # Segment register pop → discard from stack
             if r in ("fs", "gs", "cs", "ds", "es", "ss"):
                 return [f"{{ uint32_t _tmp; POP32(esp, _tmp); }} /* pop {r} - segment register */"]
+            # `pop esp` loads esp from the stack and does NOT then add 4:
+            # POP32's increment would leave esp 4 high. MSVC's inline ftol
+            # (`push esp; push eax; fistp [esp]; pop eax; pop esp`) relies on it.
+            if r == "esp":
+                return ["esp = MEM32(esp); /* pop esp: no post-increment */"]
             # Sample esp at each pop in a traced function. An epilogue that ends
             # `mov esp, ebp` restores esp unconditionally, so any drift inside
             # the function is erased before a return-time trace can see it --
