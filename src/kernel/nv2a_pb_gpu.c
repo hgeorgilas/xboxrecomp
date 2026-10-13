@@ -984,13 +984,22 @@ static ID3D11SamplerState *sampler_get(const PbGpuTexture *t)
      * makes new samplers; the key carries the level. */
     static long gen;
     static int aniso;
+    int lin_aniso;
     uint64_t key;
     if (gen != xbox_settings_gen()) {
         gen = xbox_settings_gen();
         aniso = xbox_setting_int("RECOMP_ANISO", 0);
         aniso = aniso < 2 ? 0 : aniso > 16 ? 16 : aniso;
     }
-    key = ((uint64_t)(lin ? aniso : 0) << 20) | ((uint64_t)lin << 16)
+    /* Only for mipmapped, normalised textures -- the world's surfaces seen
+     * at an angle. Render targets read back (bloom, blur, the pause
+     * background) and lookup tables read through BUMPENVMAP are screen-
+     * aligned or data; filtering them anisotropically made them shimmer. */
+    if (!(t->levels > 1 && t->normalized && !t->cube))
+        lin_aniso = 0;
+    else
+        lin_aniso = lin ? aniso : 0;
+    key = ((uint64_t)lin_aniso << 20) | ((uint64_t)lin << 16)
         | ((t->addr_u & 0xFF) << 8) | (t->addr_v & 0xFF);
     ID3D11SamplerState *s = (ID3D11SamplerState *)cache_find(s_samp, key);
     D3D11_SAMPLER_DESC sd;
@@ -999,9 +1008,9 @@ static ID3D11SamplerState *sampler_get(const PbGpuTexture *t)
         return s;
     memset(&sd, 0, sizeof sd);
     sd.Filter = lin ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
-    if (lin && aniso) {
+    if (lin_aniso) {
         sd.Filter = D3D11_FILTER_ANISOTROPIC;
-        sd.MaxAnisotropy = (UINT)aniso;
+        sd.MaxAnisotropy = (UINT)lin_aniso;
     }
     sd.AddressU = addr_map(t->addr_u);
     sd.AddressV = addr_map(t->addr_v);
@@ -2202,26 +2211,30 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
             }
         fprintf(s_cap.log, "          v0 min (%.1f %.1f %.1f %.1f) max (%.1f %.1f %.1f %.1f)\n",
                 lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]);
-        {
-            /* The program and its constants, once per program per capture. */
-            char path[300];
-            FILE *fp;
-            snprintf(path, sizeof path, "%sprog_%016llX.txt", s_cap.dir,
-                     (unsigned long long)nv2a_vsh_program_hash());
-            if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES
-                    && (fp = fopen(path, "w")) != NULL) {
-                static char body[96 * 1024];
-                int i;
-                if (nv2a_vsh_hlsl(body, sizeof body, NULL))
-                    fputs(body, fp);
-                for (i = 0; i < 192; i++) {
-                    const float *c = nv2a_vsh_constant(i);
-                    if (c[0] || c[1] || c[2] || c[3])
-                        fprintf(fp, "c%d = (%g %g %g %g)\n", i, c[0], c[1], c[2], c[3]);
-                }
-                fclose(fp);
+    }
+    if (s_cap.active && s_flip == s_cap.flip && s_cap.log) {
+        /* Every draw's program, once per capture: a full-screen pass is a
+         * 4-vertex quad, and its program decides where it lands. */
+    {
+        /* The program and its constants, once per program per capture. */
+        char path[300];
+        FILE *fp;
+        snprintf(path, sizeof path, "%sprog_%016llX.txt", s_cap.dir,
+                 (unsigned long long)nv2a_vsh_program_hash());
+        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES
+                && (fp = fopen(path, "w")) != NULL) {
+            static char body[96 * 1024];
+            int i;
+            if (nv2a_vsh_hlsl(body, sizeof body, NULL))
+                fputs(body, fp);
+            for (i = 0; i < 192; i++) {
+                const float *c = nv2a_vsh_constant(i);
+                if (c[0] || c[1] || c[2] || c[3])
+                    fprintf(fp, "c%d = (%g %g %g %g)\n", i, c[0], c[1], c[2], c[3]);
             }
+            fclose(fp);
         }
+    }
     }
     if (!draw_begin(st, &s, &z))
         goto out;
