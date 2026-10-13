@@ -333,6 +333,12 @@ def apply_to_functions_json(final, functions_json_path):
     applied = 0
     for entry in data:
         start = norm_addr(entry.get("start"))
+        # The disassembler names the XBE entry xbe_entry_point and the
+        # template's main.c links against that symbol. FidDb calls the same
+        # function mainCRTStartup, and taking it left the game unlinkable
+        # (LNK2019: unresolved external symbol xbe_entry_point).
+        if entry.get("name") == "xbe_entry_point":
+            continue
         if start in final:
             newname = final[start]
             if entry.get("name") != newname:
