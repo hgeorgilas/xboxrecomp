@@ -1307,6 +1307,8 @@ static Surface *bind_target(const PbGpuState *st, Zeta **zout)
                     st->blend_sfactor, st->blend_dfactor, st->blend_equation,
                     st->zeta_addr, st->depth_test, st->depth_func, st->depth_mask,
                     st->color_mask);
+            fprintf(lg, "     surface format %08X control0 %08X aa_control %08X\n",
+                    st->surf_format, st->control0, st->aa_control);
             fprintf(lg, "     rc %d stages %05X combiners %u fac0 %08X fac1 %08X"
                     " fc0 %08X fc1 %08X alphatest %u\n", st->use_rc,
                     st->rc.stage_program, st->rc.control & 0xF, st->rc.factor0[0],
@@ -1512,6 +1514,28 @@ static void draw_end(Surface *s)
 {
     ID3D11ShaderResourceView *none[4] = { 0, 0, 0, 0 };
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, none);
+    if (s_cap.active && s_flip == s_cap.flip && s_cap.draws > 3) {
+        /* RECOMP_CAP_DRAWS=a,b,c: also an image after those draw numbers
+         * (counted within each pass). */
+        static int n = -1;
+        static unsigned list[32];
+        int i;
+        if (n < 0) {
+            const char *e = getenv("RECOMP_CAP_DRAWS");
+            n = 0;
+            while (e && *e && n < 32) {
+                char *end;
+                list[n++] = (unsigned)strtoul(e, &end, 10);
+                e = *end == ',' ? end + 1 : "";
+            }
+        }
+        for (i = 0; i < n; i++)
+            if (list[i] == s_cap.draws) {
+                char name[64];
+                snprintf(name, sizeof name, "%02u_%08X_draw%u", s_cap.n, s->addr, s_cap.draws);
+                rt_dump(s, name);
+            }
+    }
     if (s_cap.active && s_flip == s_cap.flip && s_cap.draws <= 3) {
         /* The first few draws of each pass, one image each: what a single
          * draw did to the target, where the per-pass images only show the
@@ -1781,6 +1805,36 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
                 st->blend_sfactor, st->blend_dfactor, st->depth_test,
                 st->use_rc ? st->rc.stage_program : 0xFFFFF,
                 st->tex[0].valid ? st->tex[0].addr : 0);
+    if (s_cap.active && s_flip == s_cap.flip && s_cap.log) {
+        /* The viewport a program maps to, where Spartan keeps it (c[0]
+         * offset, c[1] scale) -- a pass drawn at a different scale shows. */
+        const float *c0 = nv2a_vsh_constant(0), *c1 = nv2a_vsh_constant(1);
+        fprintf(s_cap.log, "          c0 (%.1f %.1f %.1f) c1 (%.1f %.1f %.1f) clip %u,%u %ux%u"
+                " surf %08X pitch %u z %08X\n",
+                c0[0], c0[1], c0[2], c1[0], c1[1], c1[2],
+                st->clip_x, st->clip_y, st->clip_w, st->clip_h,
+                st->surf_addr, st->surf_pitch, st->zeta_addr);
+    }
+    if (s_cap.active && s_flip == s_cap.flip && s_cap.log && nverts <= 8) {
+        /* Small draws (screen quads): their inputs and the constants a
+         * screen-space program usually scales them by. */
+        const float *c14 = nv2a_vsh_constant(14), *c15 = nv2a_vsh_constant(15);
+        uint32_t k;
+        for (k = 0; k < nverts && k < 4; k++) {
+            uint32_t a;
+            fprintf(s_cap.log, "          vert %u:", k);
+            for (a = 0; a < 16; a++)
+                if (slot[a] >= 0)
+                    fprintf(s_cap.log, " v%u(%.1f %.1f %.1f %.1f)", a,
+                            attr[(k * stride + (uint32_t)slot[a]) * 4 + 0],
+                            attr[(k * stride + (uint32_t)slot[a]) * 4 + 1],
+                            attr[(k * stride + (uint32_t)slot[a]) * 4 + 2],
+                            attr[(k * stride + (uint32_t)slot[a]) * 4 + 3]);
+            fprintf(s_cap.log, "\n");
+        }
+        fprintf(s_cap.log, "          c14 (%.3f %.3f %.3f %.3f) c15 (%.3f %.3f %.3f %.3f)\n",
+                c14[0], c14[1], c14[2], c14[3], c15[0], c15[1], c15[2], c15[3]);
+    }
     if (!draw_begin(st, &s, &z))
         goto out;
     aoff = ring_put(s_attr_buf, &s_attr_pos, PG_ATTR_F4, 16, attr, nverts * stride);

@@ -336,6 +336,7 @@ static struct {
              stencil_func_mask, stencil_op_fail, stencil_op_zfail,
              stencil_op_zpass;
     uint32_t cull_enable, cull_face, front_face;
+    uint32_t control0, aa_control;      /* SET_CONTROL0, SET_ANTI_ALIASING_CONTROL */
     uint32_t poly_offset_fill;
     float    poly_offset_scale, poly_offset_bias;
 } s_gpu;
@@ -2077,6 +2078,9 @@ static void gpu_state(PbGpuState *g)
     g->stencil_op_fail = s_gpu.stencil_op_fail;
     g->stencil_op_zfail = s_gpu.stencil_op_zfail;
     g->stencil_op_zpass = s_gpu.stencil_op_zpass;
+    g->surf_format = s_gpu.format;
+    g->control0 = s_gpu.control0;
+    g->aa_control = s_gpu.aa_control;
     g->cull_enable = s_gpu.cull_enable;
     g->cull_face = s_gpu.cull_face;
     g->front_face = s_gpu.front_face;
@@ -3833,6 +3837,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * passes, which cancel each other out unless culling is honoured. */
     case 0x0308: s_gpu.cull_enable = param; break;       /* CULL_FACE_ENABLE */
     case 0x039C: s_gpu.cull_face = param; break;         /* CULL_FACE */
+    case 0x0290: s_gpu.control0 = param; break;          /* CONTROL0 */
+    case 0x1D7C: s_gpu.aa_control = param; break;        /* ANTI_ALIASING_CONTROL */
     case 0x03A0: s_gpu.front_face = param; break;        /* FRONT_FACE */
 
     /* Polygon offset, for decals laid on the surface beneath them. */
