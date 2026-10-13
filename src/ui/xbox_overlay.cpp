@@ -29,6 +29,9 @@ int   xbox_setting_int(const char *key, int def);
 float xbox_setting_float(const char *key, float def);
 void  xbox_setting_set(const char *key, const char *val);
 void  xbox_FramebufferSetFullscreen(int on);
+int   texpack_scan_memory(void);
+long  texpack_dumped_count(void);
+long  texpack_loaded_count(void);
 int   xbox_settings_save(void);
 const char *xbox_settings_path(void);
 }
@@ -41,6 +44,8 @@ SRWLOCK g_qlock = SRWLOCK_INIT;
 Msg     g_q[512];
 int     g_qn;
 volatile LONG g_visible;
+volatile LONG g_scan;          /* F9: dump every texture in memory */
+int     g_scan_found = -1;
 bool    g_ready;
 HWND    g_hwnd;
 LARGE_INTEGER g_freq, g_last;
@@ -134,6 +139,23 @@ void panel()
             set_int("RECOMP_ANISO", values[sel]);
     }
 
+    ImGui::SeparatorText("HD texture pack");
+    {
+        bool use = xbox_setting_int("RECOMP_TEXPACK", 1) != 0;
+        if (ImGui::Checkbox("Use HD textures (textures\replace)", &use))
+            set_int("RECOMP_TEXPACK", use ? 1 : 0);
+        ImGui::SetItemTooltip("Applies after a restart.");
+        bool dump = xbox_setting_int("RECOMP_TEXPACK_DUMP", 0) != 0;
+        if (ImGui::Checkbox("Dump textures while playing", &dump))
+            set_int("RECOMP_TEXPACK_DUMP", dump ? 1 : 0);
+        if (ImGui::Button("Dump all loaded textures now (F9)"))
+            InterlockedExchange(&g_scan, 1);
+        ImGui::Text("%ld dumped this run, %ld HD textures loaded", texpack_dumped_count(),
+                    texpack_loaded_count());
+        if (g_scan_found >= 0)
+            ImGui::TextDisabled("Last scan: %d new texture(s)", g_scan_found);
+    }
+
     ImGui::SeparatorText("Info");
     {
         bool fps = xbox_setting_int("RECOMP_SHOW_FPS", 0) != 0;
@@ -212,6 +234,10 @@ void xbox_overlay_init(HWND hwnd, ID3D11Device *dev, ID3D11DeviceContext *ctx)
 /* Window thread. Returns nonzero when the overlay takes the message. */
 int xbox_overlay_msg(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30))) {
+        InterlockedExchange(&g_scan, 1);
+        return 1;
+    }
     if (m == WM_KEYDOWN && w == VK_F1 && !(l & (1 << 30))) {
         InterlockedExchange(&g_visible, !g_visible);
         return 1;
@@ -263,6 +289,9 @@ void xbox_overlay_render(void)
     ReleaseSRWLockExclusive(&g_qlock);
     for (int i = 0; i < n; i++)
         ImGui_ImplWin32_WndProcHandler(q[i].h, q[i].m, q[i].w, q[i].l);
+
+    if (InterlockedExchange(&g_scan, 0))
+        g_scan_found = texpack_scan_memory();
 
     bool show = xbox_overlay_visible();
     bool fps = xbox_setting_int("RECOMP_SHOW_FPS", 0) != 0;

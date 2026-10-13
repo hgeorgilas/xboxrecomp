@@ -482,7 +482,16 @@ typedef struct {
     uint32_t checked_flip, used_flip;
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
+    uint64_t pack_key;             /* texture-pack name (tex_pack.c), 0: none */
+    uint32_t changes;              /* re-uploads with new contents */
+    int pack_pending;              /* a replacement is being decoded */
 } TexEntry;
+
+/* tex_pack.c */
+extern uint64_t texpack_key(const uint32_t *px, uint32_t w, uint32_t h, uint32_t fmt);
+extern void texpack_dump(uint64_t key, const uint32_t *px, uint32_t w, uint32_t h, uint32_t fmt);
+extern int  texpack_lookup(uint64_t key, uint32_t **px, uint32_t *w, uint32_t *h);
+extern void texpack_free(uint32_t *px);
 
 #define MAX_TEX 512
 static TexEntry s_tex[MAX_TEX];
@@ -497,12 +506,13 @@ static uint64_t tex_hash(const PbGpuTexture *t)
     return h;
 }
 
+static int tex_create(TexEntry *e, const uint32_t *px, uint32_t w, uint32_t h,
+                      uint32_t faces, int mips, int cube);
+
 static int tex_upload(TexEntry *e, const PbGpuTexture *t)
 {
     uint32_t faces = t->cube ? 6 : 1, f, u, v, w = t->width, h = t->height;
     uint32_t *px = (uint32_t *)malloc((size_t)w * h * faces * 4);
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_SUBRESOURCE_DATA sd[6];
 
     if (!px)
         return 0;
@@ -536,6 +546,58 @@ static int tex_upload(TexEntry *e, const PbGpuTexture *t)
             }
         }
     }
+    /* Texture packs: name it, dump it, and use a replacement if there is
+     * one. Not for cube maps, specks, or a texture whose contents keep
+     * changing (a movie, an animated surface): those would flood the dump
+     * and no pack replaces them. */
+    e->pack_key = 0;
+    e->pack_pending = 0;
+    /* R8B8/G8B8 are data, not pictures -- Spartan's colour grade is an R8B8
+     * table read through BUMPENVMAP -- and are never named or replaced. */
+    if (!t->cube && w * h >= 64 && e->changes < 4 && t->color != 0x16
+            && t->color != 0x17 && t->color != 0x28 && t->color != 0x29) {
+        uint32_t *rpx = NULL, rw = 0, rh = 0;
+        int r;
+        e->pack_key = texpack_key(px, w, h, t->color);
+        texpack_dump(e->pack_key, px, w, h, t->color);
+        r = texpack_lookup(e->pack_key, &rpx, &rw, &rh);
+        if (r == 1) {
+            int ok = tex_create(e, rpx, rw, rh, 1, t->normalized, 0);
+            texpack_free(rpx);
+            free(px);
+            return ok;
+        }
+        e->pack_pending = r < 0;
+    }
+    {
+        int ok = tex_create(e, px, w, h, faces,
+                            t->levels > 1 && !t->cube && t->normalized, t->cube);
+        free(px);
+        return ok;
+    }
+}
+
+/* A replacement decoded since the texture went up with its original. */
+static void tex_pack_poll(TexEntry *e)
+{
+    uint32_t *rpx = NULL, rw = 0, rh = 0;
+    int r = texpack_lookup(e->pack_key, &rpx, &rw, &rh);
+    if (r == 1) {
+        tex_create(e, rpx, rw, rh, 1, 1, 0);
+        texpack_free(rpx);
+    }
+    e->pack_pending = r < 0;
+}
+
+/* The D3D texture for decoded pixels; mips: a full chain generated on the
+ * GPU from level 0. */
+static int tex_create(TexEntry *e, const uint32_t *px, uint32_t w, uint32_t h,
+                      uint32_t faces, int mips, int cube)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA sd[6];
+    uint32_t f;
+
     if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
     if (e->tex) ID3D11Texture2D_Release(e->tex);
     e->srv = NULL; e->tex = NULL;
@@ -547,13 +609,13 @@ static int tex_upload(TexEntry *e, const PbGpuTexture *t)
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_IMMUTABLE;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    td.MiscFlags = t->cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
+    td.MiscFlags = cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
     for (f = 0; f < faces; f++) {
         sd[f].pSysMem = px + (size_t)f * w * h;
         sd[f].SysMemPitch = w * 4;
         sd[f].SysMemSlicePitch = w * h * 4;
     }
-    if (t->levels > 1 && !t->cube && t->normalized) {
+    if (mips) {
         /* A mipmapped texture gets a full mip chain, generated on the GPU
          * from level 0. Uploading level 0 alone left minified textures
          * sampled at full resolution -- the ground and walls shimmered as
@@ -574,7 +636,6 @@ static int tex_upload(TexEntry *e, const PbGpuTexture *t)
     } else if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, sd, &e->tex)))
         ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex,
                                               NULL, &e->srv);
-    free(px);
     return e->srv != NULL;
 }
 
@@ -642,7 +703,10 @@ static ID3D11ShaderResourceView *tex_get(const PbGpuTexture *t, Surface *target)
             e->checked_flip = s_flip;
             if (h != e->hash) {
                 e->hash = h;
+                e->changes++;
                 tex_upload(e, t);
+            } else if (e->pack_pending) {
+                tex_pack_poll(e);
             }
         }
     } else {

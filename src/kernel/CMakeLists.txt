@@ -20,6 +20,7 @@ set(KERNEL_SOURCES
     kernel_thunks.c
     kernel_bridge.c
     xbox_settings.c
+    tex_pack.c
     xbox_memory_layout.c
     guest_vmem.c
     icall_feedback.c

@@ -2054,6 +2054,56 @@ static int gpu_fetch(const void *tex, uint32_t face_offset, uint32_t u,
     return sample_tex((const Texture *)tex, face_offset, u, v, argb);
 }
 
+/* Texture packs (tex_pack.c): decode the texture a D3D resource header
+ * describes -- Format as the title sends it to SET_TEXTURE_FORMAT, Data to
+ * SET_TEXTURE_OFFSET -- exactly as a draw would, so it gets the same name.
+ * Swizzled and compressed 2D textures only: a linear one needs its pitch,
+ * a palettised one its palette, and neither is in the header. *out is
+ * BGRA, malloc'd. */
+static int tex_decode_at(uint32_t addr, uint32_t format, uint32_t **out,
+                         uint32_t *w, uint32_t *h, uint32_t *color)
+{
+    Texture t;
+    uint32_t u, v, *px;
+    memset(&t, 0, sizeof t);
+    t.offset = addr;
+    t.color = (format >> 8) & 0xFF;
+    t.cube = (format >> 2) & 1;
+    t.levels = (format >> 16) & 0xF;
+    if (t.cube || t.color == 0x0B || !tex_size_from_format(t.color))
+        return 0;
+    t.width  = 1u << ((format >> 20) & 0xF);
+    t.height = 1u << ((format >> 24) & 0xF);
+    tex_update_valid(&t);
+    if (!t.valid || !(px = (uint32_t *)malloc((size_t)t.width * t.height * 4)))
+        return 0;
+    for (v = 0; v < t.height; v++)
+        for (u = 0; u < t.width; u++) {
+            uint32_t c;
+            if (!sample_tex(&t, 0, u, v, &c))
+                c = 0xFFFFFFFFu;
+            if (t.color == 0x07 || t.color == 0x1E)
+                c |= 0xFF000000u;
+            px[v * t.width + u] = c;
+        }
+    *out = px; *w = t.width; *h = t.height; *color = t.color;
+    return 1;
+}
+
+int nv2a_tex_decode(uint32_t data, uint32_t format, uint32_t **out,
+                    uint32_t *w, uint32_t *h, uint32_t *color)
+{
+    return tex_decode_at(dma_resolve(data), format, out, w, h, color);
+}
+
+/* The same, for texels already at a guest address (the offline extractor
+ * copies them there). */
+int nv2a_tex_decode_va(uint32_t va, uint32_t format, uint32_t **out,
+                       uint32_t *w, uint32_t *h, uint32_t *color)
+{
+    return tex_decode_at(va, format, out, w, h, color);
+}
+
 static void gpu_state(PbGpuState *g)
 {
     int st;
@@ -3282,6 +3332,26 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
  * 0x1B00 + 0x40*i onwards; only stage 0 used to be decoded, which was
  * enough for menus drawn one texture at a time and not for a 3D frame that
  * composites its scene through a second stage. */
+/* The raw OFFSET/FORMAT pairs textures were last drawn with, for the
+ * texture-pack scan's diagnostics. */
+static uint32_t s_recent_tex[256][2], s_recent_raw_off[4];
+static unsigned s_recent_n;
+
+const uint8_t *nv2a_tex_bytes(uint32_t offset_param)
+{
+    return (const uint8_t *)xbox_GetMemoryOffset() + dma_resolve(offset_param);
+}
+
+int nv2a_recent_textures(uint32_t (*out)[2], int max)
+{
+    int n = (int)(s_recent_n < 256 ? s_recent_n : 256), i;
+    for (i = 0; i < n && i < max; i++) {
+        out[i][0] = s_recent_tex[i][0];
+        out[i][1] = s_recent_tex[i][1];
+    }
+    return i;
+}
+
 static void tex_stage_method(uint32_t method, uint32_t param)
 {
     uint32_t stage = (method - NV_TEX_FIRST) / 0x40;
@@ -3293,8 +3363,20 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         /* A DMA-object offset like a surface's: physical, reached through
          * the contiguous window when it names contiguous memory. */
         t->offset = dma_resolve(param);
+        s_recent_raw_off[stage] = param;
         break;
     case NV097_SET_TEXTURE_FORMAT:
+        {
+            unsigned i, n = s_recent_n < 256 ? s_recent_n : 256;
+            for (i = 0; i < n; i++)
+                if (s_recent_tex[i][0] == s_recent_raw_off[stage] && s_recent_tex[i][1] == param)
+                    break;
+            if (i == n) {
+                s_recent_tex[s_recent_n % 256][0] = s_recent_raw_off[stage];
+                s_recent_tex[s_recent_n % 256][1] = param;
+                s_recent_n++;
+            }
+        }
         t->color = (param >> 8) & 0xFF;
         t->cube = (param >> 2) & 1;
         t->levels = (param >> 16) & 0xF;
