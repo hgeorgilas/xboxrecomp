@@ -2237,7 +2237,9 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
         if (pg.ui[2] != 0 && slot[0] >= 0) {
             /* Subtitles and the hints that share the bottom letterbox bar
              * sit a little high once the layer fills the screen: a draw
-             * wholly in the bottom fifth moves down 5 lines (at 480). */
+             * wholly in the bar (below 84% of the height) moves down 5 lines
+             * (at 480). Not the bottom fifth: the pause menu's last item sits
+             * there too, split across two draws, and only half of it moved. */
             float H = (float)s->h / (float)fy, top = 1e30f;
             uint32_t k;
             for (k = 0; k < nverts; k++) {
@@ -2245,7 +2247,7 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
                 if (y < top) top = y;
             }
             top += pg.ui2[0];          /* the title's own offset, as drawn */
-            if (top > H * 0.8f)
+            if (top > H * 0.84f)
                 pg.ui2[3] += 5.0f * H / 480.0f;
         }
     }
