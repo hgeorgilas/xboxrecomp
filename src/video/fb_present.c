@@ -295,9 +295,9 @@ static void fb_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
         PatBlt(hdc, 0, 0, cw, y, BLACKNESS);
         PatBlt(hdc, 0, y + h, cw, ch - y - h, BLACKNESS);
     }
-    SetStretchBltMode(hdc, (w == (int)s_fb_width && h == (int)s_fb_height)
-                           ? COLORONCOLOR : HALFTONE);
-    SetBrushOrgEx(hdc, 0, 0, NULL);
+    /* COLORONCOLOR, not HALFTONE: GDI's halftone scaling is done on the CPU
+     * and cost a visible slice of the frame rate. */
+    SetStretchBltMode(hdc, COLORONCOLOR);
     StretchDIBits(hdc, x, y, w, h, 0, 0, (int)s_fb_width, (int)s_fb_height,
                   s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
 }

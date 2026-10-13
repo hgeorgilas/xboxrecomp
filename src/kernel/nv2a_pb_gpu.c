@@ -480,7 +480,25 @@ static int tex_upload(TexEntry *e, const PbGpuTexture *t)
         sd[f].SysMemPitch = w * 4;
         sd[f].SysMemSlicePitch = w * h * 4;
     }
-    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, sd, &e->tex)))
+    if (t->levels > 1 && !t->cube && t->normalized) {
+        /* A mipmapped texture gets a full mip chain, generated on the GPU
+         * from level 0. Uploading level 0 alone left minified textures
+         * sampled at full resolution -- the ground and walls shimmered as
+         * the camera moved. The title's own levels sit in guest memory
+         * after level 0; generated ones are the same box filter in
+         * practice and need no per-format decode. */
+        td.MipLevels = 0;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+        if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &e->tex))) {
+            ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex, 0,
+                                                  NULL, px, w * 4, 0);
+            if (SUCCEEDED(ID3D11Device_CreateShaderResourceView(s_dev,
+                              (ID3D11Resource *)e->tex, NULL, &e->srv)))
+                ID3D11DeviceContext_GenerateMips(s_ctx, e->srv);
+        }
+    } else if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, sd, &e->tex)))
         ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex,
                                               NULL, &e->srv);
     free(px);

@@ -193,6 +193,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
  * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
  * appear several times inside one BEGIN_END to draw a longer run. */
 #define NV097_DRAW_ARRAYS                 0x1810
+#define NV097_ARRAY_ELEMENT32             0x1808
 #define NV097_INLINE_ARRAY                0x1818
 /* Immediate-mode vertices. SET_VERTEX3F/4F carry the position, and writing
  * its last component completes a vertex using whatever the SET_VERTEX_DATA*
@@ -226,7 +227,10 @@ typedef struct {
 } VertexAttr;
 
 #define NV_VERTEX_ATTRS 16
-#define NV_MAX_INDICES  4096
+/* Indices per batch. Was 4096, and anything past it was dropped without a
+ * word: Spartan's terrain and walls come in bigger batches than that, and
+ * their tails were simply missing. */
+#define NV_MAX_INDICES  65536
 #define NV_MAX_INLINE   65536           /* dwords of INLINE_ARRAY per batch */
 
 /* Texture stage 0, decoded from what the title programmed.
@@ -253,7 +257,7 @@ typedef struct {
 static struct {
     VertexAttr attr[NV_VERTEX_ATTRS];
     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
-    uint16_t   idx[NV_MAX_INDICES];
+    uint32_t   idx[NV_MAX_INDICES];
     uint32_t   idx_count;
     /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
      * instead of into a buffer the title points at. Same vertex format, a
@@ -2039,7 +2043,7 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
  * rasterised, and a whole batch goes to nv2a_pb_gpu.c as one draw. Every
  * decision above this point -- vertex programs, near-plane clipping, which
  * surface -- is unchanged; only the pixels move to the GPU. */
-#define NV_GPU_MAX_VERTS (NV_MAX_INDICES * 6)
+#define NV_GPU_MAX_VERTS (4096 * 6)       /* flushed when full */
 static PbGpuVertex s_gv[NV_GPU_MAX_VERTS];
 static uint32_t    s_gn;
 
@@ -2415,7 +2419,7 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 static struct {
     int nworkers;
     HANDLE go[XF_MAX_WORKERS], done[XF_MAX_WORKERS];
-    const uint16_t *list;
+    const uint32_t *list;
     Nv2aVshOutput *out;
     uint32_t count;
     volatile LONG next;
@@ -2443,7 +2447,7 @@ static DWORD WINAPI xf_worker(LPVOID arg)
     }
 }
 
-static void xf_run(const uint16_t *list, Nv2aVshOutput *out, uint32_t count)
+static void xf_run(const uint32_t *list, Nv2aVshOutput *out, uint32_t count)
 {
     int i;
     if (s_xfp.nworkers < 0) {
@@ -2483,9 +2487,12 @@ static void raster_batch_program(void)
      * thread then sat in KickOff waiting for it. A program has no side
      * effects unless it may write c[] (CXT_WRITE), so the result for an
      * index is reused; with CXT_WRITE every index is run as before. */
-    static uint32_t s_vgen, s_vstamp[65536], s_vwhere[65536];
+    /* Indices are 32-bit; vertices past the table are simply not shared,
+     * which costs a transform, not a picture. */
+#define XF_SHARE_MAX (1u << 20)
+    static uint32_t s_vgen, s_vstamp[XF_SHARE_MAX], s_vwhere[XF_SHARE_MAX];
     static uint32_t s_map[NV_MAX_INDICES];
-    static uint16_t s_uniq[NV_MAX_INDICES];
+    static uint32_t s_uniq[NV_MAX_INDICES];
     static Nv2aVshOutput s_uout[NV_MAX_INDICES];
     int reuse = !nv2a_vsh_cxt_write();
 
@@ -2498,7 +2505,12 @@ static void raster_batch_program(void)
             s_vgen = 1;
         }
         for (i = 0; i < n; i++) {
-            uint16_t v = s_gpu.idx[i];
+            uint32_t v = s_gpu.idx[i];
+            if (v >= XF_SHARE_MAX) {
+                s_map[i] = nu;
+                s_uniq[nu++] = v;
+                continue;
+            }
             if (s_vstamp[v] != s_vgen) {
                 s_vstamp[v] = s_vgen;
                 s_vwhere[v] = nu;
@@ -2988,7 +3000,7 @@ static void draw_inline_array(void)
             s_gpu.attr[a].stride = vsize;
 
     for (i = 0; i < count; i++)
-        s_gpu.idx[i] = (uint16_t)i;
+        s_gpu.idx[i] = i;
     s_gpu.idx_count = count;
 
     s_gpu.inline_active = 1;
@@ -3037,7 +3049,7 @@ static void draw_immediate(void)
     }
 
     for (i = 0; i < s_gpu.imm_count && i < NV_MAX_INDICES; i++)
-        s_gpu.idx[i] = (uint16_t)i;
+        s_gpu.idx[i] = i;
     s_gpu.idx_count = i;
 
     /* fetch_attr bounds-checks against inline_count dwords. */
@@ -3554,16 +3566,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (!s_gpu.prim)
             break;
         for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
+            s_gpu.idx[s_gpu.idx_count++] = start + i;
         break;
     }
 
     case NV097_ARRAY_ELEMENT16:
         /* Two 16-bit indices per parameter word. */
         if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
+            s_gpu.idx[s_gpu.idx_count++] = param & 0xFFFF;
+            s_gpu.idx[s_gpu.idx_count++] = param >> 16;
         }
+        break;
+
+    case NV097_ARRAY_ELEMENT32:
+        /* One 32-bit index per parameter word. Unhandled until now, so every
+         * batch indexed this way -- a good part of Spartan's level geometry
+         * -- was never drawn. */
+        {
+            static int off = -1;
+            if (off < 0)
+                off = getenv("RECOMP_NO_E32") != NULL;
+            if (off)
+                break;
+        }
+        if (s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES)
+            s_gpu.idx[s_gpu.idx_count++] = param;
         break;
 
     case NV097_SET_FLIP_READ:
