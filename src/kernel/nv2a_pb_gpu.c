@@ -2398,12 +2398,17 @@ static const char k_blit_vs[] =
 static const char k_blit_ps[] =
 "cbuffer B : register(b0) { float4 uvmax; float4 foot; };\n"
 "Texture2D t : register(t0); SamplerState s : register(s0);\n"
+"Texture2D gl : register(t1);\n"
 "float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
 "  float2 c = uv * uvmax.xy; int n = (int)foot.z; float4 acc = 0; int i, j;\n"
 "  if (n <= 1) acc = t.Sample(s, c);\n"
 "  else { for (j = 0; j < n; j++) for (i = 0; i < n; i++)\n"
 "      acc += t.Sample(s, c + ((float2(i, j) + 0.5) / n - 0.5) * foot.xy);\n"
 "    acc /= n * n; }\n"
+"  if (uvmax.z > 0.5) {\n"
+"    int3 i = (int3)round(saturate(acc.rgb) * 255.0);\n"
+"    acc.rgb = float3(gl.Load(int3(i.r, 0, 0)).r, gl.Load(int3(i.g, 0, 0)).g,\n"
+"                     gl.Load(int3(i.b, 0, 0)).b); }\n"
 "  return float4(acc.rgb, foot.w != 0 ? acc.a : 1); }\n";
 
 /* The blit shaders, sampler and constants, made once, for the present and
@@ -2444,11 +2449,70 @@ static int blit_init(void)
     return s_blit_vs && s_blit_ps && s_blit_smp && s_blit_cb;
 }
 
+/* The title's gamma ramp (D3D's vblank handler hands it over: see
+ * Spartan's sub_0022BC9D), applied as the last step of the present, where
+ * the console's DAC applied it. A straight ramp is not applied at all. */
+static uint8_t           s_gamma_pending[256 * 4];
+static volatile LONG     s_gamma_dirty;
+static int               s_gamma_on;
+static ID3D11Texture2D          *s_gamma_tex;
+static ID3D11ShaderResourceView *s_gamma_srv;
+
+void xbox_SetGammaRamp(const uint8_t *r, const uint8_t *g, const uint8_t *b)
+{
+    static uint8_t last[256 * 4];
+    uint8_t lut[256 * 4];
+    int i, identity = 1;
+    for (i = 0; i < 256; i++) {
+        lut[i * 4 + 0] = r[i];
+        lut[i * 4 + 1] = g[i];
+        lut[i * 4 + 2] = b[i];
+        lut[i * 4 + 3] = 255;
+        if (r[i] != i || g[i] != i || b[i] != i)
+            identity = 0;
+    }
+    if (!memcmp(lut, last, sizeof lut))
+        return;
+    memcpy(last, lut, sizeof lut);
+    memcpy(s_gamma_pending, lut, sizeof lut);
+    InterlockedExchange(&s_gamma_dirty, identity ? 2 : 1);
+    fprintf(stderr, "  [PBGPU] gamma ramp %s: r %u %u %u %u  g %u %u %u  b %u %u %u\n",
+            identity ? "identity" : "set", r[0], r[64], r[128], r[255],
+            g[64], g[128], g[255], b[64], b[128], b[255]);
+}
+
+static void gamma_update(void)
+{
+    LONG d = InterlockedExchange(&s_gamma_dirty, 0);
+    if (!d)
+        return;
+    s_gamma_on = 0;
+    if (d == 2)
+        return;
+    if (!s_gamma_tex) {
+        D3D11_TEXTURE2D_DESC td;
+        memset(&td, 0, sizeof td);
+        td.Width = 256; td.Height = 1;
+        td.MipLevels = td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_gamma_tex)))
+            return;
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_gamma_tex, NULL,
+                                              &s_gamma_srv);
+    }
+    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_gamma_tex, 0, NULL,
+                                          s_gamma_pending, 256 * 4, 0);
+    s_gamma_on = s_gamma_srv != NULL;
+}
+
 static void blit_consts(const float uvmax[2], float fx, float fy, float taps, float alpha)
 {
     D3D11_MAPPED_SUBRESOURCE m;
     float c[8];
-    c[0] = uvmax[0]; c[1] = uvmax[1]; c[2] = 0; c[3] = 0;
+    c[0] = uvmax[0]; c[1] = uvmax[1]; c[2] = uvmax[2]; c[3] = 0;
     c[4] = fx; c[5] = fy; c[6] = taps; c[7] = alpha;
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -2463,7 +2527,7 @@ static ID3D11Texture2D *surf_logical(Surface *s)
 {
     D3D11_VIEWPORT vp;
     D3D11_RECT r;
-    float one[2] = { 1, 1 }, taps;
+    float one[3] = { 1, 1, 0 }, taps;
     ID3D11ShaderResourceView *none = NULL;
 
     if (s->pw == s->w && s->ph == s->h)
@@ -2644,7 +2708,11 @@ int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height)
         }
         uv[0] = sw / (float)s->w;
         uv[1] = sh / (float)s->h;
-        uv[2] = uv[3] = 0;
+        gamma_update();
+        uv[2] = s_gamma_on ? 1.0f : 0.0f;
+        uv[3] = 0;
+        if (s_gamma_on)
+            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 1, 1, &s_gamma_srv);
         {
             /* Averaged over each window pixel when the scaled frame is
              * bigger than the window. */
