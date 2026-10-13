@@ -2289,6 +2289,56 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         raster_xf_triangle(&poly[0], &poly[i], &poly[i + 1]);
 }
 
+/* RECOMP_FLIP_HZ=<n>: hold each flip until the next tick of an n Hz clock.
+ *
+ * A flip here completes the moment it is asked for (there is no scanout), so
+ * a title that paces itself on the flip runs as fast as the host can draw --
+ * Spartan's menu went to 75 fps once the GPU back end made drawing cheap,
+ * and its animations with it. On hardware the flip lands on a vblank; 60 is
+ * the NTSC rate, and a title that wants 30 still gets it by waiting on two.
+ * The clock advances by a whole period per flip, so the average rate is
+ * exact; a frame that runs late is not waited for, and a long stall resyncs
+ * rather than letting the next frames race to catch up. */
+static void flip_pace(void)
+{
+    static int hz = -1;
+    static LARGE_INTEGER freq;
+    static LONGLONG next;
+    static HANDLE timer;
+    LARGE_INTEGER now;
+    LONGLONG period;
+
+    if (hz < 0) {
+        const char *e = getenv("RECOMP_FLIP_HZ");
+        hz = e ? atoi(e) : 0;
+        QueryPerformanceFrequency(&freq);
+        /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: sub-millisecond waits
+         * without raising the system timer resolution. */
+        timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002, TIMER_ALL_ACCESS);
+    }
+    if (hz <= 0)
+        return;
+    period = freq.QuadPart / hz;
+    QueryPerformanceCounter(&now);
+    if (!next || now.QuadPart - next > period * 4)
+        next = now.QuadPart;
+    next += period;
+    while (now.QuadPart < next) {
+        LONGLONG left = next - now.QuadPart;
+        LONGLONG ms2 = freq.QuadPart / 500;          /* 2 ms */
+        if (timer && left > ms2) {
+            LARGE_INTEGER due;
+            /* relative, in 100 ns units, leaving ~1 ms to spin */
+            due.QuadPart = -((left - ms2 / 2) * 10000000 / freq.QuadPart);
+            SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
+            WaitForSingleObject(timer, INFINITE);
+        } else {
+            SwitchToThread();
+        }
+        QueryPerformanceCounter(&now);
+    }
+}
+
 static Nv2aVshOutput s_xf[NV_MAX_INDICES];
 
 static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
@@ -3253,6 +3303,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     s_gpu.drawn_offset, s_gpu.color_offset, 10);
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now. */
+        flip_pace();
         s_gpu.flip_read = s_gpu.flip_write;
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
