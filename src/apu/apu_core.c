@@ -377,6 +377,60 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
             g_waveout.frames_written);
 }
 
+/* F10 in the game window: record the next 30 s of what goes to the speakers
+ * to capture\audio_NNN.wav, and log what could have made it crackle while
+ * it ran -- buffers dropped, underruns, frames the VP did not run. */
+static volatile long g_rec_idle_frames;
+
+static void rec_audio(const int16_t *buf, int n, int sent)
+{
+    extern int xbox_FramebufferKeyDown(int vk);
+    static FILE *wav;
+    static int was, total, dropped, underruns;
+    static long idle0;
+    static char path[64];
+    int down = xbox_FramebufferKeyDown(VK_F10);
+
+    if (down && !was && !wav) {
+        int i;
+        CreateDirectoryA("capture", NULL);
+        for (i = 0; i < 1000; i++) {
+            snprintf(path, sizeof path, "capture\\audio_%03d.wav", i);
+            if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+                break;
+        }
+        if ((wav = fopen(path, "wb")) != NULL) {
+            uint32_t h[11] = { 0x46464952, 0, 0x45564157, 0x20746D66, 16,
+                               1 | (2u << 16), 48000, 48000 * 4, 4 | (16u << 16),
+                               0x61746164, 0 };
+            fwrite(h, 4, 11, wav);
+            total = dropped = 0;
+            xa2_take_underruns();               /* start the count afresh */
+            underruns = 0;
+            idle0 = g_rec_idle_frames;
+            fprintf(stderr, "[APU] F10: recording 30 s of audio -> %s\n", path);
+        }
+    }
+    was = down;
+    if (!wav)
+        return;
+    fwrite(buf, 4, (size_t)n, wav);
+    total += n;
+    if (!sent)
+        dropped++;
+    underruns += xa2_take_underruns();
+    if (total >= 48000 * 30) {
+        uint32_t bytes = (uint32_t)total * 4u, riff = 36 + bytes;
+        fseek(wav, 4, SEEK_SET);  fwrite(&riff, 4, 1, wav);
+        fseek(wav, 40, SEEK_SET); fwrite(&bytes, 4, 1, wav);
+        fclose(wav);
+        wav = NULL;
+        fprintf(stderr, "[APU] audio written to %s: %d buffers dropped, %d"
+                " underruns, %ld idle VP frames\n", path, dropped, underruns,
+                g_rec_idle_frames - idle0);
+    }
+}
+
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
     if ((d->ep_frame_div + 1) % 8) {
@@ -426,6 +480,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
         if (fill >= buf_size) {
             int ok = xa2_submit_samples((const int16_t *)stage, buf_size);
+            rec_audio((const int16_t *)stage, buf_size, ok);
             {
                 /* RECOMP_APU_WAV=<file>: what goes to the speakers, as a
                  * 48 kHz stereo WAV (header sized for 10 minutes), to look at
@@ -776,6 +831,9 @@ static void *mcpx_apu_frame_thread(void *arg)
                 }
             }
         } else {
+            /* Counted for the F10 recording's summary: an idle frame is
+             * 32 samples of silence in the output. */
+            g_rec_idle_frames++;
             /* Lightweight: just monitor frame (test tone + software mixer) */
             if (getenv("RECOMP_APU_VP_TRACE")) {
                 static unsigned off, trap, halt, n;
