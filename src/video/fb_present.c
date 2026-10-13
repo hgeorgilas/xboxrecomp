@@ -148,8 +148,55 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+/* Borderless fullscreen: the window, without its frame, over the whole
+ * monitor it is on; the swap chain follows the client size. Alt+Enter, the
+ * overlay or RECOMP_FULLSCREEN=1. Changed on the window's own thread. */
+#define WM_FB_FULLSCREEN (WM_APP + 1)
+static WINDOWPLACEMENT s_fb_place;
+static int s_fb_full;
+
+static void fb_set_fullscreen(HWND h, int on)
+{
+    if (on == s_fb_full)
+        return;
+    if (on) {
+        MONITORINFO mi;
+        mi.cbSize = sizeof mi;
+        s_fb_place.length = sizeof s_fb_place;
+        GetWindowPlacement(h, &s_fb_place);
+        GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi);
+        SetWindowLongPtrA(h, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    } else {
+        SetWindowLongPtrA(h, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowPlacement(h, &s_fb_place);
+        SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                     | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    }
+    s_fb_full = on;
+}
+
+void xbox_FramebufferSetFullscreen(int on)
+{
+    if (s_fb_hwnd)
+        PostMessageA(s_fb_hwnd, WM_FB_FULLSCREEN, (WPARAM)(on != 0), 0);
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    if (m == WM_FB_FULLSCREEN) {
+        fb_set_fullscreen(h, (int)w);
+        return 0;
+    }
+    if (m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30))) {
+        extern void xbox_setting_set(const char *key, const char *val);
+        fb_set_fullscreen(h, !s_fb_full);
+        xbox_setting_set("RECOMP_FULLSCREEN", s_fb_full ? "1" : "0");
+        return 0;
+    }
     /* The settings overlay (F1) sees input first; what it takes -- all of
      * it while it is open -- the title does not, and keys held when it
      * opened read as released. */
@@ -358,6 +405,11 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     hdc = GetDC(hwnd);
     s_fb_hwnd = hwnd;
+    {
+        extern int xbox_setting_int(const char *key, int def);
+        if (xbox_setting_int("RECOMP_FULLSCREEN", 0))
+            fb_set_fullscreen(hwnd, 1);
+    }
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);

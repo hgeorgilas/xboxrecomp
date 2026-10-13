@@ -28,6 +28,7 @@ const char *xbox_setting_get(const char *key);
 int   xbox_setting_int(const char *key, int def);
 float xbox_setting_float(const char *key, float def);
 void  xbox_setting_set(const char *key, const char *val);
+void  xbox_FramebufferSetFullscreen(int on);
 int   xbox_settings_save(void);
 const char *xbox_settings_path(void);
 }
@@ -107,6 +108,18 @@ void panel()
         if (ImGui::Checkbox("HUD and subtitles use the whole screen", &fill))
             set_int("RECOMP_SAFE_AREA_FILL", fill ? 1 : 0);
         ImGui::SetItemTooltip("Off: the console's TV-safe layout, with margins.");
+    }
+
+    {
+        bool full = xbox_setting_int("RECOMP_FULLSCREEN", 0) != 0;
+        if (ImGui::Checkbox("Fullscreen (Alt+Enter)", &full)) {
+            set_int("RECOMP_FULLSCREEN", full ? 1 : 0);
+            xbox_FramebufferSetFullscreen(full ? 1 : 0);
+        }
+        bool vsync = xbox_setting_int("RECOMP_VSYNC", 0) != 0;
+        if (ImGui::Checkbox("V-sync", &vsync))
+            set_int("RECOMP_VSYNC", vsync ? 1 : 0);
+        ImGui::SetItemTooltip("Waits for the display: no tearing, a little more latency.");
     }
 
     ImGui::SeparatorText("Textures");

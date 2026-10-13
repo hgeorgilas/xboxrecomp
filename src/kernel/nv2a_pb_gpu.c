@@ -2549,8 +2549,18 @@ int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height)
             ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &full);
             xbox_overlay_render();
         }
-        /* No vsync wait: the executor already paces flips to 60 Hz. */
-        IDXGISwapChain1_Present(s_swap, 0, 0);
+        /* No vsync wait by default: the executor already paces flips to
+         * 60 Hz. RECOMP_VSYNC=1 waits for the display's -- no tearing, at
+         * the cost of a frame of latency. */
+        {
+            static long gen;
+            static UINT interval;
+            if (gen != xbox_settings_gen()) {
+                gen = xbox_settings_gen();
+                interval = xbox_setting_int("RECOMP_VSYNC", 0) ? 1 : 0;
+            }
+            IDXGISwapChain1_Present(s_swap, interval, 0);
+        }
     }
 out_ok:
     ok = 1;
