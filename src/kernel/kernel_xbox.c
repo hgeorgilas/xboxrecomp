@@ -11,6 +11,7 @@
 
 #include "kernel.h"
 #include <string.h>
+#include <stdlib.h>
 
 /* ============================================================================
  * Exported Data Objects
@@ -145,9 +146,13 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_VIDEO:
-        /* NTSC with widescreen and HDTV support enabled */
+        /* A 4:3 set with no HDTV modes, which is what titles have always
+         * seen here: the flags used to be written with made-up values
+         * (0x01 | 0x02) that match no XDK flag. RECOMP_VIDEO_FLAGS sets
+         * them, e.g. 0x10000 for widescreen. */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            const char *vf = getenv("RECOMP_VIDEO_FLAGS");
+            *(PULONG)Value = vf ? (ULONG)strtoul(vf, NULL, 0) : 0;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

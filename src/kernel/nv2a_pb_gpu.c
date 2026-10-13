@@ -1745,6 +1745,21 @@ static const char k_pg_tail[] =
 "  r.f = fogf(o[5].x);\n"
 "  return r; }\n";
 
+/* The shape the frame is shown at, width over height: RECOMP_ASPECT, for a
+ * title rendering anamorphic widescreen into its 4:3 buffer; 0 shows the
+ * buffer at its own shape. */
+float xbox_DisplayAspect(void)
+{
+    static float a = -1;
+    if (a < 0) {
+        const char *e = getenv("RECOMP_ASPECT");
+        a = e ? (float)atof(e) : 0;
+        if (a < 0.5f || a > 8)
+            a = 0;
+    }
+    return a;
+}
+
 /* The program pg_get last returned. */
 static PgEntry *s_pg_cur;
 
@@ -1805,10 +1820,18 @@ static void ui_fill(const PgEntry *e, float W, float H, PgConsts *pg)
         return;
     bw = W - 2 * ox;
     bh = H - 2 * oy;
-    sc = W / bw < H / bh ? W / bw : H / bh;
-    pg->ui[0] = c[0];
-    pg->ui[2] = sc;
-    pg->ui[3] = (W - bw * sc) * 0.5f - 0.5f;
+    {
+        /* Scaled uniformly as displayed: with a display aspect wider than
+         * the buffer, a buffer pixel shows wider than it is tall, and the
+         * box is narrowed by the same factor to keep its shapes. */
+        float wd = xbox_DisplayAspect() > 0 ? H * xbox_DisplayAspect() : W;
+        float sx;
+        sc = wd / bw < H / bh ? wd / bw : H / bh;
+        sx = sc * W / wd;
+        pg->ui[0] = c[0];
+        pg->ui[2] = sx;
+        pg->ui[3] = (W - bw * sx) * 0.5f - 0.5f;
+    }
     pg->ui2[0] = c[1];
     pg->ui2[2] = sc;
     pg->ui2[3] = (H - bh * sc) * 0.5f - 0.5f;
@@ -2295,13 +2318,14 @@ int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height)
         D3D11_MAPPED_SUBRESOURCE m;
         float uv[4];
         float sw = (float)width, sh = (float)height;
-        float scale = (float)cw / sw < (float)ch / sh ? (float)cw / sw : (float)ch / sh;
+        float aspect = xbox_DisplayAspect() > 0 ? xbox_DisplayAspect() : sw / sh;
         ID3D11Buffer *cb = s_blit_cb;
 
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_swap_rtv, NULL);
         ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_swap_rtv, black);
-        vp.Width = sw * scale;
-        vp.Height = sh * scale;
+        /* The largest box of the display aspect in the window. */
+        vp.Height = (float)cw / aspect < (float)ch ? (float)cw / aspect : (float)ch;
+        vp.Width = vp.Height * aspect;
         vp.TopLeftX = ((float)cw - vp.Width) * 0.5f;
         vp.TopLeftY = ((float)ch - vp.Height) * 0.5f;
         vp.MinDepth = 0;

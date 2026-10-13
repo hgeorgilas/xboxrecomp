@@ -329,6 +329,13 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         RegisterClassA(&wc);
     }
     r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
+    {
+        /* A display aspect (RECOMP_ASPECT) shapes the window to it. */
+        extern float xbox_DisplayAspect(void);
+        float a = xbox_DisplayAspect();
+        if (a > 0)
+            r.right = (LONG)((float)r.bottom * a + 0.5f);
+    }
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
