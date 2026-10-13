@@ -6,6 +6,7 @@
  * function in that file this follows.
  */
 #include "nv2a_pb_gpu.h"
+#include "nv2a_vsh_interp.h"
 
 #if defined(_WIN32)
 
@@ -1327,27 +1328,9 @@ static Surface *bind_target(const PbGpuState *st, Zeta **zout)
     return s;
 }
 
-void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
+/* RECOMP capture: one line per screen-space draw (see cap_poll). */
+static void cap_log_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
 {
-    Surface *s;
-    Zeta *z;
-    PsKey key;
-    PsConsts pc;
-    ID3D11ShaderResourceView *srv[4];
-    ID3D11SamplerState *smp[4];
-    D3D11_MAPPED_SUBRESOURCE m;
-    uint32_t bytes = count * sizeof(PbGpuVertex), st_i, zmax;
-    float vpc[4], bf[4];
-    UINT stride = sizeof(PbGpuVertex), off;
-    ID3D11PixelShader *ps;
-    ID3D11BlendState *bs;
-
-    if (!count || bytes > VB_BYTES || !pbgpu_enabled())
-        return;
-    EnterCriticalSection(&s_lock);
-    if (!(s = bind_target(st, &z)))
-        goto out;
-
     if (s_cap.active && s_flip == s_cap.flip && s_cap.log) {
         /* One line per draw: its screen extent and the state that decides
          * what it does to the target. */
@@ -1402,6 +1385,31 @@ void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
             }
         }
     }
+
+}
+
+/* Everything a draw needs except its vertices and vertex shader: target,
+ * pixel shader and its constants, textures, blend/depth/stencil/raster state.
+ * Shared by the screen-space path (pbgpu_draw) and the vertex-program path
+ * (pbgpu_draw_program). Called with s_lock held; 0 if nothing can be drawn. */
+static int draw_begin(const PbGpuState *st, Surface **so, Zeta **zo)
+{
+    Surface *s;
+    Zeta *z;
+    PsKey key;
+    PsConsts pc;
+    ID3D11ShaderResourceView *srv[4];
+    ID3D11SamplerState *smp[4];
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t st_i;
+    float bf[4];
+    ID3D11PixelShader *ps;
+    ID3D11BlendState *bs;
+
+    if (!(s = bind_target(st, &z)))
+        return 0;
+    *so = s;
+    *zo = z;
 
     /* Pixel shader key: the combiner program's shape, not its constants. */
     memset(&key, 0, sizeof key);
@@ -1459,7 +1467,7 @@ void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
         }
     }
     if (!(ps = ps_get(&key)))
-        goto out;
+        return 0;
 
     for (st_i = 0; st_i < 8; st_i++) {
         unpack(st->rc.factor0[st_i], pc.fac0[st_i]);
@@ -1470,27 +1478,6 @@ void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
     memcpy(pc.fogc, st->fog_color, sizeof pc.fogc);
     pc.misc[0] = (float)(st->alpha_ref & 0xFF);
 
-    /* Vertices. */
-    if (s_vb_pos + bytes > VB_BYTES)
-        s_vb_pos = 0;
-    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vb, 0,
-            s_vb_pos ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD, 0, &m)))
-        goto out;
-    memcpy((uint8_t *)m.pData + s_vb_pos, v, bytes);
-    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
-    off = s_vb_pos;
-    s_vb_pos += bytes;
-
-    zmax = st->zeta_format == 1 ? 0xFFFFu : 0xFFFFFFu;
-    vpc[0] = 2.0f / (float)s->w;
-    vpc[1] = 2.0f / (float)s->h;
-    vpc[2] = 1.0f / (float)zmax;
-    vpc[3] = 0;
-    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vs_cb, 0,
-                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        memcpy(m.pData, vpc, sizeof vpc);
-        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vs_cb, 0);
-    }
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_ps_cb, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         memcpy(m.pData, &pc, sizeof pc);
@@ -1512,20 +1499,19 @@ void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, depth_get(st, z != NULL),
                                                st->stencil_ref & 0xFF);
     ID3D11DeviceContext_RSSetState(s_ctx, rs_get(st));
-    ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
-    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &off);
-    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
-    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_vs_cb);
     ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_ps_cb);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
-    ID3D11DeviceContext_Draw(s_ctx, count, 0);
-    {
-        ID3D11ShaderResourceView *none[4] = { 0, 0, 0, 0 };
-        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, none);
-    }
+    return 1;
+}
+
+/* After a draw: let go of the textures (a render target bound as a texture
+ * cannot be bound as a target next) and, when capturing, keep a picture. */
+static void draw_end(Surface *s)
+{
+    ID3D11ShaderResourceView *none[4] = { 0, 0, 0, 0 };
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, none);
     if (s_cap.active && s_flip == s_cap.flip && s_cap.draws <= 3) {
         /* The first few draws of each pass, one image each: what a single
          * draw did to the target, where the per-pass images only show the
@@ -1534,8 +1520,311 @@ void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
         snprintf(name, sizeof name, "%02u_%08X_draw%u", s_cap.n, s->addr, s_cap.draws);
         rt_dump(s, name);
     }
+}
+
+/* Screen-space vertices, transformed already (by the CPU interpreter or
+ * because the title sent them that way). */
+void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
+{
+    Surface *s;
+    Zeta *z;
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t bytes = count * sizeof(PbGpuVertex), zmax;
+    float vpc[4];
+    UINT stride = sizeof(PbGpuVertex), off;
+
+    if (!count || bytes > VB_BYTES || !pbgpu_enabled())
+        return;
+    EnterCriticalSection(&s_lock);
+    if (!draw_begin(st, &s, &z))
+        goto out;
+    cap_log_draw(st, v, count);
+
+    if (s_vb_pos + bytes > VB_BYTES)
+        s_vb_pos = 0;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vb, 0,
+            s_vb_pos ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        goto out;
+    memcpy((uint8_t *)m.pData + s_vb_pos, v, bytes);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
+    off = s_vb_pos;
+    s_vb_pos += bytes;
+
+    zmax = st->zeta_format == 1 ? 0xFFFFu : 0xFFFFFFu;
+    vpc[0] = 2.0f / (float)s->w;
+    vpc[1] = 2.0f / (float)s->h;
+    vpc[2] = 1.0f / (float)zmax;
+    vpc[3] = 0;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vs_cb, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        memcpy(m.pData, vpc, sizeof vpc);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vs_cb, 0);
+    }
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &off);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_vs_cb);
+    ID3D11DeviceContext_Draw(s_ctx, count, 0);
+    draw_end(s);
 out:
     LeaveCriticalSection(&s_lock);
+}
+
+/* ---- vertex programs on the GPU ------------------------------------------
+ *
+ * The title's vertex program, translated to HLSL (nv2a_vsh_hlsl.c), runs as
+ * the vertex shader. Its raw attributes go up in a structured buffer read by
+ * vertex index -- no input layout to match against the NV2A's own vertex
+ * formats (packed normals, shorts...), which the executor already decodes
+ * to floats -- and its 192 constants in a constant buffer.
+ *
+ * What the program writes is screen space, as on the console: the XDK
+ * appends the viewport transform and the divide by w to every shader. So
+ * the epilogue here is the one the screen-space path uses -- back to clip
+ * space through w -- and near-plane clipping is a clip distance at the same
+ * w the CPU clipper used. */
+#define PG_MAX_PROGS   512
+#define PG_ATTR_F4     (1u << 21)     /* float4s in the attribute ring: 32 MB */
+#define PG_IDX_U32     (1u << 21)     /* indices in the index ring: 8 MB */
+
+typedef struct {
+    uint64_t hash;
+    ID3D11VertexShader *vs;           /* NULL: translation or compile failed */
+} PgEntry;
+static PgEntry   s_pg[PG_MAX_PROGS];
+static int       s_npg;
+static ID3D11Buffer *s_attr_buf, *s_idx_buf, *s_pg_cb, *s_const_cb;
+static ID3D11ShaderResourceView *s_attr_srv;
+static uint32_t  s_attr_pos, s_idx_pos, s_const_gen_up;
+
+typedef struct {
+    float vp[4];                      /* 2/w, 2/h, 1/zmax, - */
+    float fog[4];                     /* enable, mode, param x, param y */
+    uint32_t info[4];                 /* stride (float4s), first element */
+    int32_t  slot[16][4];             /* attribute -> slot in a vertex, or -1 */
+    float    vdef[16][4];             /* value of an absent attribute */
+} PgConsts;
+
+static const char k_pg_head[] =
+"cbuffer P : register(b0) { float4 vp; float4 fogp; uint4 info;\n"
+"  int4 slot[16]; float4 vdef[16]; };\n"
+"cbuffer K : register(b1) { float4 C[192]; };\n"
+"StructuredBuffer<float4> Attr : register(t0);\n"
+"struct VO { float4 p:SV_Position; float4 d0:COLOR0; float4 d1:COLOR1;\n"
+"  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2;\n"
+"  float4 t3:TEXCOORD3; float f:TEXCOORD4; float cd:SV_ClipDistance0; };\n"
+"float4 nv_rcc(float x) { float f = 1.0 / x;\n"
+"  if (abs(f) < 5.42101e-20) f = f < 0 ? -5.42101e-20 : 5.42101e-20;\n"
+"  if (abs(f) > 1.884467e19) f = f < 0 ? -1.884467e19 : 1.884467e19;\n"
+"  return f.xxxx; }\n"
+"float4 nv_exp(float x) { float fl = floor(x);\n"
+"  return float4(exp2(fl), x - fl, exp2(x), 1.0); }\n"
+"float4 nv_log(float x) { float ax = abs(x);\n"
+"  if (ax == 0) return float4(asfloat(0xFF800000), 1.0, asfloat(0xFF800000), 1.0);\n"
+"  float e = floor(log2(ax)); return float4(e, ax / exp2(e), log2(ax), 1.0); }\n"
+"float4 nv_lit(float4 c) { float nl = max(c.x, 0), nh = max(c.y, 0);\n"
+"  float p = clamp(c.w, -127.9961, 127.9961);\n"
+"  return float4(1.0, nl, c.x > 0 ? pow(nh, p) : 0, 1.0); }\n"
+"float fogf(float d) { if (fogp.x == 0) return 1.0;\n"
+"  float f, px = fogp.z, py = fogp.w; uint mode = (uint)fogp.y;\n"
+"  if (mode == 0x800 || mode == 0x802) f = px + exp2(d * py * 16.0) - 1.5;\n"
+"  else if (mode == 0x801 || mode == 0x803) f = px + exp2(-d * d * py * py * 32.0) - 1.5;\n"
+"  else f = px + d * py - 1.0;\n"
+"  if (mode == 0x802 || mode == 0x803 || mode == 0x804) f = abs(f);\n"
+"  if (isnan(f)) f = 1.0;\n"
+"  return saturate(f); }\n"
+"VO main(uint vid : SV_VertexID) {\n"
+"  float4 v[16]; int k;\n"
+"  [unroll] for (k = 0; k < 16; k++)\n"
+"    v[k] = slot[k].x >= 0 ? Attr[info.y + vid * info.x + (uint)slot[k].x] : vdef[k];\n"
+"  float4 R[12]; [unroll] for (k = 0; k < 12; k++) R[k] = 0;\n"
+"  float4 o[13]; [unroll] for (k = 0; k < 13; k++) o[k] = 0;\n"
+"  o[3].w = 1; o[4].w = 1; o[9].w = 1; o[10].w = 1; o[11].w = 1; o[12].w = 1;\n"
+"  float4 oPos = 0; int a0 = 0;\n";
+
+static const char k_pg_tail[] =
+"  VO r; float w = oPos.w;\n"
+"  if (isinf(w) || isnan(w)) w = 1.0;\n"
+"  float x = oPos.x * vp.x - 1.0, y = 1.0 - oPos.y * vp.y, z = oPos.z * vp.z;\n"
+"  r.p = float4(x * w, y * w, z * w, w);\n"
+"  r.cd = w - 1e-3;\n"
+"  r.d0 = o[3]; r.d1 = o[4];\n"
+"  r.t0 = o[9]; r.t1 = o[10]; r.t2 = o[11]; r.t3 = o[12];\n"
+"  r.f = fogf(o[5].x);\n"
+"  return r; }\n";
+
+static ID3D11VertexShader *pg_get(void)
+{
+    uint64_t h = nv2a_vsh_program_hash();
+    int i;
+    static char body[96 * 1024];
+    static char full[sizeof body + 8192];
+    size_t n;
+    ID3DBlob *code;
+    PgEntry *e;
+
+    for (i = 0; i < s_npg; i++)
+        if (s_pg[i].hash == h)
+            return s_pg[i].vs;
+    if (s_npg == PG_MAX_PROGS)
+        return NULL;
+    e = &s_pg[s_npg++];
+    e->hash = h;
+    e->vs = NULL;
+    n = nv2a_vsh_hlsl(body, sizeof body, NULL);
+    if (!n) {
+        fprintf(stderr, "  [PBGPU] vertex program %016llX not translated;"
+                " it stays on the CPU\n", (unsigned long long)h);
+        return NULL;
+    }
+    snprintf(full, sizeof full, "%s%s%s", k_pg_head, body, k_pg_tail);
+    code = compile(full, "vs_5_0");
+    if (code) {
+        ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                        ID3D10Blob_GetBufferSize(code), NULL, &e->vs);
+        ID3D10Blob_Release(code);
+    }
+    if (getenv("RECOMP_PB_GPU_DUMP"))
+        fprintf(stderr, "  [PBGPU] vertex program %016llX:\n%s\n",
+                (unsigned long long)h, body);
+    return e->vs;
+}
+
+static int pg_init(void)
+{
+    D3D11_BUFFER_DESC bd;
+    D3D11_SHADER_RESOURCE_VIEW_DESC vd;
+
+    if (s_attr_srv)
+        return 1;
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = PG_ATTR_F4 * 16;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = 16;
+    if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_attr_buf)))
+        return 0;
+    memset(&vd, 0, sizeof vd);
+    vd.Format = DXGI_FORMAT_UNKNOWN;
+    vd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    vd.Buffer.NumElements = PG_ATTR_F4;
+    if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_attr_buf,
+                                                    &vd, &s_attr_srv)))
+        return 0;
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = PG_IDX_U32 * 4;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_idx_buf)))
+        return 0;
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = (sizeof(PgConsts) + 15) & ~15u;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_pg_cb)))
+        return 0;
+    bd.ByteWidth = NV2A_VSH_CONSTANTS * 16;
+    if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_const_cb)))
+        return 0;
+    return 1;
+}
+
+/* Copy n units into a dynamic ring, wrapping (and discarding) when full.
+ * Returns the unit offset written at, or -1. */
+static long ring_put(ID3D11Buffer *b, uint32_t *pos, uint32_t cap, uint32_t unit,
+                     const void *src, uint32_t n)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t at;
+    if (n > cap)
+        return -1;
+    if (*pos + n > cap)
+        *pos = 0;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)b, 0,
+            *pos ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return -1;
+    memcpy((uint8_t *)m.pData + (size_t)*pos * unit, src, (size_t)n * unit);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)b, 0);
+    at = *pos;
+    *pos += n;
+    return (long)at;
+}
+
+int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
+                       uint32_t stride, const int32_t slot[16],
+                       const float vdef[16][4], const uint32_t *idx, uint32_t nidx,
+                       const float fog[4])
+{
+    Surface *s;
+    Zeta *z;
+    ID3D11VertexShader *vs;
+    D3D11_MAPPED_SUBRESOURCE m;
+    PgConsts pg;
+    long aoff, ioff;
+    int k, ok = 0;
+
+    if (!nidx || !nverts || !pbgpu_enabled())
+        return 1;
+    EnterCriticalSection(&s_lock);
+    if (!pg_init() || !(vs = pg_get()))
+        goto out;                          /* caller keeps it on the CPU */
+    ok = 1;
+    if (s_cap.active && s_flip == s_cap.flip && s_cap.log)
+        fprintf(s_cap.log, "     draw %u indices %u verts on GPU program %016llX"
+                " blend %u %X/%X ztest %u stages %05X t0 %08X\n", nidx, nverts,
+                (unsigned long long)nv2a_vsh_program_hash(), st->blend_enable,
+                st->blend_sfactor, st->blend_dfactor, st->depth_test,
+                st->use_rc ? st->rc.stage_program : 0xFFFFF,
+                st->tex[0].valid ? st->tex[0].addr : 0);
+    if (!draw_begin(st, &s, &z))
+        goto out;
+    aoff = ring_put(s_attr_buf, &s_attr_pos, PG_ATTR_F4, 16, attr, nverts * stride);
+    ioff = ring_put(s_idx_buf, &s_idx_pos, PG_IDX_U32, 4, idx, nidx);
+    if (aoff < 0 || ioff < 0)
+        goto out;
+
+    memset(&pg, 0, sizeof pg);
+    pg.vp[0] = 2.0f / (float)s->w;
+    pg.vp[1] = 2.0f / (float)s->h;
+    pg.vp[2] = 1.0f / (float)(st->zeta_format == 1 ? 0xFFFFu : 0xFFFFFFu);
+    memcpy(pg.fog, fog, sizeof pg.fog);
+    pg.info[0] = stride;
+    pg.info[1] = (uint32_t)aoff;
+    for (k = 0; k < 16; k++) {
+        pg.slot[k][0] = slot[k];
+        memcpy(pg.vdef[k], vdef[k], sizeof pg.vdef[k]);
+    }
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_pg_cb, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        memcpy(m.pData, &pg, sizeof pg);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_pg_cb, 0);
+    }
+    if (s_const_gen_up != nv2a_vsh_constant_gen()
+        && SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_const_cb, 0,
+                                             D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        memcpy(m.pData, nv2a_vsh_constant(0), NV2A_VSH_CONSTANTS * 16);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_const_cb, 0);
+        s_const_gen_up = nv2a_vsh_constant_gen();
+    }
+    {
+        ID3D11Buffer *cbs[2] = { s_pg_cb, s_const_cb };
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_idx_buf, DXGI_FORMAT_R32_UINT, 0);
+        ID3D11DeviceContext_VSSetShader(s_ctx, vs, NULL, 0);
+        ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 2, cbs);
+        ID3D11DeviceContext_VSSetShaderResources(s_ctx, 0, 1, &s_attr_srv);
+        ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, (UINT)ioff, 0);
+    }
+    draw_end(s);
+out:
+    LeaveCriticalSection(&s_lock);
+    return ok;
 }
 
 void pbgpu_clear(const PbGpuState *st, uint32_t flags, uint32_t color,
@@ -1624,6 +1913,10 @@ void pbgpu_flip(void)
 
 int  pbgpu_enabled(void) { return 0; }
 void pbgpu_draw(const PbGpuState *s, const PbGpuVertex *v, uint32_t n) { (void)s; (void)v; (void)n; }
+int pbgpu_draw_program(const PbGpuState *st, const float *a, uint32_t nv, uint32_t stride,
+                       const int32_t slot[16], const float vdef[16][4],
+                       const uint32_t *idx, uint32_t ni, const float fog[4])
+{ (void)st; (void)a; (void)nv; (void)stride; (void)slot; (void)vdef; (void)idx; (void)ni; (void)fog; return 0; }
 void pbgpu_clear(const PbGpuState *s, uint32_t f, uint32_t c, float d, uint32_t t)
 { (void)s; (void)f; (void)c; (void)d; (void)t; }
 void pbgpu_readback(uint32_t a) { (void)a; }

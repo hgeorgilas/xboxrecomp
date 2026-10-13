@@ -61,4 +61,16 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
 
+/* For translating programs elsewhere (nv2a_vsh_hlsl.c): program memory and
+ * the start slot, and a counter that changes whenever any constant does. */
+const uint32_t (*nv2a_vsh_program(uint32_t *start))[4];
+uint32_t nv2a_vsh_constant_gen(void);
+
+/* The program at the start slot as HLSL (see nv2a_vsh_hlsl.c). Returns the
+ * length written, or 0 if the program uses something not translated -- the
+ * caller then keeps it on the CPU. *hash identifies the program's code. */
+size_t nv2a_vsh_hlsl(char *out, size_t cap, uint64_t *hash);
+/* The same hash, without generating anything: the cache lookup. */
+uint64_t nv2a_vsh_program_hash(void);
+
 #endif

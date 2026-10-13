@@ -2477,6 +2477,98 @@ static void xf_run(const uint32_t *list, Nv2aVshOutput *out, uint32_t count)
     WaitForMultipleObjects((DWORD)s_xfp.nworkers, s_xfp.done, TRUE, INFINITE);
 }
 
+/* Vertex programs on the GPU (pbgpu_draw_program).
+ *
+ * The batch's distinct vertices go up as raw attributes -- decoded to floats
+ * here, which is cheap next to running the program -- with a triangle list
+ * of indices into them, and the GPU runs the program as its vertex shader.
+ * Returns 0 when the GPU cannot take this batch, and the CPU path runs as
+ * before. RECOMP_CPU_VSH=1 keeps every batch on the CPU. */
+static int gpu_batch_program(const uint32_t *uniq, uint32_t nu,
+                             const uint32_t *map, uint32_t n)
+{
+    static float    s_attr[NV_MAX_INDICES * NV2A_VSH_INPUTS * 4];
+    static uint32_t s_tri[NV_MAX_INDICES * 6];
+    static int off = -1;
+    int32_t slot[NV2A_VSH_INPUTS];
+    float vdef[NV2A_VSH_INPUTS][4], fog[4];
+    uint32_t a, u, i, stride = 0, nt = 0;
+    PbGpuState g;
+
+    if (off < 0)
+        off = getenv("RECOMP_CPU_VSH") != NULL;
+    if (off || !pbgpu_enabled())
+        return 0;
+
+    for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+        const VertexAttr *at = &s_gpu.attr[a];
+        vdef[a][0] = vdef[a][1] = vdef[a][2] = 0.0f;
+        vdef[a][3] = 1.0f;                     /* fetch_attr's absent value */
+        slot[a] = (at->size && at->stride) ? (int32_t)stride++ : -1;
+    }
+    if (!stride)
+        stride = 1;
+    for (u = 0; u < nu; u++)
+        for (a = 0; a < NV2A_VSH_INPUTS; a++)
+            if (slot[a] >= 0)
+                fetch_attr(&s_gpu.attr[a], uniq[u],
+                           &s_attr[((size_t)u * stride + (uint32_t)slot[a]) * 4]);
+
+    /* As a triangle list, windings as raster_batch_program emits them. */
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3) {
+            s_tri[nt++] = map[i]; s_tri[nt++] = map[i+1]; s_tri[nt++] = map[i+2];
+        }
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++) {
+            s_tri[nt++] = map[(i & 1) ? i + 1 : i];
+            s_tri[nt++] = map[(i & 1) ? i : i + 1];
+            s_tri[nt++] = map[i+2];
+        }
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++) {
+            s_tri[nt++] = map[0]; s_tri[nt++] = map[i]; s_tri[nt++] = map[i+1];
+        }
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            s_tri[nt++] = map[i]; s_tri[nt++] = map[i+1]; s_tri[nt++] = map[i+2];
+            s_tri[nt++] = map[i]; s_tri[nt++] = map[i+2]; s_tri[nt++] = map[i+3];
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            s_tri[nt++] = map[i]; s_tri[nt++] = map[i+1]; s_tri[nt++] = map[i+3];
+            s_tri[nt++] = map[i]; s_tri[nt++] = map[i+3]; s_tri[nt++] = map[i+2];
+        }
+        break;
+    default:
+        return 1;                              /* points and lines: not drawn */
+    }
+    if (!nt)
+        return 1;
+    if (!surface_begin_batch((const uint8_t *)xbox_GetMemoryOffset()))
+        return 1;
+
+    gpu_flush();                               /* CPU-path triangles first */
+    gpu_state(&g);
+    fog[0] = (float)(s_gpu.fog_enable != 0);
+    fog[1] = (float)s_gpu.fog_mode;
+    fog[2] = s_gpu.fog_param[0];
+    fog[3] = s_gpu.fog_param[1];
+    if (!pbgpu_draw_program(&g, s_attr, nu, stride, slot,
+                            (const float (*)[4])vdef, s_tri, nt, fog))
+        return 0;
+    note_drawn();
+    s_gpu.tris_drawn += nt / 3;
+    s_gpu.xf_drawn += nt / 3;
+    return 1;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
@@ -2517,6 +2609,13 @@ static void raster_batch_program(void)
                 s_uniq[nu++] = v;
             }
             s_map[i] = s_vwhere[v];
+        }
+        if (gpu_batch_program(s_uniq, nu, s_map, n)) {
+            s_gpu.batches_program++;
+            s_gpu.verts_program += n;
+            if (s_gpu.texs[0].valid)
+                note_texture_use();
+            return;
         }
         if (!transform_vertex(s_uniq[0], &s_uout[0]))
             return;                                    /* no program loaded */

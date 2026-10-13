@@ -39,6 +39,9 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
+/* Bumped on every constant write, so a consumer that copies c[] somewhere
+ * (the GPU vertex-shader path) can tell when its copy is stale. */
+static uint32_t s_const_gen = 1;
 
 static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
 {
@@ -77,6 +80,7 @@ void nv2a_vsh_constant_word(uint32_t word)
 {
     if (s_const_load < NV2A_VSH_CONSTANTS)
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
+    s_const_gen++;
     if (++s_const_word == 4) {
         s_const_word = 0;
         s_const_load++;
@@ -87,6 +91,7 @@ void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 {
     if (index < NV2A_VSH_CONSTANTS)
         memcpy(s_const[index], v, sizeof s_const[index]);
+    s_const_gen++;
 }
 
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
@@ -169,6 +174,16 @@ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 {
     if (index < NV2A_VSH_CONSTANTS && comp < 4)
         memcpy(&s_const[index][comp], &word, 4);
+    s_const_gen++;
+}
+
+uint32_t nv2a_vsh_constant_gen(void) { return s_const_gen; }
+
+const uint32_t (*nv2a_vsh_program(uint32_t *start))[4]
+{
+    if (start)
+        *start = s_start_slot;
+    return (const uint32_t (*)[4])s_program;
 }
 
 /* ---- execution ----------------------------------------------------------- */
@@ -378,8 +393,10 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
         if (omask) {
             const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
             if (!field(ins, 3, 11, 1)) {                  /* to c[] */
-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
+                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS) {
                     write_masked(s_const[oaddr], src, omask);
+                    s_const_gen++;
+                }
             } else if (oaddr == 0) {
                 write_masked(opos.v, src, omask);
             } else if (oaddr < 13) {

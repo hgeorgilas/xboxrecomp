@@ -91,6 +91,19 @@ int  pbgpu_enabled(void);
 /* Triangle list, three vertices per triangle. */
 void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count);
 
+/* A batch run through the current vertex program on the GPU.
+ *   attr      nverts vertices, `stride` float4s each: the active attributes
+ *   slot[i]   which of a vertex's float4s is attribute i, or -1 for absent
+ *   vdef[i]   the value an absent attribute reads as
+ *   idx       a triangle list, indices into attr
+ *   fog       enable, mode, param x, param y (the NV2A's fog registers)
+ * Returns 0 if the program cannot run on the GPU (not translated, or failed
+ * to compile); the caller then transforms on the CPU as before. */
+int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
+                       uint32_t stride, const int32_t slot[16],
+                       const float vdef[16][4], const uint32_t *idx, uint32_t nidx,
+                       const float fog[4]);
+
 /* NV097_CLEAR_SURFACE: `flags` as the method's parameter (Z 0x01,
  * stencil 0x02, R G B A 0x10..0x80). `color` is the surface-format clear
  * value, `depth` 0..1, `stencil` 0..255. Honours the clip rectangle. */
