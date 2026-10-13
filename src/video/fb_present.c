@@ -144,6 +144,16 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_CLOSE:
+        /* Closing the game's only window is quitting the game. This used to
+         * stop just the window thread: the title kept running with nothing
+         * on screen, and holding its log file open, so the launcher's next
+         * `> run_live.txt` failed and the game seemed not to start at all.
+         * Terminate rather than ExitProcess -- guest threads may hold locks
+         * that DLL-detach teardown would wait on forever. */
+        fflush(stdout);
+        fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), 0);
+        return 0;
     case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
         return 0;
