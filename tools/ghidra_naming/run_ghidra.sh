@@ -51,6 +51,20 @@ if [ -z "${GHIDRA_HOME:-}" ]; then
     exit 1
 fi
 HEADLESS="$GHIDRA_HOME/support/analyzeHeadless.bat"
+HEADLESS_ARGS=""
+# Ghidra 12 dropped built-in Jython: a .py post-script fails with
+# "you must install the Jython Ghidra Extension" unless Ghidra runs under
+# PyGhidra. Use its launcher there (same arguments after --headless; it builds
+# its own venv from wheels bundled in the install, offline). PYGHIDRA=0/1
+# overrides the version check.
+if [ -z "${PYGHIDRA:-}" ]; then
+    GHIDRA_MAJOR="$(basename "$GHIDRA_HOME" | sed -n 's/^ghidra_\([0-9]*\)\..*/\1/p')"
+    PYGHIDRA=0; [ "${GHIDRA_MAJOR:-0}" -ge 12 ] 2>/dev/null && PYGHIDRA=1
+fi
+if [ "$PYGHIDRA" = "1" ]; then
+    HEADLESS="$GHIDRA_HOME/support/pyghidraRun.bat"
+    HEADLESS_ARGS="--headless"
+fi
 XBE="${XBE:?ERROR: set XBE=/path/to/Xbox/default.xbe (the XBE to analyze)}"
 
 WORK="$HERE/work"
@@ -79,7 +93,7 @@ echo " Decompile   : $DO_DECOMPILE (limit=$DECOMP_LIMIT timeout=${DECOMP_TIMEOUT
 echo "=============================================================="
 
 if [ ! -f "$HEADLESS" ]; then
-  echo "ERROR: analyzeHeadless.bat not found at $HEADLESS" >&2
+  echo "ERROR: Ghidra headless launcher not found at $HEADLESS" >&2
   exit 1
 fi
 if [ ! -f "$XBE" ]; then
@@ -112,7 +126,7 @@ if [ "$IMPORT" = "1" ]; then
   echo "[2/3] Importing flat image + analyzing + exporting ..."
   ANALYZE_FLAG=()
   if [ "$ANALYZE" = "0" ]; then ANALYZE_FLAG=(-noanalysis); fi
-  "$HEADLESS" "$W_PROJ_DIR" "$PROJ_NAME" \
+  "$HEADLESS" $HEADLESS_ARGS "$W_PROJ_DIR" "$PROJ_NAME" \
     -import "$W_FLAT" \
     -loader BinaryLoader \
     -loader-baseAddr 0x10000 \
@@ -132,7 +146,7 @@ else
   # existing program.
   NOANALYZE_FLAG=(-noanalysis)
   if [ "$ANALYZE" = "1" ]; then NOANALYZE_FLAG=(); fi
-  "$HEADLESS" "$W_PROJ_DIR" "$PROJ_NAME" \
+  "$HEADLESS" $HEADLESS_ARGS "$W_PROJ_DIR" "$PROJ_NAME" \
     -process "$PROG_NAME" \
     "${NOANALYZE_FLAG[@]}" \
     -scriptPath "$W_SCRIPT_DIR" \

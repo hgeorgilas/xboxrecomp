@@ -13,7 +13,7 @@
 #                  (default: <repo>/tools/disasm/output/functions.json)
 #
 # @category XboxRecomp
-# @runtime Jython
+
 import json
 import os
 

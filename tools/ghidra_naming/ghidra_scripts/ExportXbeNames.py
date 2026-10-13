@@ -21,7 +21,6 @@
 # same outDir continues where it left off until all functions are decompiled.
 #
 # @category XboxRecomp
-# @runtime Jython
 
 import json
 import os
