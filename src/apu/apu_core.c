@@ -426,6 +426,29 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
         if (fill >= buf_size) {
             int ok = xa2_submit_samples((const int16_t *)stage, buf_size);
+            {
+                /* RECOMP_APU_WAV=<file>: what goes to the speakers, as a
+                 * 48 kHz stereo WAV (header sized for 10 minutes), to look at
+                 * clicks and pitch without having to describe them. */
+                static FILE *wav;
+                static int tried;
+                if (!tried) {
+                    const char *p = getenv("RECOMP_APU_WAV");
+                    tried = 1;
+                    if (p && (wav = fopen(p, "wb")) != NULL) {
+                        uint32_t bytes = 48000u * 4u * 600u, h[11];
+                        h[0] = 0x46464952; h[1] = 36 + bytes; h[2] = 0x45564157;
+                        h[3] = 0x20746D66; h[4] = 16; h[5] = 1 | (2u << 16);
+                        h[6] = 48000; h[7] = 48000 * 4; h[8] = 4 | (16u << 16);
+                        h[9] = 0x61746164; h[10] = bytes;
+                        fwrite(h, 4, 11, wav);
+                    }
+                }
+                if (wav) {
+                    fwrite(stage, 4, (size_t)buf_size, wav);
+                    fflush(wav);
+                }
+            }
             static int level = -1;
             if (level < 0)
                 level = getenv("RECOMP_APU_LEVEL") != NULL;
@@ -442,7 +465,8 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                 if (ok) sent++; else dropped++;
                 if (++blocks >= 94) {
                     fprintf(stderr, "[APU-LEVEL] peak %d/32767 over %d buffers"
-                            " (%d sent, %d dropped)\n", peak, blocks, sent, dropped);
+                            " (%d sent, %d dropped, %d underruns)\n", peak, blocks,
+                            sent, dropped, xa2_take_underruns());
                     peak = blocks = sent = dropped = 0;
                 }
             }
@@ -690,6 +714,30 @@ static void *mcpx_apu_frame_thread(void *arg)
          * forever to post its next command: Burnout 3 stalls in
          * sub_002F805E polling the same doorbell it was acked on at init. */
         mcpx_apu_dsp_ack_poll(d);
+
+        /* The same brief "off" window, landing during the throttle sleep.
+         * The grace check above only sees windows open at the top of the
+         * loop; one that opened while this thread slept until the frame was
+         * due made the frame idle -- 32 samples of silence -- and with
+         * DirectSound toggling SECTL around every batch of voice updates
+         * that was ~44 dropouts a second: a constant crackle. Wait it out
+         * here too, within the same grace, and then run the frame. */
+        {
+            enum { APU_OFF_GRACE_US = 20000 };
+            int64_t t_off = 0;
+            while (GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                            NV_PAPU_SECTL_XCNTMODE) == NV_PAPU_SECTL_XCNTMODE_OFF
+                   && !qatomic_read(&d->exiting)) {
+                int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+                if (!t_off)
+                    t_off = now;
+                if (now - t_off >= APU_OFF_GRACE_US)
+                    break;                  /* really off: idle frame below */
+                qemu_mutex_unlock(&d->lock);
+                SwitchToThread();
+                qemu_mutex_lock(&d->lock);
+            }
+        }
 
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);

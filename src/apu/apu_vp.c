@@ -964,26 +964,94 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
  * resample. This gives us functional audio at the cost of quality.
  * ============================================================ */
 
+/* Per-voice resampler state.
+ *
+ * This used to fetch source samples one-for-one and ignore `rate`, so every
+ * voice played at the output's 48 kHz whatever its own rate: a 22.05 kHz
+ * voice -- the usual rate for speech -- ran 2.18x fast (chipmunks), and
+ * nothing was interpolated. `rate` is xemu's libsamplerate ratio, output
+ * samples per input sample.
+ *
+ * Linear interpolation between the two source samples either side of a
+ * fractional read position, carried across frames per voice. Source
+ * samples come from voice_get_samples in small batches, so its decoding,
+ * looping and end-of-buffer handling are unchanged. State resets when a
+ * voice was not processed in the previous VP frame (it has just started,
+ * or restarted after a pause). */
+#define RS_BATCH 32
+typedef struct {
+    float a[2], b[2];          /* source samples around the read position */
+    float frac;                /* position between a and b, 0..1 */
+    float src[RS_BATCH][2];    /* fetched, not yet consumed */
+    int   n, at;
+    int   ended;               /* the voice has no more data */
+    uint32_t stamp;            /* VP frame this voice was last processed */
+} VoiceRs;
+static VoiceRs  s_rs[MCPX_HW_MAX_VOICES];
+static uint32_t s_vp_frame;
+
+/* The next source sample into out; 0 once the voice has run out. */
+static int rs_next(MCPXAPUState *d, uint16_t v, VoiceRs *r, float out[2])
+{
+    if (r->at >= r->n) {
+        int got = 0;
+        if (!r->ended
+            && voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                              NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+            got = voice_get_samples(d, v, r->src, RS_BATCH);
+        if (got <= 0) {
+            r->ended = 1;
+            out[0] = out[1] = 0.0f;
+            return 0;
+        }
+        r->n = got;
+        r->at = 0;
+    }
+    out[0] = r->src[r->at][0];
+    out[1] = r->src[r->at][1];
+    r->at++;
+    return 1;
+}
+
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
+    VoiceRs *r = &s_rs[v];
+    float step;
+    int i;
 
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+    if (r->stamp != s_vp_frame && r->stamp + 1 != s_vp_frame) {
+        memset(r, 0, sizeof *r);
+        if (!rs_next(d, v, r, r->a))
+            return -1;
+        rs_next(d, v, r, r->b);
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+    r->stamp = s_vp_frame;
+    /* A stream voice can run dry and be refilled while still active: try
+     * again on every call rather than going quiet for good. */
+    r->ended = 0;
+    if (!(rate > 0.0f))
+        rate = 1.0f;
+    step = 1.0f / rate;                     /* source samples per output */
+    if (step > 64.0f)
+        step = 64.0f;
+
+    for (i = 0; i < requested_num; i++) {
+        if (r->ended && r->frac >= 1.0f)
+            break;
+        samples[i][0] = r->a[0] + (r->b[0] - r->a[0]) * r->frac;
+        samples[i][1] = r->a[1] + (r->b[1] - r->a[1]) * r->frac;
+        r->frac += step;
+        while (r->frac >= 1.0f && !r->ended) {
+            r->a[0] = r->b[0];
+            r->a[1] = r->b[1];
+            rs_next(d, v, r, r->b);
+            r->frac -= 1.0f;
+        }
+    }
+    if (i == 0)
+        return -1;
+    return i;
 }
 
 /* ============================================================
@@ -1024,6 +1092,29 @@ static void voice_process(MCPXAPUState *d,
                                         NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE);
     float rate = 1.0f / powf(2.0f, (p + ps * 32 * ef_value) / 4096.0f);
     dbg->rate = rate;
+    {
+        /* RECOMP_APU_VOICE_TRACE: each voice's format and playback rate, once
+         * per change -- a voice playing at the wrong speed or read in the
+         * wrong format shows here as an implausible rate or layout. */
+        static int on = -1;
+        static uint32_t seen_fmt[MCPX_HW_MAX_VOICES];
+        static int16_t seen_p[MCPX_HW_MAX_VOICES];
+        if (on < 0)
+            on = getenv("RECOMP_APU_VOICE_TRACE") != NULL;
+        if (on) {
+            uint32_t fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu);
+            if (fmt != seen_fmt[v] || p != seen_p[v]) {
+                seen_fmt[v] = fmt;
+                seen_p[v] = p;
+                fprintf(stderr, "  [VOICE] %3u fmt %08X %s ss %u cs %u spb %u stream %u"
+                        " loop %u pitch %d -> rate %.4f (%.0f Hz) list %d\n", v, fmt,
+                        stereo ? "stereo" : "mono  ",
+                        (fmt >> 28) & 3, (fmt >> 30) & 3, (fmt >> 16) & 0x1F,
+                        (fmt >> 24) & 1, (fmt >> 25) & 1, p, rate, rate * 48000.0f,
+                        voice_list);
+            }
+        }
+    }
 
     /* Step amplitude envelope */
     float ea_value = voice_step_envelope(
@@ -1198,6 +1289,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 {
     unsigned active[3] = { 0, 0, 0 };
     static unsigned frames;
+    s_vp_frame++;                           /* resampler state freshness */
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {

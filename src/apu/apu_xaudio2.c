@@ -31,6 +31,7 @@ static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
 static IXAudio2SourceVoice    *g_xa2_source = NULL;
 static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
+static int                     g_xa2_underruns;
 static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
@@ -139,6 +140,8 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
     if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+    if (state.BuffersQueued == 0 && g_xa2_frames_written)
+        g_xa2_underruns++;             /* the queue had run dry: a gap */
 
     idx = g_xa2_next_buf;
     copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
@@ -156,6 +159,14 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     return 1;
 }
 
+/* Times a buffer arrived to an empty queue since the last call. */
+int xa2_take_underruns(void)
+{
+    int n = g_xa2_underruns;
+    g_xa2_underruns = 0;
+    return n;
+}
+
 int xa2_get_buffer_size(void)
 {
     return XA2_BUF_SAMPLES;
@@ -168,5 +179,6 @@ void xa2_shutdown(void)                               {}
 int  xa2_is_active(void)                              { return 0; }
 int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
 int  xa2_get_buffer_size(void)                        { return 0; }
+int  xa2_take_underruns(void)                         { return 0; }
 
 #endif /* _WIN32 */
