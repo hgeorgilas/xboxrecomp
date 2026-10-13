@@ -3428,6 +3428,14 @@ static void bridge_NtReadFile(void)
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
      * identical from inside the title -- the first bytes settle it. */
+    /* Rate-limited: a title parsing a pack index with 2-byte reads (Spartan's
+     * data.pak) issues tens of thousands, and logging each one dominated run
+     * time. First 200, then every 10000th; RECOMP_READ_LOG=1 logs them all. */
+    static int s_read_log_all = -1;
+    static uint64_t s_reads;
+    if (s_read_log_all < 0)
+        s_read_log_all = getenv("RECOMP_READ_LOG") != NULL;
+    if (s_read_log_all || ++s_reads <= 200 || s_reads % 10000 == 0)
     {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
