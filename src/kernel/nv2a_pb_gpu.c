@@ -1159,13 +1159,37 @@ static void unpack(uint32_t c, float o[4])
     o[3] = (float)( c >> 24        ) / 255.0f;
 }
 
+/* The surface's anti-aliasing mode (SET_SURFACE_FORMAT bits 12-15), as the
+ * factor between the title's coordinates and the surface's pixels.
+ *
+ * In a supersampled mode the NV2A renders a logical surface onto more
+ * samples than it has pixels: CENTER_CORNER_2 doubles x, SQUARE_OFFSET_4
+ * doubles both (xemu's pgraph_apply_anti_aliasing_factor). A title then
+ * sets its clip rectangle and viewport in the logical size, and the
+ * hardware covers the whole buffer. Spartan switches its 640x480 back
+ * buffer to SQUARE_OFFSET_4 for its stencil shadows and glow sprites,
+ * drawing in 320x240 logical space; read 1:1, every one of them landed
+ * in the top-left quarter -- the miniature shadows, the misplaced orbs.
+ * Here the samples are the pixels, so the factor scales positions and
+ * the clip rectangle onto the surface. */
+static void aa_factor(const PbGpuState *st, uint32_t *fx, uint32_t *fy)
+{
+    switch ((st->surf_format >> 12) & 0xF) {
+    case 1:  *fx = 2; *fy = 1; break;      /* CENTER_CORNER_2 */
+    case 2:  *fx = 2; *fy = 2; break;      /* SQUARE_OFFSET_4 */
+    default: *fx = 1; *fy = 1; break;      /* CENTER_1 */
+    }
+}
+
 static void set_scissor(const PbGpuState *st, const Surface *s)
 {
     D3D11_RECT r;
-    r.left = (LONG)st->clip_x;
-    r.top = (LONG)st->clip_y;
-    r.right = (LONG)(st->clip_x + st->clip_w);
-    r.bottom = (LONG)(st->clip_y + st->clip_h);
+    uint32_t fx, fy;
+    aa_factor(st, &fx, &fy);
+    r.left = (LONG)(st->clip_x * fx);
+    r.top = (LONG)(st->clip_y * fy);
+    r.right = (LONG)((st->clip_x + st->clip_w) * fx);
+    r.bottom = (LONG)((st->clip_y + st->clip_h) * fy);
     if (r.right > (LONG)s->w) r.right = (LONG)s->w;
     if (r.bottom > (LONG)s->h) r.bottom = (LONG)s->h;
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &r);
@@ -1277,7 +1301,7 @@ static Surface *bind_target(const PbGpuState *st, Zeta **zout)
     if (!st->surf_addr || !st->surf_pitch || (st->surf_bpp != 4 && st->surf_bpp != 2))
         return NULL;
     s = surface_get(st->surf_addr, st->surf_pitch, st->surf_bpp,
-                    st->clip_y + st->clip_h);
+                    (st->clip_y + st->clip_h) * (((st->surf_format >> 12) & 0xF) == 2 ? 2u : 1u));
     if (!s)
         return NULL;
     if (st->zeta_addr)
@@ -1576,8 +1600,12 @@ void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
     s_vb_pos += bytes;
 
     zmax = st->zeta_format == 1 ? 0xFFFFu : 0xFFFFFFu;
-    vpc[0] = 2.0f / (float)s->w;
-    vpc[1] = 2.0f / (float)s->h;
+    {
+        uint32_t fx, fy;
+        aa_factor(st, &fx, &fy);
+        vpc[0] = 2.0f * (float)fx / (float)s->w;
+        vpc[1] = 2.0f * (float)fy / (float)s->h;
+    }
     vpc[2] = 1.0f / (float)zmax;
     vpc[3] = 0;
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vs_cb, 0,
@@ -1811,10 +1839,10 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
          * offset, c[1] scale) -- a pass drawn at a different scale shows. */
         const float *c0 = nv2a_vsh_constant(0), *c1 = nv2a_vsh_constant(1);
         fprintf(s_cap.log, "          c0 (%.1f %.1f %.1f) c1 (%.1f %.1f %.1f) clip %u,%u %ux%u"
-                " surf %08X pitch %u z %08X\n",
+                " surf %08X pitch %u z %08X fmt %08X\n",
                 c0[0], c0[1], c0[2], c1[0], c1[1], c1[2],
                 st->clip_x, st->clip_y, st->clip_w, st->clip_h,
-                st->surf_addr, st->surf_pitch, st->zeta_addr);
+                st->surf_addr, st->surf_pitch, st->zeta_addr, st->surf_format);
     }
     if (s_cap.active && s_flip == s_cap.flip && s_cap.log && nverts <= 8) {
         /* Small draws (screen quads): their inputs and the constants a
@@ -1844,8 +1872,12 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
         goto out;
 
     memset(&pg, 0, sizeof pg);
-    pg.vp[0] = 2.0f / (float)s->w;
-    pg.vp[1] = 2.0f / (float)s->h;
+    {
+        uint32_t fx, fy;
+        aa_factor(st, &fx, &fy);
+        pg.vp[0] = 2.0f * (float)fx / (float)s->w;
+        pg.vp[1] = 2.0f * (float)fy / (float)s->h;
+    }
     pg.vp[2] = 1.0f / (float)(st->zeta_format == 1 ? 0xFFFFu : 0xFFFFFFu);
     memcpy(pg.fog, fog, sizeof pg.fog);
     pg.info[0] = stride;
