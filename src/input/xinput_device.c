@@ -224,7 +224,23 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
 {
+    /* Live, not just what xbox_InputInit saw: nothing in the runtime calls
+     * InputInit, so the flag read FALSE forever and a title asking "is a pad
+     * there" (XGetDevices / XGetDeviceChanges) never opened one. Probed at
+     * most once a second per port -- XInputGetState on an empty slot is slow.
+     * The keyboard counts as pad 0, matching xbox_InputGetState. */
+    static DWORD last_probe[XBOX_MAX_CONTROLLERS];
+    DWORD now;
+
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
+    now = GetTickCount();
+    if (!last_probe[dwPort] || now - last_probe[dwPort] >= 1000) {
+        XINPUT_STATE state;
+        last_probe[dwPort] = now ? now : 1;
+        g_controller_connected[dwPort] = XInputGetState(dwPort, &state) == ERROR_SUCCESS;
+    }
+    if (dwPort == 0 && keyboard_enabled())
+        return TRUE;
     return g_controller_connected[dwPort];
 }
 
