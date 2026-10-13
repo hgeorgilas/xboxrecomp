@@ -36,6 +36,28 @@ static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
 
+/* Recovery. XAudio2 stops for good when its device goes away -- a headset
+ * switched off, the default device changed, a monitor's speakers asleep --
+ * and reports it once, through OnCriticalError. A voice whose position
+ * stops moving with its queue full is treated the same way. Either has the
+ * submitting thread rebuild the engine on the current default device. */
+static volatile LONG           g_xa2_lost;
+static UINT64                  g_xa2_last_played;
+static ULONGLONG               g_xa2_stuck_since;
+
+static void STDMETHODCALLTYPE xa2_cb_pass_start(IXAudio2EngineCallback *This, UINT32 bytes)
+{ (void)This; (void)bytes; }
+static void STDMETHODCALLTYPE xa2_cb_pass_end(IXAudio2EngineCallback *This)
+{ (void)This; }
+static void STDMETHODCALLTYPE xa2_cb_error(IXAudio2EngineCallback *This, HRESULT err)
+{
+    (void)This;
+    fprintf(stderr, "[XA2] critical error 0x%08lX (device lost?) -- will restart audio\n", err);
+    InterlockedExchange(&g_xa2_lost, 1);
+}
+static IXAudio2EngineCallbackVtbl g_xa2_cb_vtbl = { xa2_cb_pass_start, xa2_cb_pass_end, xa2_cb_error };
+static IXAudio2EngineCallback g_xa2_cb = { &g_xa2_cb_vtbl };
+
 int xa2_init(void)
 {
     HRESULT hr;
@@ -56,6 +78,8 @@ int xa2_init(void)
         fprintf(stderr, "[XA2] XAudio2Create failed: 0x%08lX\n", hr);
         goto fail;
     }
+
+    IXAudio2_RegisterForCallbacks(g_xa2, &g_xa2_cb);
 
     hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
         XA2_CHANNELS, XA2_SAMPLE_RATE, 0, NULL, NULL, 0);
@@ -87,6 +111,9 @@ int xa2_init(void)
     g_xa2_next_buf = 0;
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
+    g_xa2_last_played = 0;
+    g_xa2_stuck_since = 0;
+    InterlockedExchange(&g_xa2_lost, 0);
 
     fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
             XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
@@ -136,10 +163,37 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     int copy_samples;
     HRESULT hr;
 
+    if (g_xa2_lost) {
+        static ULONGLONG last_try;
+        ULONGLONG now = GetTickCount64();
+        if (now - last_try < 1000)
+            return 0;                  /* once a second until it comes back */
+        last_try = now;
+        xa2_shutdown();
+        if (xa2_init())
+            fprintf(stderr, "[XA2] audio restarted\n");
+        else
+            InterlockedExchange(&g_xa2_lost, 1);
+        return 0;
+    }
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
-    IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+    IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
+    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) {
+        ULONGLONG now = GetTickCount64();
+        if (state.SamplesPlayed != g_xa2_last_played) {
+            g_xa2_last_played = state.SamplesPlayed;
+            g_xa2_stuck_since = now;
+        } else if (!g_xa2_stuck_since) {
+            g_xa2_stuck_since = now;
+        } else if (now - g_xa2_stuck_since > 1500) {
+            fprintf(stderr, "[XA2] playback stalled for 1.5 s -- restarting audio\n");
+            InterlockedExchange(&g_xa2_lost, 1);
+        }
+        return 0;
+    }
+    g_xa2_last_played = state.SamplesPlayed;
+    g_xa2_stuck_since = 0;
     if (state.BuffersQueued == 0 && g_xa2_frames_written)
         g_xa2_underruns++;             /* the queue had run dry: a gap */
 
