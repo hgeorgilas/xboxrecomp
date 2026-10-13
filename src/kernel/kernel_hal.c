@@ -1026,6 +1026,37 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
  * call establishes the origin so the counter starts near zero rather than at
  * whatever the host had been running for.
  * ========================================================================= */
+/* =========================================================================
+ * x86 port I/O, as the lifter emits it for `in` and `out`.
+ *
+ * 0x80C0, bit 5: the display field. The XDK's D3D vblank handler reads it to
+ * record which field of an interlaced mode is being scanned
+ * (GetDisplayFieldStatus), and on hardware it alternates every vblank. It is
+ * derived here from the vblanks the kernel has delivered (RECOMP_VBLANK), so
+ * it alternates the same way. Spartan's XMV movie player starts playback only
+ * on one field; with a constant value no movie ever started.
+ *
+ * Every other port reads 0 and ignores writes -- what the instructions did
+ * while they were untranslated, so nothing that worked changes.
+ * ========================================================================= */
+extern uint32_t xbox_VblankCount(void);
+
+uint32_t xbox_PortIn(uint32_t port, int size)
+{
+    (void)size;
+    switch (port & 0xFFFFu) {
+    case 0x80C0:
+        return (xbox_VblankCount() & 1u) ? 0x20u : 0u;
+    default:
+        return 0;
+    }
+}
+
+void xbox_PortOut(uint32_t port, uint32_t value, int size)
+{
+    (void)port; (void)value; (void)size;
+}
+
 #define XBOX_TSC_HZ 733333333ull
 
 uint64_t xbox_ReadTimeStampCounter(void)

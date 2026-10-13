@@ -1684,6 +1684,28 @@ class Lifter:
                 "  /* rdtsc */",
             ]
 
+        # ── Port I/O ──
+        # `in`/`out` were RECOMP_UNIMPL no-ops, so an `in` left the register
+        # holding whatever it had. The XDK's D3D reads the display field from
+        # port 0x80C0 in its vblank handler; with a stale value the field
+        # never alternated, GetDisplayFieldStatus reported the same field
+        # forever, and the XMV player -- which only starts on a field-2
+        # vblank -- never showed a movie frame. The runtime answers ports it
+        # knows (xbox_PortIn/xbox_PortOut) and returns 0xFF.. for the rest,
+        # which is what an absent device reads as. The string forms
+        # (ins/outs) stay unimplemented: nothing reached has used them.
+        if m in ("in", "out") and len(ops) == 2:
+            reg_op, port_op = (ops[0], ops[1]) if m == "in" else (ops[1], ops[0])
+            if reg_op.type == "reg":
+                width = _REG_WIDTH.get(str(reg_op.reg).lower(), 4)
+                port = ("(edx & 0xFFFFu)" if port_op.type == "reg"
+                        else f"0x{port_op.imm & 0xFFFF:X}u")
+                if m == "in":
+                    return [_fmt_operand_write(
+                        reg_op, f"xbox_PortIn({port}, {width})") + f"  /* {m} */"]
+                return [f"xbox_PortOut({port}, {_fmt_operand_read(reg_op)}, {width});"
+                        f"  /* {m} */"]
+
         # ── Bit scan ──
         # Index of the lowest (bsf) or highest (bsr) set bit. When the source
         # is zero the destination is left untouched and ZF is set; that is the

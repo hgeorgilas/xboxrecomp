@@ -391,6 +391,12 @@ void recomp_icall_not_code_log(uint32_t va);
  * to the console's rate instead. */
 uint64_t xbox_ReadTimeStampCounter(void);
 
+/* x86 port I/O (`in`/`out`), size 1, 2 or 4 bytes. The runtime answers the
+ * ports titles are seen to use (kernel_hal.c); others read 0 and writes are
+ * dropped, which is what the instructions did when they were no-ops. */
+uint32_t xbox_PortIn(uint32_t port, int size);
+void     xbox_PortOut(uint32_t port, uint32_t value, int size);
+
 void recomp_trace_enter(const char *name, uint32_t va);
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
 void recomp_trace_exit(const char *name, uint32_t va);
