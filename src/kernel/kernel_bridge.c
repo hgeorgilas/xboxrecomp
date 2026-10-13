@@ -1514,6 +1514,19 @@ static HANDLE bridge_resolve_handle(uint32_t token);
 static HANDLE ke_guest_event(uint32_t guest_va, int *type);
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
+/* Set a title-built event from the runtime, as KeSetEvent would: for an
+ * event the GPU signals on hardware (the NV2A software method D3D waits on). Needs the event to
+ * have a shadow (RECOMP_TITLE_KEVENTS); otherwise nothing could wait on it. */
+void xbox_GuestEventSet(uint32_t guest_va)
+{
+    int type;
+    HANDLE ge = ke_guest_event(guest_va, &type);
+    if (ge) {
+        BRIDGE_MEM32(guest_va + 4) = 1;
+        SetEvent(ge);
+    }
+}
+
 static void bridge_KeSetEvent(void)
 {
     uint32_t guest_va = STACK_ARG(0);

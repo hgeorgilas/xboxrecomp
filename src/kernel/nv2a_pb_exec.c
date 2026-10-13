@@ -2320,8 +2320,11 @@ static void flip_pace(void)
         return;
     period = freq.QuadPart / hz;
     QueryPerformanceCounter(&now);
+    /* Resync to "due now" (next = now - period, then += period), not to
+     * now + period: resyncing a frame that ran late used to make it wait a
+     * whole extra period, so at 15 fps every flip slept another 16 ms. */
     if (!next || now.QuadPart - next > period * 4)
-        next = now.QuadPart;
+        next = now.QuadPart - period;
     next += period;
     while (now.QuadPart < next) {
         LONGLONG left = next - now.QuadPart;
@@ -2355,9 +2358,31 @@ static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
 
-    for (i = 0; i < n; i++)
-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+    /* Each vertex once per batch. Indexed meshes name most vertices several
+     * times (Spartan averages ~270 indices a draw), and running the program
+     * per index was a third of the executor's time in gameplay -- the game
+     * thread then sat in KickOff waiting for it. A program has no side
+     * effects unless it may write c[] (CXT_WRITE), so the result for an
+     * index is reused; with CXT_WRITE every index is run as before. */
+    static uint32_t s_vgen, s_vstamp[65536];
+    static uint16_t s_vwhere[65536];
+    int reuse = !nv2a_vsh_cxt_write();
+
+    if (++s_vgen == 0) {
+        memset(s_vstamp, 0, sizeof s_vstamp);
+        s_vgen = 1;
+    }
+    for (i = 0; i < n; i++) {
+        uint16_t v = s_gpu.idx[i];
+        if (reuse && s_vstamp[v] == s_vgen) {
+            s_xf[i] = s_xf[s_vwhere[v]];
+            continue;
+        }
+        if (!transform_vertex(v, &s_xf[i]))
             return;                                    /* no program loaded */
+        s_vstamp[v] = s_vgen;
+        s_vwhere[v] = (uint16_t)i;
+    }
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
     if (s_gpu.blend_enable) {
@@ -2605,7 +2630,9 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
+    /* Progress marker, sparse: every 200th draw cost ~4% of the executor's
+     * time in gameplay, spent writing log lines. */
+    if ((s_gpu.draws % 100000) == 0)
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
     if (pb_noraster())
@@ -3053,6 +3080,90 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         record_tex_reg(method, param);
 }
 
+/* A NOP with a non-zero parameter makes the NV2A raise a software-method
+ * interrupt, and XDK D3D's ISR acts on the parameter: low five bits say what,
+ * the rest is the argument.
+ *
+ * 0xC and 0xD are how D3DDevice_RunPushBuffer returns from a recorded
+ * pushbuffer it could not patch on the spot. It JUMPs to the pushbuffer, and
+ * the pushbuffer's last word is a JUMP back to the call site -- but while an
+ * earlier run of the same pushbuffer may still be executing, that word cannot
+ * be rewritten yet. So D3D queues the patch in a fixup entry and puts this NOP
+ * just before the JUMP; the GPU stops on it, the ISR writes the return JUMP,
+ * and the GPU carries on into a pushbuffer that now comes back to the right
+ * place. Without it the stream returned to wherever the previous call came
+ * from -- ring the title had since overwritten -- and ran garbage.
+ *
+ * The patch is the ISR's (XDK 5849, sub_0022ACB0), done here because this is
+ * the moment the GPU reaches the NOP and the executor has no guest stack to
+ * call the title's own routine on:
+ *   entry[0]   return address | 0x80000000 in use | 0x40000000 pending
+ *              | 0x20000000 has fixups
+ *   entry[4]   next entry to patch (0 or -1 ends the chain)
+ *   entry[8]   where the pushbuffer's return JUMP goes
+ *   entry[12]  fixup records {size, offset, data[size]} ending in size -1
+ *   entry[16]  the pushbuffer the offsets are relative to
+ * 0xD names an entry in the device's table (device + 0x264, 20 bytes each),
+ * 0xC an entry D3D wrote into the pushbuffer itself; either way the device's
+ * pending count (+0x50) drops by one. */
+static uint32_t s_sem_offset;   /* last SET_SEMAPHORE_OFFSET */
+
+static void pb_soft_method(uint32_t param)
+{
+    extern uint32_t xbox_Nv2aDevice(void);
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t code = param & 0x1Fu, arg = param >> 5, dev, entry;
+    int guard = 0;
+
+    /* 0x5: D3D_BlockOnTime rewrote the two placeholder words after the
+     * fence it is waiting for into WAIT_FOR_IDLE + this NOP, and sleeps on
+     * the miniport's event (device + 0x1C28 + 0x1A4) until the GPU gets
+     * there. The ISR's answer is to set it. */
+    if (code == 0x5) {
+        extern uint32_t xbox_Nv2aDevice(void);
+        extern void xbox_GuestEventSet(uint32_t guest_va);
+        uint32_t d = xbox_Nv2aDevice();
+        if (d)
+            xbox_GuestEventSet(d + 0x1C28u + 0x1A4u);
+        return;
+    }
+    if (code != 0xC && code != 0xD) {
+        static uint32_t seen;
+        if (!(seen & (1u << code))) {
+            seen |= 1u << code;
+            fprintf(stderr, "  [PB] software method 0x%X (param 0x%08X) not"
+                            " handled\n", code, param);
+        }
+        return;
+    }
+    dev = xbox_Nv2aDevice();
+    if (!dev)
+        return;
+    entry = code == 0xD ? dev + 0x264u + (arg & 0x3Fu) * 20u
+                        : (arg | 0x80000000u);
+    InterlockedDecrement((volatile LONG *)(mem + dev + 0x50u));
+
+#define PB_M32(va) (*(volatile uint32_t *)(mem + (uint32_t)(va)))
+    while (entry + 1u > 1u && guard++ < 64) {          /* not 0, not -1 */
+        uint32_t e0 = PB_M32(entry), next;
+        PB_M32(PB_M32(entry + 8)) = (e0 & 0x0FFFFFFFu) + 1u;   /* JUMP back */
+        if (e0 & 0x20000000u) {
+            uint32_t base = PB_M32(entry + 16), rec = PB_M32(entry + 12);
+            uint32_t size;
+            while ((size = PB_M32(rec)) != 0xFFFFFFFFu && size < 0x100000u) {
+                memcpy(mem + base + PB_M32(rec + 4), mem + rec + 8, size);
+                rec += 8 + size;
+            }
+        }
+        next = PB_M32(entry + 4);
+        PB_M32(entry + 4) = 0xFFFFFFFFu;
+        if (e0 & 0x80000000u)
+            PB_M32(entry) = e0 & ~0x40000000u;
+        entry = next;
+    }
+#undef PB_M32
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -3071,6 +3182,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. Cached: this runs for every method, and an
      * uncached getenv here was a quarter of the executor's time. */
+    /* XDK D3D's fence is two methods: this one on subchannel 5, then the
+     * semaphore release below. Its parameter is
+     *   (pushbuffer address << 5) | (fence time & 0x1F) << 2 | ring lap
+     * and the GPU latches it into PGRAPH 0x400B10. D3D reads that register
+     * back as the GPU's position whenever DMA_GET is outside the ring
+     * (running a static pushbuffer it JUMPed to), and as the low bits of
+     * the completed fence time while it waits. A made-up value there told
+     * D3D the GPU was at the start of the ring, and it overwrote commands
+     * the executor had not run yet. */
+    if (method == 0x0100 && param) {
+        pb_soft_method(param);
+        return;
+    }
+    if (subch == 5 && method == 0x0310) {
+        extern void xbox_Nv2aRefSet(uint32_t value);
+        xbox_Nv2aRefSet(param);
+        return;
+    }
     static int verbose = -1;
     if (verbose < 0)
         verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
@@ -3134,6 +3263,20 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_COLOR_CLEAR_VALUE:
         s_gpu.clear_color = param;
         break;
+    case 0x1D6C:                       /* SET_SEMAPHORE_OFFSET */
+        s_sem_offset = param;
+        break;
+    case 0x1D70: {                     /* BACK_END_WRITE_SEMAPHORE_RELEASE */
+        /* XDK D3D inserts its fences as this method carrying the fence time,
+         * which the GPU writes to memory when it gets there. Reporting it
+         * here -- when the executor has actually reached it -- rather than
+         * the moment it was submitted is what stops the title reusing
+         * pushbuffer and resources the executor has not consumed yet. */
+        extern void xbox_Nv2aFenceReached(uint32_t time);
+        xbox_Nv2aFenceReached(param);
+        break;
+    }
+
     case NV097_SET_BLEND_ENABLE:
         s_gpu.blend_enable = param;
         break;

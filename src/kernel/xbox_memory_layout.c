@@ -586,6 +586,23 @@ static void dsp_ack_tick(void)
 {
     int i;
 
+    /* At most every 250 us. This runs on the executor's loop, and walking a
+     * pointer chain (with a readability check per dereference) on every pass
+     * was ~6% of that thread in gameplay; a DSP command waits for us far
+     * longer than this anyway. */
+    {
+        static LARGE_INTEGER freq, last;
+        LARGE_INTEGER now;
+        if (!g_dsp_ack_count)
+            return;
+        if (!freq.QuadPart)
+            QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - last.QuadPart < freq.QuadPart / 4000)
+            return;
+        last = now;
+    }
+
     for (i = 0; i < g_dsp_ack_count; i++) {
         const char *p = g_dsp_ack[i];
         uint32_t va;
@@ -846,8 +863,85 @@ static void frame_counters_tick(void)
     }
 }
 
+/* Set once the pushbuffer executor reports fences as it reaches them: the
+ * mirror below then stands down, because "everything submitted is done" is
+ * no longer true -- the executor runs behind the title. */
+static volatile LONG g_fences_from_exec;
+
+/* The D3D device the title registered with xbox_Nv2aMirrorFence, or 0. */
+uint32_t xbox_Nv2aDevice(void)
+{
+    uint32_t dev;
+    if (!g_fence_mirror_count
+        || !fence_readable(g_fence_mirrors[0].device_ptr_va, 4))
+        return 0;
+    dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[0].device_ptr_va
+                                 + g_memory_offset);
+    return fence_readable(dev, 4) ? dev : 0;
+}
+
+/* The value D3D's fence method (subchannel 5, 0x0310) asks the GPU to latch
+ * into PGRAPH 0x400B10. See nv2a_pb_exec_method. */
+void xbox_Nv2aRefSet(uint32_t value)
+{
+    g_fences_from_exec = 1;
+    if (g_nv2a_memory)
+        *(volatile uint32_t *)((char *)g_nv2a_memory + 0x400B10) = value;
+}
+
+void xbox_Nv2aFenceReached(uint32_t time)
+{
+    int i;
+    static uint32_t last;
+    if (last && (int32_t)(time - last) < 0) {
+        static int said;
+        if (said++ < 10)
+            fprintf(stderr, "  [FENCE] backwards: %u after %u\n", time, last);
+    }
+    last = time;
+    g_fences_from_exec = 1;
+    for (i = 0; i < g_fence_mirror_count; i++) {
+        uint32_t dev, get_ptr;
+        if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
+                                     + g_memory_offset);
+        if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4))
+            continue;
+        get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
+                                         + g_memory_offset);
+        if (!fence_readable(get_ptr, 4))
+            continue;
+        {
+            /* Only a fence time that moves forward and does not pass what
+             * the title has issued ([dev + put_off]). The same method also
+             * releases other semaphores, and one bogus value here tells D3D
+             * the GPU has finished everything: it then reuses pushbuffer the
+             * executor has not read, and the executor runs garbage. */
+            volatile uint32_t *fence =
+                (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
+            uint32_t cur = fence_readable(dev + g_fence_mirrors[i].put_off, 4)
+                ? *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
+                                         + g_memory_offset) : time;
+            static uint32_t wrote;
+            if (wrote && *fence != wrote) {
+                static int said;
+                if (said++ < 10)
+                    fprintf(stderr, "  [FENCE] completed changed behind the"
+                            " executor: %u -> %u\n", wrote, *fence);
+            }
+            if ((int32_t)(time - *fence) <= 0 || (int32_t)(cur - time) < 0)
+                continue;
+            *fence = time;
+            wrote = time;
+        }
+    }
+}
+
 static void fence_mirrors_tick(void)
 {
+    if (g_fences_from_exec)
+        return;
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -870,11 +964,24 @@ static void fence_mirrors_tick(void)
                                        + g_memory_offset);
             if (*fence != put)
                 *fence = put;
+            /* The GPU's own copy of the reference it has reached. XDK D3D
+             * (5849: sub_00228CE0 in Spartan) waits until
+             * ((completed << 2) ^ PGRAPH[0x400B10]) & 0x7C == 0 before it
+             * trusts the read pointer. Nothing kept the register, so it read
+             * 0 and the wait only ended when the completed time happened to
+             * be a multiple of 32 -- by luck, and slowly, and never once the
+             * kick handshake stopped serialising with the executor. */
+            if (g_nv2a_memory)
+                *(volatile uint32_t *)((char *)g_nv2a_memory + 0x400B10) = put << 2;
         }
     }
 }
 
 static int s_nv2a_trace = 0;
+/* Per-kick register logging, separate from s_nv2a_trace (which also arms
+ * the pushbuffer scan and so is on whenever RECOMP_PB_EXEC is): logging every
+ * kick wrote ~40,000 lines a minute in gameplay. RECOMP_NV2A_TRACE only. */
+static int s_nv2a_log = 0;
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
  * second so a run can answer the only question that matters before building a
@@ -945,7 +1052,7 @@ static void framebuffer_probe_tick(void)
  * frame on) then advanced at ~2 Hz and movies never showed a frame.
  *
  * So the tick holds the two registers while it delivers: from setting the
- * bits until it has drained the DPC. The hold lapses after 1 ms regardless,
+ * bits until it has drained the DPC. The hold lapses after 100 us regardless,
  * because one DPC path acknowledges by writing 1 to PCRTC_INTR and waiting
  * for PMC_INTR to drop -- write-1-to-clear on hardware, which plain memory
  * cannot express, so the clearing has to come from here. */
@@ -972,7 +1079,7 @@ static int nv2a_intr_held(void)
     if (!freq.QuadPart)
         QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&now);
-    return now.QuadPart - since < freq.QuadPart / 1000;
+    return now.QuadPart - since < freq.QuadPart / 10000;   /* 100 us */
 }
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
@@ -1058,38 +1165,19 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * The contiguous window IS the physical-address view, so
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
-                    /* The pushbuffer is a ring, so PUT coming back below
-                     * where it was is a wrap, not a rewind. Scanning only
-                     * forward segments dropped everything written across
-                     * the seam -- one whole submission each time round.
-                     *
-                     * The ring's bounds are not published anywhere this
-                     * code can read, so they are learned: the lowest and
-                     * highest PUT seen bracket it. That is approximate on
-                     * the first lap and exact afterwards, and scanning a
-                     * little short of the true end costs the same commands
-                     * that were being lost anyway. */
-                    static uint32_t put_lo, put_hi;
-                    if (!put_lo || put < put_lo) put_lo = put;
-                    if (put > put_hi) put_hi = put;
-                    if (last_put && put > last_put) {
-                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                     XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                    } else if (last_put && put < last_put) {
-                        if (put_hi > last_put)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                        if (put > put_lo)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
-                        if (getenv("RECOMP_PB_WRAP_TRACE")) {
-                            static unsigned wraps;
-                            if (wraps++ < 8)
-                                fprintf(stderr, "  [NV2A] pushbuffer wrapped "
-                                        "(0x%08X -> 0x%08X)\n", last_put, put);
-                        }
+                    /* Follow the stream from where the GPU is (GET) to
+                     * PUT, through every JUMP and CALL, as the DMA engine
+                     * does. See nv2a_pb_run. */
+                    {
+                        extern uint32_t nv2a_pb_run(uint32_t, uint32_t,
+                                                    volatile uint32_t *);
+                        static uint32_t dma_get;
+                        if (!last_put)
+                            dma_get = put;             /* nothing before this */
+                        else if ((put ^ last_put) || dma_get != put)
+                            dma_get = nv2a_pb_run(dma_get, put,
+                                (volatile uint32_t *)((char *)regs
+                                                      + NV2A_USER_DMA_GET));
                     }
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
@@ -1126,17 +1214,19 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * in its device struct rather than assuming 0xFD800000, and
                  * mirroring the wrong block leaves it spinning on a GET that
                  * never moves. */
-                if (s_nv2a_trace) {
+                if (s_nv2a_log) {
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
                             "0x%08X%s\n", put, g,
                             g == put ? "" : "  (GPU behind)");
+                    fflush(stderr);
                 }
-                fflush(stderr);
+                /* (The flush used to be unconditional: a write syscall on
+                 * every kick, ~5% of this thread in gameplay.) */
             }
         }
-        if (s_nv2a_trace) {
+        if (s_nv2a_log) {
             static uint32_t last_start = 0xFFFFFFFFu;
             uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
             if (start != last_start) {
@@ -1168,11 +1258,44 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     return 0;
 }
 
+/* The register handshakes on their own thread.
+ *
+ * nv2a_ack_thread clears the busy bits at the top of each pass, but the same
+ * pass then executes whatever the title submitted -- with RECOMP_PB_EXEC that
+ * is vertex programs and draws, milliseconds of work. KickOff sets the PFB
+ * flush bit (0x100410) and spins until it clears, so every kick waited for the
+ * previous segment to finish executing: the title and the "GPU" ran in
+ * lockstep, and Spartan's game thread spent 73% of gameplay in KickOff. On
+ * hardware that flush is a write-combine handshake, done in microseconds and
+ * independent of how far the GPU has got. This loop answers only the
+ * handshakes (NV2A_ACK's flush bit and the NV2A_IDLE status bits), yielding
+ * between checks; the interrupt-status entries stay with the main loop. */
+static DWORD WINAPI nv2a_handshake_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    volatile uint32_t *flush = (volatile uint32_t *)((char *)regs + 0x100410);
+
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        size_t i;
+        if (*flush & 0x00010000u)
+            *flush &= ~0x00010000u;
+        for (i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
+            volatile uint32_t *r =
+                (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
+            if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask)
+                *r |= NV2A_IDLE[i].idle_mask;
+        }
+        SwitchToThread();
+    }
+    return 0;
+}
+
 static void xbox_Nv2aAckStart(void)
 {
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
+    CloseHandle(CreateThread(NULL, 0, nv2a_handshake_thread, g_nv2a_memory, 0, NULL));
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {
@@ -2424,6 +2547,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         );
         /* The pushbuffer survey rides on the same poll, so either
          * variable arms it. */
+        s_nv2a_log = getenv("RECOMP_NV2A_TRACE") != NULL;
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
                     || getenv("RECOMP_PB_SCAN") != NULL
                     || getenv("RECOMP_PB_EXEC") != NULL;

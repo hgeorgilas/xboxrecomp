@@ -25,7 +25,11 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#include <windows.h>
 
+#ifndef XBOX_CONTIG_SIZE
+#define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)   /* as kernel.h */
+#endif
 #ifndef XBOX_CONTIG_BASE
 #define XBOX_CONTIG_BASE 0x80000000u   /* physical P is at this + P */
 #endif
@@ -168,9 +172,24 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t words = 0;
+    const uint32_t lo = XBOX_CONTIG_BASE, hi = XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
 
+    /* Stay inside the contiguous window. A CALL is followed for up to 4 MB
+     * looking for its RETURN, and a stale or overwritten target has none:
+     * the walk ran off the end of guest RAM and faulted the executor
+     * (Spartan, loading its first level). */
+    if (end_va > hi || end_va < va)
+        end_va = hi;
     while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
+        uint32_t w;
+        if (va < lo || va + 4 > hi) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [PB] walk left the contiguous window at "
+                                "0x%08X; segment abandoned\n", va);
+            break;
+        }
+        w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
 
@@ -182,6 +201,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
                 break;                        /* the ring: a jump ends it */
             va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
             end_va = va + 0x400000u;
+            if (end_va > hi || end_va < va)
+                end_va = hi;
             continue;
         }
         if ((w & 0xFFFF0003u) == 0x00020000u) {  /* RETURN */
@@ -242,4 +263,155 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
+}
+
+/* Run the pushbuffer the way the DMA engine does: from GET, following every
+ * JUMP, CALL and RETURN, until GET reaches PUT. Takes and returns physical
+ * addresses, like the registers.
+ *
+ * Walking [last PUT, PUT) as a flat range was an approximation of this that
+ * broke wherever the stream does not run in address order: a JUMP ended the
+ * segment (the ring's wrap, and any jump the title placed mid-ring), and
+ * whatever came after it -- fence releases included -- was never executed.
+ * A title blocking on one of those fences then waited forever (Spartan, a
+ * few minutes into its first level).
+ *
+ * If the stream never reaches PUT (a corrupt or stale word sent it astray)
+ * it is abandoned at PUT after a bound, which is what the flat walk did for
+ * every segment anyway. */
+static struct { uint32_t g, p, words; unsigned long long t; } s_rl[8];
+static unsigned s_rl_n;
+
+uint32_t nv2a_pb_run(uint32_t get, uint32_t put, volatile uint32_t *get_reg)
+{
+    /* GET is published as the walk goes, as the hardware's is. The title
+     * reads it to decide how much of the ring it may overwrite, and a GET
+     * that only moved once a whole run was done -- a run can be most of a
+     * lap -- let it wrap round and overwrite commands still waiting to be
+     * read (XDK D3D waits on a fence, which the executor had passed, then
+     * checks GET, which still said where the run started).
+     *
+     * Only while inside the ring: in a pushbuffer the title JUMPed or CALLed
+     * to, the last ring position stays, which is behind and so safe. The
+     * ring is the range PUT has been seen in. */
+    static uint32_t ring_lo = 0xFFFFFFFFu, ring_hi;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t ret = 0, words = 0, start = get;
+    int in_call = 0;
+    /* The last few control transfers, for when the stream is lost. */
+    struct { uint32_t at, w; } hist[16];
+    unsigned nh = 0;
+
+    static int scan = -1;
+    if (s_exec_enabled < 0)
+        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+    if (scan < 0)
+        scan = getenv("RECOMP_PB_SCAN") != NULL;
+    get &= 0x0FFFFFFCu;
+    put &= 0x0FFFFFFCu;
+    if (put < ring_lo) ring_lo = put;
+    if (put > ring_hi) ring_hi = put;
+    while (get != put) {
+        uint32_t w;
+        if (get + 4 > XBOX_CONTIG_SIZE || ++words > 0x400000u) {
+            static int said;
+            if (said++ < 4) {
+                extern uint32_t xbox_Nv2aDevice(void);
+                uint32_t dev = xbox_Nv2aDevice();
+                if (dev)
+                    fprintf(stderr, "  [PB] ring 0x%08X..0x%08X lap %u put 0x%08X"
+                            " issued %u completed %u\n",
+                            *(const uint32_t *)(mem + dev + 0x24),
+                            *(const uint32_t *)(mem + dev + 0x28),
+                            *(const uint32_t *)(mem + dev + 0x40),
+                            *(const uint32_t *)(mem + dev),
+                            *(const uint32_t *)(mem + dev + 0x2C),
+                            *(const uint32_t *)(mem + 0x80002000u));
+                fprintf(stderr, "  [PB] previous runs:\n");
+                for (unsigned k = 0; k < 8; k++) {
+                    unsigned j = (s_rl_n + k) & 7;
+                    fprintf(stderr, "  [PB]   0x%08X -> 0x%08X  %u words  t=%llu ms\n",
+                            s_rl[j].g, s_rl[j].p, s_rl[j].words,
+                            (unsigned long long)s_rl[j].t);
+                }
+                fprintf(stderr, "  [PB] stream lost at 0x%08X (%u words, from"
+                                " 0x%08X); resyncing to PUT 0x%08X\n",
+                        get, words, start, put);
+                if (nh >= 2) {
+                    uint32_t at = hist[(nh - 1) & 15].at & ~0x1Fu;
+                    for (uint32_t a = at - 0x40; a < at + 0x40; a += 16)
+                        fprintf(stderr, "  [PB]   %08X: %08X %08X %08X %08X%c", a,
+                            *(const uint32_t *)(mem + XBOX_CONTIG_BASE + a),
+                            *(const uint32_t *)(mem + XBOX_CONTIG_BASE + a + 4),
+                            *(const uint32_t *)(mem + XBOX_CONTIG_BASE + a + 8),
+                            *(const uint32_t *)(mem + XBOX_CONTIG_BASE + a + 12), 10);
+                }
+                for (unsigned k = nh > 16 ? nh - 16 : 0; k < nh; k++)
+                    fprintf(stderr, "  [PB]   0x%08X: %08X\n",
+                            hist[k & 15].at, hist[k & 15].w);
+            }
+            return put;
+        }
+        w = *(const uint32_t *)(mem + XBOX_CONTIG_BASE + get);
+        if ((w & 3u) || (w & 0xE0000003u) == 0x20000000u
+                     || (w & 0xFFFF0003u) == 0x00020000u) {
+            hist[nh & 15].at = get; hist[nh & 15].w = w; nh++;
+        }
+        get += 4;
+
+        if ((w & 3u) == 1u) {                         /* JUMP */
+            get = w & 0x0FFFFFFCu;
+            s_tot_jumps++;
+            continue;
+        }
+        if ((w & 0xE0000003u) == 0x20000000u) {       /* old-style JUMP */
+            get = w & 0x0FFFFFFCu;
+            s_tot_jumps++;
+            continue;
+        }
+        if ((w & 3u) == 2u) {                         /* CALL */
+            if (!in_call) {
+                ret = get;
+                in_call = 1;
+                s_tot_calls++;
+            }
+            get = w & 0x0FFFFFFCu;
+            continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u) {       /* RETURN */
+            if (in_call) {
+                get = ret;
+                in_call = 0;
+            }
+            continue;
+        }
+        if ((w & 0x00030003u) == 0u) {
+            uint32_t count  = (w >> 18) & 0x7FFu;
+            uint32_t subch  = (w >> 13) & 7u;
+            uint32_t method =  w & 0x1FFCu;
+            int noninc = (w & 0xE0000000u) == 0x40000000u;
+            if (get_reg && get - 4 >= ring_lo && get - 4 <= ring_hi)
+                *get_reg = get - 4;          /* this command, not yet run */
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t m = noninc ? method : method + i * 4;
+                if (get + 4 > XBOX_CONTIG_SIZE)
+                    break;
+                if (scan)
+                    note(subch, m);
+                if (s_exec_enabled)
+                    nv2a_pb_exec_method(subch, m,
+                        *(const uint32_t *)(mem + XBOX_CONTIG_BASE + get));
+                get += 4;
+                words++;
+            }
+            continue;
+        }
+        s_tot_unknown++;
+    }
+    s_tot_words += words;
+    s_tot_segments++;
+    s_rl[s_rl_n & 7].g = start; s_rl[s_rl_n & 7].p = put;
+    s_rl[s_rl_n & 7].words = words; s_rl[s_rl_n & 7].t = GetTickCount64();
+    s_rl_n++;
+    return get;
 }
