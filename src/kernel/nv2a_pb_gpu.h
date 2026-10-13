@@ -57,6 +57,8 @@ typedef struct {
     uint32_t face_stride;
     const void   *src;        /* executor's Texture, for `fetch` */
     PbGpuTexelFn  fetch;
+    float    bump_mat[4];     /* BUMP_ENV_MAT 00 01 10 11, for this stage */
+    float    bump_scale, bump_offset;
 } PbGpuTexture;
 
 typedef struct {
@@ -72,6 +74,7 @@ typedef struct {
     int      use_rc;          /* combiners programmed; else d0 * texture 0 */
     Nv2aCombiner rc;
     uint32_t clip_plane_mode;
+    uint32_t other_stage_input; /* stage 2's input in bits 16-19, stage 3's 20-23 */
     float    fog_color[4];    /* r, g, b, a */
     PbGpuTexture tex[4];
 } PbGpuState;

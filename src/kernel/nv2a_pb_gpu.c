@@ -113,6 +113,8 @@ typedef struct {
     float fc0[4], fc1[4], fogc[4];
     float texsize[4][4];          /* 1/w, 1/h for texel-coordinate stages */
     float misc[4];                /* x: alpha reference 0..255 */
+    float bump[4][4];             /* per stage: BUMP_ENV_MAT 00 01 10 11 */
+    float bumpls[4][4];           /* per stage: x luminance scale, y offset */
 } PsConsts;
 
 static int init_device(void)
@@ -437,6 +439,26 @@ static int tex_upload(TexEntry *e, const PbGpuTexture *t)
                     c |= 0xFF000000u;
                 px[((size_t)f * h + v) * w + u] = c;
             }
+    {
+        /* RECOMP_TEX_DUMP=<dir>: each uploaded texture of a format named in
+         * RECOMP_TEX_DUMP_FMT (hex), as decoded, once per address. */
+        const char *dir = getenv("RECOMP_TEX_DUMP"), *fm = getenv("RECOMP_TEX_DUMP_FMT");
+        if (dir && fm && strtoul(fm, NULL, 16) == t->color && !t->cube) {
+            char path[512];
+            FILE *fp;
+            uint32_t hdr[13];
+            snprintf(path, sizeof path, "%stex_%08X_%02X.bmp", dir, t->addr, t->color);
+            if ((fp = fopen(path, "wb")) != NULL) {
+                memset(hdr, 0, sizeof hdr);
+                fwrite("BM", 1, 2, fp);
+                hdr[0] = 54 + w * h * 4; hdr[2] = 54; hdr[3] = 40;
+                hdr[4] = w; hdr[5] = (uint32_t)-(int32_t)h; hdr[6] = 1 | (32 << 16);
+                fwrite(hdr, 4, 13, fp);
+                fwrite(px, 4, (size_t)w * h, fp);
+                fclose(fp);
+            }
+        }
+    }
     if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
     if (e->tex) ID3D11Texture2D_Release(e->tex);
     e->srv = NULL; e->tex = NULL;
@@ -701,6 +723,8 @@ typedef struct {
     uint32_t use_rc, alpha_test, alpha_func, clip_plane_mode;
     uint32_t stage_kind[4];    /* 0 none 1 2D 2 cube 3 rect-2D */
     uint32_t no_alpha[4];
+    uint32_t input_tex[4];     /* dependent reads: the stage they read */
+    uint32_t rt_swizzle[4];    /* render target read as another 32-bit order */
 } PsKey;
 
 typedef struct { PsKey key; ID3D11PixelShader *ps; } PsEntry;
@@ -773,7 +797,8 @@ static void gen_ps(const PsKey *k, Sb *b)
     uint32_t st, s, n = k->rc.control & 0xFF, flags = k->rc.control >> 8;
 
     sb(b, "cbuffer P : register(b0) { float4 fac0[8]; float4 fac1[8];\n"
-          "  float4 fc0; float4 fc1; float4 fogc; float4 texsize[4]; float4 misc; };\n"
+          "  float4 fc0; float4 fc1; float4 fogc; float4 texsize[4]; float4 misc;\n"
+          "  float4 bump[4]; float4 bumpls[4]; };\n"
           "struct VO { float4 p:SV_Position; float4 d0:COLOR0; float4 d1:COLOR1;\n"
           "  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2;\n"
           "  float4 t3:TEXCOORD3; float f:TEXCOORD4; };\n");
@@ -829,6 +854,30 @@ static void gen_ps(const PsKey *k, Sb *b)
             case 4:
                 sb(b, "    t = saturate(c);\n");
                 break;
+            case 6: case 7:                    /* BUMPENVMAP (_LUMINANCE) */
+                /* The input stage's blue and green are du and dv, as signed
+                 * bytes (xemu's sign3, over 128).
+                 *
+                 * The four BUMP_ENV_MAT registers hold 00, 01, 11, 10 --
+                 * not the 00 01 10 11 their order suggests (xemu reads them
+                 * that way). Spartan's colour grade settles it: it writes
+                 * 0.5 0 0.5 0 and samples a table whose u and v carry two
+                 * different channels' curves from a texel-centre
+                 * coordinate, which only works as the diagonal 0.5: half a
+                 * signed byte, wrapped, is the byte unsigned. */
+                sb(b, "    float2 ds = round(R[%u].bg * 255);\n"
+                      "    ds = (ds >= 128 ? ds - 256 : ds) / 128;\n",
+                   8 + k->input_tex[st]);
+                sb(b, "    ds = float2(dot(ds, bump[%u].xw), dot(ds, bump[%u].yz));\n",
+                   st, st);
+                sb(b, "    float2 uv = c.xy + ds;\n");
+                if (k->stage_kind[st] == 3)
+                    sb(b, "    uv *= texsize[%u].xy;\n", st);
+                sb(b, "    t = tx%u.Sample(sm%u, uv);\n", st, st);
+                if (mode == 7)                 /* luminance: unsigned red */
+                    sb(b, "    t *= R[%u].r * bumpls[%u].x + bumpls[%u].y;\n",
+                       8 + k->input_tex[st], st, st);
+                break;
             case 5:
                 for (j = 0; j < 4; j++) {
                     int ge = (k->clip_plane_mode >> (st * 4 + j)) & 1;
@@ -840,7 +889,18 @@ static void gen_ps(const PsKey *k, Sb *b)
                 sb(b, "    t = 0;\n");
                 break;
             }
-            if (k->no_alpha[st] && (mode == 1 || mode == 2 || mode == 3))
+            /* A render target is sampled as it was drawn (A8R8G8B8); a
+             * title reading it back as another byte order -- Spartan's colour
+             * grade reads its downsample as R8G8B8A8 to index a table by
+             * green and red -- gets the texel decoder's permutation here. */
+            if (k->rt_swizzle[st] == 0x41)
+                sb(b, "    t = t.argb;\n");          /* LIN_R8G8B8A8 */
+            else if (k->rt_swizzle[st] == 0x40)
+                sb(b, "    t = t.grab;\n");          /* LIN_B8G8R8A8 */
+            else if (k->rt_swizzle[st] == 0x3F)
+                sb(b, "    t = t.bgra;\n");          /* LIN_A8B8G8R8 */
+            if (k->no_alpha[st] && (mode == 1 || mode == 2 || mode == 3
+                                    || mode == 6 || mode == 7))
                 sb(b, "    t.a = 1;\n");
             sb(b, "    R[%u] = t; }\n", 8 + st);
         }
@@ -976,6 +1036,36 @@ static void set_scissor(const PbGpuState *st, const Surface *s)
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &r);
 }
 
+/* Write a surface as it is on the GPU now to <RECOMP_RT_DUMP><name>.bmp. */
+static void rt_dump(Surface *s, const char *name)
+{
+    const char *dir = getenv("RECOMP_RT_DUMP");
+    D3D11_MAPPED_SUBRESOURCE m;
+    char path[512];
+    FILE *fp;
+    uint32_t y, w = s->w, h = s->h, hdr[13];
+
+    if (!dir || !s->staging)
+        return;
+    snprintf(path, sizeof path, "%s%s.bmp", dir, name);
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s->staging,
+                                     (ID3D11Resource *)s->tex);
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s->staging, 0,
+                                       D3D11_MAP_READ, 0, &m)))
+        return;
+    if ((fp = fopen(path, "wb")) != NULL) {
+        memset(hdr, 0, sizeof hdr);
+        fwrite("BM", 1, 2, fp);
+        hdr[0] = 54 + w * h * 4; hdr[1] = 0; hdr[2] = 54; hdr[3] = 40;
+        hdr[4] = w; hdr[5] = (uint32_t)-(int32_t)h; hdr[6] = 1 | (32 << 16);
+        fwrite(hdr, 4, 13, fp);
+        for (y = 0; y < h; y++)
+            fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch, 4, w, fp);
+        fclose(fp);
+    }
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s->staging, 0);
+}
+
 static Surface *bind_target(const PbGpuState *st, Zeta **zout)
 {
     Surface *s;
@@ -997,6 +1087,56 @@ static Surface *bind_target(const PbGpuState *st, Zeta **zout)
     vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     set_scissor(st, s);
+    {
+        /* RECOMP_RT_TRACE=<flip>: every target a frame draws to, in order,
+         * with what it samples -- to find a pass landing on the wrong one. */
+        static long trace_flip = -2;
+        static const Surface *last;
+        static unsigned n;
+        if (trace_flip == -2) {
+            const char *e = getenv("RECOMP_RT_TRACE");
+            trace_flip = e ? atol(e) : -1;
+        }
+        if (trace_flip >= 0 && s_flip >= (uint32_t)trace_flip
+            && s_flip <= (uint32_t)trace_flip + 1 && n < 400) {
+            if (s != last) {
+                n++;
+                if (last) {
+                    char name[64];
+                    snprintf(name, sizeof name, "rt%u_%02u_%08X", s_flip, n,
+                             ((Surface *)last)->addr);
+                    rt_dump((Surface *)last, name);
+                }
+                fprintf(stderr, "  [RT] flip %u -> %08X pitch %u clip %u,%u %ux%u"
+                        " (surf %ux%u) tex0 %08X %ux%u blend %u %X/%X z %08X%c",
+                        s_flip, st->surf_addr, st->surf_pitch, st->clip_x,
+                        st->clip_y, st->clip_w, st->clip_h, s->w, s->h,
+                        st->tex[0].valid ? st->tex[0].addr : 0,
+                        st->tex[0].width, st->tex[0].height, st->blend_enable,
+                        st->blend_sfactor, st->blend_dfactor, st->zeta_addr, 10);
+                {
+                    int k;
+                    fprintf(stderr, "  [RT]    fac0 %08X fac1 %08X fc0 %08X fc1 %08X%c",
+                            st->rc.factor0[0], st->rc.factor1[0], st->rc.final_c0,
+                            st->rc.final_c1, 10);
+                    fprintf(stderr, "  [RT]    rc %d stages %05X ctl-count %u", st->use_rc,
+                            st->rc.stage_program, st->rc.control & 0xF);
+                    for (k = 0; k < 4; k++)
+                        if (st->tex[k].valid)
+                            fprintf(stderr, " | t%d %08X %ux%u fmt %02X norm %d addr %u/%u"
+                                    " bm %.3f %.3f %.3f %.3f", k,
+                                    st->tex[k].addr, st->tex[k].width,
+                                    st->tex[k].height, st->tex[k].color,
+                                    st->tex[k].normalized, st->tex[k].addr_u,
+                                    st->tex[k].addr_v, st->tex[k].bump_mat[0],
+                                    st->tex[k].bump_mat[1], st->tex[k].bump_mat[2],
+                                    st->tex[k].bump_mat[3]);
+                    fprintf(stderr, "%c", 10);
+                }
+            }
+            last = s;
+        }
+    }
     s->drawn_flip = s_flip;
     s->drawn = 1;
     *zout = z;
@@ -1044,7 +1184,15 @@ void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
                                    : (st_i == 0 && t->valid ? 1 : 0);
         srv[st_i] = s_white;
         smp[st_i] = NULL;
-        if (mode >= 1 && mode <= 3) {
+        if ((mode >= 1 && mode <= 3) || mode == 6 || mode == 7) {
+            if (mode == 6 || mode == 7) {
+                uint32_t in = st_i == 1 ? 0
+                            : (st->other_stage_input >> (st_i == 2 ? 16 : 20)) & 0xF;
+                key.input_tex[st_i] = in < st_i ? in : st_i - 1;
+                memcpy(pc.bump[st_i], t->bump_mat, sizeof pc.bump[st_i]);
+                pc.bumpls[st_i][0] = t->bump_scale;
+                pc.bumpls[st_i][1] = t->bump_offset;
+            }
             key.stage_kind[st_i] = (mode == 3 && t->cube) ? 2
                                  : (t->valid && !t->normalized) ? 3 : 1;
             key.no_alpha[st_i] = (uint32_t)t->no_alpha;
@@ -1053,8 +1201,21 @@ void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
             if (key.stage_kind[st_i] == 2 && srv[st_i] == s_white)
                 key.stage_kind[st_i] = 1;      /* no cube to bind */
             if (t->width && t->height) {
-                pc.texsize[st_i][0] = 1.0f / (float)t->width;
-                pc.texsize[st_i][1] = 1.0f / (float)t->height;
+                /* Texel coordinates into a render target address the
+                 * surface it was drawn to, which is taller than the texture
+                 * (surfaces are made at least 480 rows): normalising by the
+                 * texture's own height read rows nothing had drawn. */
+                const Surface *rt = !t->cube ? surface_find(t->addr) : NULL;
+                uint32_t w = t->width, h = t->height;
+                if (rt && rt->drawn_flip + 4 >= s_flip
+                    && (srv[st_i] == rt->srv || srv[st_i] == s_copy_srv)) {
+                    w = rt->w;
+                    h = rt->h;
+                    if (t->color == 0x41 || t->color == 0x40 || t->color == 0x3F)
+                        key.rt_swizzle[st_i] = t->color;
+                }
+                pc.texsize[st_i][0] = 1.0f / (float)w;
+                pc.texsize[st_i][1] = 1.0f / (float)h;
             }
         }
     }

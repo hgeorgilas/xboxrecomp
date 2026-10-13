@@ -244,6 +244,8 @@ typedef struct {
     uint32_t palette;                   /* guest address of the CLUT, P8 */
     uint32_t levels;                    /* mip levels, from FORMAT       */
     uint32_t filter;                    /* SET_TEXTURE_FILTER            */
+    float    bump[4];                   /* SET_BUMP_ENV_MAT 00 01 10 11  */
+    float    bump_scale, bump_offset;   /* SET_BUMP_ENV_SCALE / _OFFSET  */
     int      cube;                      /* FORMAT: six faces, not one    */
     int      valid;
 } Texture;
@@ -308,6 +310,7 @@ static struct {
     Nv2aCombiner rc;
     int      rc_seen;
     uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE */
+    uint32_t other_stage_input;         /* SET_SHADER_OTHER_STAGE_INPUT */
     uint32_t alpha_test, alpha_func, alpha_ref;
     uint32_t fog_enable, fog_mode, fog_color;
     float    fog_param[2];
@@ -881,6 +884,8 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
     case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
     case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
+    case 0x28: return 0x17;                /* G8B8      -> LIN_G8B8      */
+    case 0x29: return 0x16;                /* R8B8      -> LIN_R8B8      */
     default:   return fmt;                 /* already linear, or unhandled */
     }
 }
@@ -1014,6 +1019,21 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
               | (expand((t >>  8) & 0x0F, 4) << 16)
               | (expand((t >>  4) & 0x0F, 4) <<  8)
               |  expand( t        & 0x0F, 4);
+        return 1;
+    }
+
+    /* 16-bit, two channels: the named one in the high byte, blue in the
+     * low. The NV2A reads the missing channels as copies (as xemu maps
+     * them): G8B8 is (B, G, B, G) and R8B8 is (R, B, B, R). Spartan's
+     * colour grade is a 256x256 R8B8 table read through BUMPENVMAP. */
+    case 0x17: {                                    /* LIN_G8B8 */
+        uint32_t t = ((const uint16_t *)p)[u], hi = t >> 8, lo = t & 0xFF;
+        *argb = (hi << 24) | (lo << 16) | (hi << 8) | lo;
+        return 1;
+    }
+    case 0x16: {                                    /* LIN_R8B8 */
+        uint32_t t = ((const uint16_t *)p)[u], hi = t >> 8, lo = t & 0xFF;
+        *argb = (hi << 24) | (hi << 16) | (lo << 8) | lo;
         return 1;
     }
 
@@ -1642,7 +1662,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
     case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
         return 1;
     case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
-    case 0x1C: case 0x1D:
+    case 0x1C: case 0x1D: case 0x16: case 0x17: case 0x28: case 0x29:
         return 2;
     default:
         return 4;
@@ -2054,6 +2074,7 @@ static void gpu_state(PbGpuState *g)
     }
     g->rc = s_gpu.rc;
     g->clip_plane_mode = s_gpu.clip_plane_mode;
+    g->other_stage_input = s_gpu.other_stage_input;
     /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
     nv2a_rc_unpack(s_gpu.fog_color, g->fog_color);
     { float r = g->fog_color[2]; g->fog_color[2] = g->fog_color[0]; g->fog_color[0] = r; }
@@ -2071,6 +2092,9 @@ static void gpu_state(PbGpuState *g)
         d->no_alpha = t->color == 0x07 || t->color == 0x1E;
         d->addr_u = t->addr_u; d->addr_v = t->addr_v; d->filter = t->filter;
         d->face_stride = tex_face_stride(t);
+        memcpy(d->bump_mat, t->bump, sizeof d->bump_mat);
+        d->bump_scale = t->bump_scale;
+        d->bump_offset = t->bump_offset;
         d->bytes = t->cube ? d->face_stride * 6
                  : (d->normalized ? d->face_stride : t->pitch * t->height);
         d->src = t;
@@ -3072,6 +3096,15 @@ static void tex_stage_method(uint32_t method, uint32_t param)
     case 0x1B14:                                  /* SET_TEXTURE_FILTER */
         t->filter = param;
         break;
+    case 0x1B28: case 0x1B2C: case 0x1B30: case 0x1B34:  /* BUMP_ENV_MAT */
+        memcpy(&t->bump[(reg - 0x1B28) / 4], &param, 4);
+        return;
+    case 0x1B38:                                  /* BUMP_ENV_SCALE */
+        memcpy(&t->bump_scale, &param, 4);
+        return;
+    case 0x1B3C:                                  /* BUMP_ENV_OFFSET */
+        memcpy(&t->bump_offset, &param, 4);
+        return;
     default:
         break;
     }
@@ -3297,6 +3330,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.rc_seen = 1;
         break;
     case 0x1E70: s_gpu.rc.stage_program = param; break;
+    case 0x1E78: s_gpu.other_stage_input = param; break;  /* which stage a
+                                         * dependent read takes its input from */
     case 0x17F8: s_gpu.clip_plane_mode = param; break;
 
     /* Alpha test and fog. */
