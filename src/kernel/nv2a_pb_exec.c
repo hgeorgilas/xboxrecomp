@@ -2197,13 +2197,20 @@ static void raster_batch_program(void)
         /* RECOMP_VSH_TRACE=<n>: print n program batches -- attribute setup,
          * raw inputs, key constants, and what came out. */
         static int left = -1;
+        static uint32_t every = 20000;
         if (left < 0) {
+            /* RECOMP_VSH_TRACE=<count>[:<every>] */
             const char *t = getenv("RECOMP_VSH_TRACE");
+            const char *c = t ? strchr(t, ':') : NULL;
             left = t ? atoi(t) : 0;
+            if (c && atoi(c + 1) > 0)
+                every = (uint32_t)atoi(c + 1);
         }
-        /* Spread out: one every 20000 program batches, so a run that spends
-         * its first half in menus still traces the 3D scene. */
-        if (left > 0 && n >= 3 && s_gpu.batches_program % 20000 == 0) {
+        /* Spread out: one every 20000 program batches by default, so a run
+         * that spends its first half in menus still traces the 3D scene. A
+         * title that issues a few thousand batches a minute needs a smaller
+         * interval to be traced at all. */
+        if (left > 0 && n >= 3 && s_gpu.batches_program % every == 0) {
             float in[4];
             left--;
             fprintf(stderr, "[VTRACE] prim %u n %u idx %u %u %u\n", s_gpu.prim,
@@ -2225,10 +2232,15 @@ static void raster_batch_program(void)
                             c[0], c[1], c[2], c[3], 10);
                 }
             }
-            for (i = 0; i < 3; i++)
-                fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g\n", i,
-                        s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
-                        s_xf[i].pos[3]);
+            for (i = 0; i < 3; i++) {
+                /* Input attribute 0 of the same vertex, so a transform that
+                 * scatters one primitive's corners can be told apart from
+                 * inputs that were scattered already. */
+                fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], in);
+                fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g  (in v0 %g %g %g %g)\n",
+                        i, s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
+                        s_xf[i].pos[3], in[0], in[1], in[2], in[3]);
+            }
         }
     }
     for (i = 0; i < NV2A_VSH_INPUTS; i++) {
@@ -2603,10 +2615,18 @@ static void draw_inline_array(void)
         uint32_t bytes;
         if (!s_gpu.attr[a].size)
             continue;
+        /* NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE. Shorts are two bytes a
+         * component: sizing them as floats made Spartan's text vertices
+         * (float2 + D3DCOLOR + short2) 20 bytes instead of 16, so every
+         * vertex after the first was read 4 bytes further out per vertex and
+         * glyph quads became screen-wide streaks. */
         switch (s_gpu.attr[a].type) {
-        case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
-        case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
-        case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
+        case 0:  bytes = 4;                        break;  /* D3DCOLOR     */
+        case 1:                                            /* short, norm  */
+        case 5:  bytes = 2 * s_gpu.attr[a].size;   break;  /* short, S32K  */
+        case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float        */
+        case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm   */
+        case 6:  bytes = 4;                        break;  /* packed 11:11:10 */
         default: bytes = 4 * s_gpu.attr[a].size;   break;
         }
         s_gpu.attr[a].offset = off;
