@@ -36,6 +36,19 @@ extern int xbox_setting_int(const char *key, int def);
 #define DUMP_DIR    "textures\\dump\\"
 #define REPL_DIR    "textures\\replace\\"
 
+/* Button prompts: textures/prompts/<style>/ holds replacements, named like
+ * the pack's, for the textures that draw controller buttons -- one set per
+ * pad family. RECOMP_BUTTON_PROMPTS picks the set: "auto" (the default)
+ * follows the pad last used, the title's own art for an Xbox pad and the
+ * PlayStation set for a DualShock/DualSense; "original", "xbox" and
+ * "playstation" fix it. They sit in the replacement set under the texture's
+ * key salted with the style, and apply with the HD pack on or off. */
+enum { PROMPT_ORIGINAL, PROMPT_XBOX, PROMPT_PLAYSTATION, PROMPT_STYLES };
+static const char *const s_prompt_dir[PROMPT_STYLES] = {
+    NULL, "textures\\prompts\\xbox\\", "textures\\prompts\\playstation\\" };
+#define PROMPT_KEY(k, style) ((k) ^ (0xB077011CDA5E0000ull * (uint64_t)(style)))
+static int s_prompt;            /* the style in force */
+
 /* ---- a small open-addressing set of 64-bit keys ---------------------------- */
 
 typedef struct {
@@ -210,25 +223,51 @@ static void init(void)
                 DUMP_DIR, s_dumped.n);
     }
     /* Listed even when off: the overlay can turn the pack on later. */
-    if ((f = FindFirstFileA(REPL_DIR "*.png", &fd)) != INVALID_HANDLE_VALUE) {
-        do {
-            uint64_t k = _strtoui64(fd.cFileName, NULL, 16);
-            Slot *sl;
-            if (!k || !(sl = set_find(&s_repl, k, 1)))
+    {
+        int style;
+        for (style = 0; style < PROMPT_STYLES; style++) {
+            const char *dir = style ? s_prompt_dir[style] : REPL_DIR;
+            char pat[MAX_PATH];
+            if (!dir)
                 continue;
-            if (!sl->path) {
-                size_t len = strlen(REPL_DIR) + strlen(fd.cFileName) + 1;
-                sl->path = (char *)malloc(len);
-                if (sl->path)
-                    snprintf(sl->path, len, "%s%s", REPL_DIR, fd.cFileName);
-                sl->state = 1;
-                n++;
-            }
-        } while (FindNextFileA(f, &fd));
-        FindClose(f);
+            n = 0;
+            snprintf(pat, sizeof pat, "%s*.png", dir);
+            if ((f = FindFirstFileA(pat, &fd)) == INVALID_HANDLE_VALUE)
+                continue;
+            do {
+                uint64_t k = _strtoui64(fd.cFileName, NULL, 16);
+                Slot *sl;
+                if (!k || !(sl = set_find(&s_repl, style ? PROMPT_KEY(k, style) : k, 1)))
+                    continue;
+                if (!sl->path) {
+                    size_t len = strlen(dir) + strlen(fd.cFileName) + 1;
+                    sl->path = (char *)malloc(len);
+                    if (sl->path)
+                        snprintf(sl->path, len, "%s%s", dir, fd.cFileName);
+                    sl->state = 1;
+                    n++;
+                }
+            } while (FindNextFileA(f, &fd));
+            FindClose(f);
+            if (n)
+                fprintf(stderr, "  [TEXPACK] %d replacement texture(s) in %s\n", n, dir);
+        }
     }
-    if (n)
-        fprintf(stderr, "  [TEXPACK] %d replacement texture(s) in %s\n", n, REPL_DIR);
+}
+
+/* The prompt style RECOMP_BUTTON_PROMPTS asks for now. */
+static int prompt_style(void)
+{
+    extern const char *xbox_setting_get(const char *key);
+    extern int xbox_InputActiveKind(void);
+    const char *v = xbox_setting_get("RECOMP_BUTTON_PROMPTS");
+    if (v && !_stricmp(v, "original"))
+        return PROMPT_ORIGINAL;
+    if (v && !_stricmp(v, "xbox"))
+        return PROMPT_XBOX;
+    if (v && !_stricmp(v, "playstation"))
+        return PROMPT_PLAYSTATION;
+    return xbox_InputActiveKind() ? PROMPT_PLAYSTATION : PROMPT_ORIGINAL;
 }
 
 /* The texture's name: its decoded pixels, format and size. */
@@ -298,10 +337,14 @@ int texpack_lookup(uint64_t key, uint32_t **px, uint32_t *w, uint32_t *h)
     Slot *sl;
     int r = 0, load = 0;
     init();
-    if (!s_use || !s_repl.n)
+    if (!s_repl.n)
         return 0;
     AcquireSRWLockExclusive(&s_lock);
-    sl = set_find(&s_repl, key, 0);
+    sl = NULL;
+    if (s_prompt && (sl = set_find(&s_repl, PROMPT_KEY(key, s_prompt), 0)) != NULL)
+        key = PROMPT_KEY(key, s_prompt);
+    else if (s_use)
+        sl = set_find(&s_repl, key, 0);
     if (sl) {
         switch (sl->state) {
         case 1:                       /* on disk: start decoding */
@@ -333,14 +376,29 @@ int texpack_lookup(uint64_t key, uint32_t **px, uint32_t *w, uint32_t *h)
     return r;
 }
 
-/* RECOMP_TEXPACK, live: nonzero when it changed since the last call, so
- * the renderer re-uploads its textures -- replaced or original. */
+/* RECOMP_TEXPACK and the button prompt style, live: nonzero when either
+ * changed since the last call, so the renderer re-uploads its textures --
+ * replaced or original. Called once a frame. */
 int texpack_use_changed(void)
 {
     static long gen;
+    static DWORD last_check;
     extern long xbox_settings_gen(void);
     int was, now;
     init();
+    /* The pad in use can change at any time; a few times a second is
+     * plenty to notice. */
+    if (GetTickCount() - last_check >= 250) {
+        int style = prompt_style();
+        last_check = GetTickCount();
+        if (style != s_prompt) {
+            fprintf(stderr, "  [TEXPACK] button prompts: %s\n",
+                    style == PROMPT_PLAYSTATION ? "PlayStation"
+                    : style == PROMPT_XBOX ? "Xbox" : "original");
+            s_prompt = style;
+            return 1;
+        }
+    }
     if (gen == xbox_settings_gen())
         return 0;
     gen = xbox_settings_gen();

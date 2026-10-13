@@ -25,6 +25,51 @@
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
 static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
 
+/* DualShock 4 / DualSense pads, read over HID (hid_pads.c). XInput pads keep
+ * their own ports; the Sony pads fill the ports XInput leaves empty, in
+ * order. */
+extern int  hidpad_count(void);
+extern int  hidpad_get(int n, XBOX_INPUT_STATE *st);
+extern void hidpad_rumble(int n, WORD left, WORD right);
+
+static int hid_for_port(DWORD port)
+{
+    DWORD q;
+    int k = 0;
+    for (q = 0; q < port; q++)
+        k += !g_controller_connected[q];
+    return k < hidpad_count() ? k : -1;
+}
+
+/* Which kind of pad is in use: what the button prompts should show.
+ * 0 an Xbox pad (or none yet), 1 a PlayStation pad.
+ *
+ * Steam Input and DS4Windows present a Sony pad as an XInput pad too, so the
+ * same press can arrive from both; the PlayStation pad wins whenever it was
+ * active within two seconds of the Xbox one, or the prompts would flip with
+ * every press. */
+static volatile LONG g_xi_active_ms, g_hid_active_ms;
+
+int xbox_InputActiveKind(void)
+{
+    LONG xi = g_xi_active_ms, hid = g_hid_active_ms;
+    if (!xi && !hid)
+        return hidpad_count() > 0;
+    return hid && (LONG)((DWORD)xi - (DWORD)hid) <= 2000;
+}
+
+static void note_activity(const XBOX_INPUT_STATE *st, int sony)
+{
+    const XBOX_GAMEPAD *g = &st->Gamepad;
+    int i, active = g->wButtons != 0 || g->sThumbLX > 16000 || g->sThumbLX < -16000
+                 || g->sThumbLY > 16000 || g->sThumbLY < -16000;
+    for (i = 0; i < 8 && !active; i++)
+        active = g->bAnalogButtons[i] > 64;
+    if (active)
+        InterlockedExchange(sony ? &g_hid_active_ms : &g_xi_active_ms,
+                            (LONG)(GetTickCount() | 1));
+}
+
 /* Host XInput calls that took a millisecond or more, and the longest, for
  * the audio recorder's report: a wireless pad can block in these, and the
  * title calls them from its own threads. */
@@ -184,7 +229,29 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         xi_timed(t0);
     }
     if (result != ERROR_SUCCESS) {
+        int h;
         g_controller_connected[dwPort] = FALSE;
+        if ((h = hid_for_port(dwPort)) >= 0 && hidpad_get(h, pState)) {
+            note_activity(pState, 1);
+            /* The packet number is the pad's own; offset so a port that
+             * changes source still sees it move. */
+            pState->dwPacketNumber += 0x10000000u;
+            if (dwPort == 0 && keyboard_enabled()) {
+                XBOX_INPUT_STATE kb;
+                int i, any = 0;
+                keyboard_state(&kb);
+                pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
+                for (i = 0; i < 8; i++)
+                    if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
+                        pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
+                for (i = 0; i < 8; i++)
+                    any |= kb.Gamepad.bAnalogButtons[i] != 0;
+                /* A key press moves the packet number too. */
+                if (any || kb.Gamepad.wButtons)
+                    pState->dwPacketNumber = kb.dwPacketNumber;
+            }
+            return ERROR_SUCCESS;
+        }
         if (dwPort == 0 && keyboard_enabled()) {
             keyboard_state(pState);
             return ERROR_SUCCESS;
@@ -218,6 +285,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
     pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
     pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
+    note_activity(pState, 0);
 
     /* Merge the keyboard on top rather than only standing in for a missing
      * pad.
@@ -273,10 +341,14 @@ static DWORD WINAPI rumble_thread(LPVOID unused)
             if (v != sent[p]) {
                 XINPUT_VIBRATION xi_vib;
                 LARGE_INTEGER t0;
+                int h;
                 xi_vib.wLeftMotorSpeed = (WORD)((ULONG)v >> 16);
                 xi_vib.wRightMotorSpeed = (WORD)v;
                 QueryPerformanceCounter(&t0);
-                XInputSetState(p, &xi_vib);
+                if (!g_controller_connected[p] && (h = hid_for_port(p)) >= 0)
+                    hidpad_rumble(h, xi_vib.wLeftMotorSpeed, xi_vib.wRightMotorSpeed);
+                else
+                    XInputSetState(p, &xi_vib);
                 xi_timed(t0);
                 sent[p] = v;
             }
@@ -300,7 +372,8 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
                         (LONG)(((ULONG)pVibration->wLeftMotorSpeed << 16)
                                | pVibration->wRightMotorSpeed));
     SetEvent(g_rumble_event);
-    return g_controller_connected[dwPort] ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+    return g_controller_connected[dwPort] || hid_for_port(dwPort) >= 0
+         ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
@@ -322,7 +395,7 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
     }
     if (dwPort == 0 && keyboard_enabled())
         return TRUE;
-    return g_controller_connected[dwPort];
+    return g_controller_connected[dwPort] || hid_for_port(dwPort) >= 0;
 }
 
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
@@ -334,7 +407,14 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
         return ERROR_DEVICE_NOT_CONNECTED;
 
     result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
-    if (result != ERROR_SUCCESS) return result;
+    if (result != ERROR_SUCCESS) {
+        if (hid_for_port(dwPort) < 0)
+            return result;
+        memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
+        pCaps->Type = 1;        /* XINPUT_DEVTYPE_GAMEPAD */
+        pCaps->SubType = 1;     /* XINPUT_DEVSUBTYPE_GAMEPAD */
+        return ERROR_SUCCESS;
+    }
 
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
     pCaps->Type = xi_caps.Type;

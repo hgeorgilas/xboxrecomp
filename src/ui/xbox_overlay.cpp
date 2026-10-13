@@ -34,6 +34,8 @@ long  texpack_dumped_count(void);
 long  texpack_loaded_count(void);
 int   xbox_settings_save(void);
 const char *xbox_settings_path(void);
+int   hidpad_count(void);
+int   xbox_InputActiveKind(void);
 }
 
 namespace {
@@ -141,6 +143,30 @@ void panel()
         ImGui::SetItemTooltip("The game steps once per frame at this rate, so game speed"
                               " stays right while your PC holds it; if it cannot, the"
                               " game slows down, as the console did.");
+    }
+
+    ImGui::SeparatorText("Controls");
+    {
+        static const char *names[] = { "Automatic (follows the pad)", "Original (Xbox)",
+                                       "Xbox Series", "PlayStation" };
+        static const char *values[] = { "auto", "original", "xbox", "playstation" };
+        const char *cur = xbox_setting_get("RECOMP_BUTTON_PROMPTS");
+        int sel = 0;
+        for (int i = 1; i < 4; i++)
+            if (cur && !_stricmp(cur, values[i]))
+                sel = i;
+        if (ImGui::Combo("Button prompts", &sel, names, 4))
+            xbox_setting_set("RECOMP_BUTTON_PROMPTS", values[sel]);
+        ImGui::SetItemTooltip("Which buttons the game's prompts show. Automatic: the"
+                              " original art with an Xbox pad, PlayStation symbols with"
+                              " a DualShock or DualSense.");
+        bool hid = xbox_setting_int("RECOMP_HID_PADS", 1) != 0;
+        if (ImGui::Checkbox("DualShock / DualSense support", &hid))
+            set_int("RECOMP_HID_PADS", hid ? 1 : 0);
+        ImGui::SetItemTooltip("Reads PlayStation pads directly, over USB or Bluetooth."
+                              " Turn off if Steam Input or DS4Windows already does.");
+        ImGui::TextDisabled("%d PlayStation pad(s) connected; using %s", hidpad_count(),
+                            xbox_InputActiveKind() ? "PlayStation" : "Xbox");
     }
 
     ImGui::SeparatorText("Textures");

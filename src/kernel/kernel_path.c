@@ -394,6 +394,38 @@ static void xbox_remember_host_path(const wchar_t *p)
 
 
 
+/* Mods: a file in the mods directory replaces the game file at the same
+ * path, so a title's data can be changed (reworded text, fixed assets)
+ * without touching the game files. RECOMP_MODS_DIR names the directory;
+ * by default it is "mods" in the working directory, when there is one.
+ * Read-only game paths only -- saves are never redirected. */
+static void mods_override(const WCHAR *remainder, WCHAR *host_path, DWORD n)
+{
+    static WCHAR dir[MAX_PATH];
+    static int state;           /* 0 unknown, 1 on, -1 off */
+    WCHAR cand[MAX_PATH];
+    DWORD attr;
+
+    if (!state) {
+        const char *e = getenv("RECOMP_MODS_DIR");
+        WCHAR rel[MAX_PATH];
+        MultiByteToWideChar(CP_UTF8, 0, e && *e ? e : "mods", -1, rel, MAX_PATH);
+        attr = GetFullPathNameW(rel, MAX_PATH, dir, NULL)
+             ? GetFileAttributesW(dir) : INVALID_FILE_ATTRIBUTES;
+        state = attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) ? 1 : -1;
+        if (state > 0)
+            fprintf(stderr, "  [PATH] mods: %S\n", dir);
+    }
+    if (state < 0 || !*remainder)
+        return;
+    swprintf_s(cand, MAX_PATH, L"%s\\%s", dir, remainder);
+    attr = GetFileAttributesW(cand);
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY))
+        return;
+    wcscpy_s(host_path, n, cand);
+    fprintf(stderr, "  [PATH] -> mods\\%S\n", remainder);
+}
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
     const char*  remainder = NULL;
@@ -457,6 +489,8 @@ translate:
             CreateDirectoryW(dir_path, NULL);
         } else {
             swprintf_s(host_path_buf, buf_size, L"%s\\%s", base_dir, remainder_wide);
+            if (base_dir == s_game_dir)
+                mods_override(remainder_wide, host_path_buf, buf_size);
         }
 
         /* An empty remainder means the title opened the device itself, so
