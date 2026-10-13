@@ -1856,6 +1856,7 @@ typedef struct {
     float    vdef[16][4];             /* value of an absent attribute */
     float    ui[4];                   /* safe-area fill: x' = (x - ui.x) * ui.z + ui.w */
     float    ui2[4];                  /* y' = (y - ui2.x) * ui2.z + ui2.w; ui.z 0: off */
+                                      /* ui.y, ui2.y: edge snap at width, height; 0 off */
 } PgConsts;
 
 static const char k_pg_head[] =
@@ -1898,6 +1899,9 @@ static const char k_pg_head[] =
 static const char k_pg_tail[] =
 "  VO r; float w = oPos.w;\n"
 "  if (isinf(w) || isnan(w)) w = 1.0;\n"
+"  if (ui.y > 0 && oPos.w == 1) {\n"
+"    if (oPos.x >= ui.y - 1.5) oPos.x = ui.y;\n"
+"    if (oPos.y >= ui2.y - 1.5) oPos.y = ui2.y; }\n"
 "  if (ui.z != 0) { oPos.x = (oPos.x - ui.x) * ui.z + ui.w;\n"
 "    oPos.y = (oPos.y - ui2.x) * ui2.z + ui2.w; }\n"
 "  float x = oPos.x * vp.x - 1.0, y = 1.0 - oPos.y * vp.y, z = oPos.z * vp.z;\n"
@@ -1973,12 +1977,25 @@ static void ui_fill(const PgEntry *e, float W, float H, PgConsts *pg)
         gen = xbox_settings_gen();
         on = xbox_setting_int("RECOMP_SAFE_AREA_FILL", 1) != 0;
     }
-    if (!on || !e || e->ui_const < 0)
+    if (!e || e->ui_const < 0)
         return;
     c = nv2a_vsh_constant((uint32_t)e->ui_const);
+    if (c[2] != 0 || c[3] != 0)
+        return;
+    /* Edge snap. The title's full-screen quads -- the cutscene letterbox
+     * bars, menu backdrops -- run from 0 to 639 with a -0.5 offset, so their
+     * far edges stop at 638.5 / 478.5 and leave the last column and row
+     * uncovered: the "black bars don't cover the screen" seen on real
+     * hardware too, where a TV's overscan hides it and a monitor does not.
+     * A vertex within a pixel and a half of the right or bottom edge is put
+     * on it. */
+    pg->ui[1] = W;
+    pg->ui2[1] = H;
+    if (!on)
+        return;
     ox = c[0] + 0.5f;
     oy = c[1] + 0.5f;
-    if (c[2] != 0 || c[3] != 0 || ox < 1 || oy < 1
+    if (ox < 1 || oy < 1
             || ox != floorf(ox) || oy != floorf(oy)
             || ox * 4 > W || oy * 4 > H)
         return;
@@ -2216,6 +2233,20 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
         uint32_t fx, fy;
         aa_factor(st, &fx, &fy);
         ui_fill(s_pg_cur, (float)s->w / (float)fx, (float)s->h / (float)fy, &pg);
+        if (pg.ui[2] != 0 && slot[0] >= 0) {
+            /* Subtitles and the hints that share the bottom letterbox bar
+             * sit a little high once the layer fills the screen: a draw
+             * wholly in the bottom fifth moves down 5 lines (at 480). */
+            float H = (float)s->h / (float)fy, top = 1e30f;
+            uint32_t k;
+            for (k = 0; k < nverts; k++) {
+                float y = attr[(k * stride + (uint32_t)slot[0]) * 4 + 1];
+                if (y < top) top = y;
+            }
+            top += pg.ui2[0];          /* the title's own offset, as drawn */
+            if (top > H * 0.8f)
+                pg.ui2[3] += 5.0f * H / 480.0f;
+        }
     }
     memcpy(pg.fog, fog, sizeof pg.fog);
     pg.info[0] = stride;
