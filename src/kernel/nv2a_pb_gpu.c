@@ -1096,6 +1096,8 @@ static void cap_poll(void)
             s_cap.last = NULL;
             s_cap.n = s_cap.draws = 0;
             fprintf(s_cap.log, "capture of flip %u\n", s_cap.flip);
+            if (env_flip >= 0 && s_cap.flip == (uint32_t)env_flip)
+                env_flip = -1;                 /* the env trigger fires once */
         }
     }
     was = down;
