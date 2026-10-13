@@ -234,9 +234,11 @@ int pbgpu_enabled(void)
 /* ---- colour and depth surfaces ----------------------------------------- */
 
 typedef struct {
-    uint32_t key, addr, pitch, bpp, w, h;
-    ID3D11Texture2D *tex, *staging;
-    ID3D11RenderTargetView *rtv;
+    uint32_t key, addr, pitch, bpp, w, h;   /* the guest's (logical) size */
+    uint32_t pw, ph;                        /* the texture's: logical x scale */
+    float sx, sy;                           /* that scale */
+    ID3D11Texture2D *tex, *staging, *down;  /* staging and down: logical size */
+    ID3D11RenderTargetView *rtv, *down_rtv;
     ID3D11ShaderResourceView *srv;
     uint32_t drawn_flip;           /* last flip it was drawn in */
     int drawn;                     /* drawn since the last readback */
@@ -260,8 +262,52 @@ static void surf_release(Surface *s)
     if (s->rtv) ID3D11RenderTargetView_Release(s->rtv);
     if (s->tex) ID3D11Texture2D_Release(s->tex);
     if (s->staging) ID3D11Texture2D_Release(s->staging);
+    if (s->down_rtv) ID3D11RenderTargetView_Release(s->down_rtv);
+    if (s->down) ID3D11Texture2D_Release(s->down);
     memset(s, 0, sizeof *s);
 }
+
+/* Internal resolution. Render targets are drawn at their guest size times
+ * RECOMP_RES_SCALE -- and, with a display aspect wider than the buffer's,
+ * wider still, so the stretched picture has square pixels. The title never
+ * sees it: positions reach the viewport in normalised form, texture
+ * coordinates are fractions, and what goes back to guest memory is filtered
+ * down to the guest size (surf_logical). A change re-creates the surfaces. */
+extern float xbox_DisplayAspect(void);
+extern float xbox_setting_float(const char *key, float def);
+static float s_res_sx = 1, s_res_sy = 1;
+
+static void res_update(void)
+{
+    static long gen;
+    float sc, a, sx, sy;
+    int i;
+    if (gen == xbox_settings_gen())
+        return;
+    gen = xbox_settings_gen();
+    sc = xbox_setting_float("RECOMP_RES_SCALE", 1.0f);
+    sc = sc < 1 ? 1 : sc > 6 ? 6 : sc;
+    a = xbox_DisplayAspect();
+    sx = sc * (a > 4.0f / 3.0f ? a * 0.75f : 1.0f);
+    sy = sc;
+    if (sx == s_res_sx && sy == s_res_sy)
+        return;
+    s_res_sx = sx;
+    s_res_sy = sy;
+    for (i = 0; i < MAX_SURF; i++)
+        if (s_surf[i].tex)
+            surf_release(&s_surf[i]);
+    for (i = 0; i < MAX_ZETA; i++)
+        if (s_zeta[i].tex) {
+            ID3D11DepthStencilView_Release(s_zeta[i].dsv);
+            ID3D11Texture2D_Release(s_zeta[i].tex);
+            memset(&s_zeta[i], 0, sizeof s_zeta[i]);
+        }
+    fprintf(stderr, "  [PBGPU] internal resolution x%.2f (%.0fx%.0f for 640x480)\n",
+            sc, 640 * sx, 480 * sy);
+}
+
+static ID3D11Texture2D *surf_logical(Surface *s);
 
 /* Guest pixels (32 or 16 bpp) to B8G8R8A8 rows, and back. */
 static void to_bgra(const uint8_t *src, uint32_t bpp, uint32_t w, uint32_t *dst)
@@ -320,8 +366,12 @@ static Surface *surface_get(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_
         s = &s_surf[i];
     }
     h = need_h < 480 ? 480 : need_h;
+    s->sx = s_res_sx;
+    s->sy = s_res_sy;
+    s->pw = (uint32_t)((float)w * s->sx + 0.5f);
+    s->ph = (uint32_t)((float)h * s->sy + 0.5f);
     memset(&td, 0, sizeof td);
-    td.Width = w; td.Height = h;
+    td.Width = s->pw; td.Height = s->ph;
     td.MipLevels = td.ArraySize = 1;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1;
@@ -329,6 +379,7 @@ static Surface *surface_get(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s->tex)))
         return NULL;
+    td.Width = w; td.Height = h;
     td.Usage = D3D11_USAGE_STAGING;
     td.BindFlags = 0;
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -345,8 +396,24 @@ static Surface *surface_get(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_
     if (row) {
         for (y = 0; y < h; y++)
             to_bgra(guest(addr) + (size_t)y * pitch, bpp, w, row + (size_t)y * w);
-        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s->tex, 0,
-                                              NULL, row, w * 4, 0);
+        if (s->pw == w && s->ph == h) {
+            ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s->tex, 0,
+                                                  NULL, row, w * 4, 0);
+        } else {
+            /* Scaled: the guest's pixels, each repeated over its area. */
+            uint32_t *big = (uint32_t *)malloc((size_t)s->pw * s->ph * 4), x;
+            if (big) {
+                for (y = 0; y < s->ph; y++) {
+                    const uint32_t *src = row + (size_t)(y * h / s->ph) * w;
+                    uint32_t *dst = big + (size_t)y * s->pw;
+                    for (x = 0; x < s->pw; x++)
+                        dst[x] = src[x * w / s->pw];
+                }
+                ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s->tex, 0,
+                                                      NULL, big, s->pw * 4, 0);
+                free(big);
+            }
+        }
         free(row);
     }
     return s;
@@ -1206,12 +1273,12 @@ static void set_scissor(const PbGpuState *st, const Surface *s)
     D3D11_RECT r;
     uint32_t fx, fy;
     aa_factor(st, &fx, &fy);
-    r.left = (LONG)(st->clip_x * fx);
-    r.top = (LONG)(st->clip_y * fy);
-    r.right = (LONG)((st->clip_x + st->clip_w) * fx);
-    r.bottom = (LONG)((st->clip_y + st->clip_h) * fy);
-    if (r.right > (LONG)s->w) r.right = (LONG)s->w;
-    if (r.bottom > (LONG)s->h) r.bottom = (LONG)s->h;
+    r.left = (LONG)floorf((float)(st->clip_x * fx) * s->sx);
+    r.top = (LONG)floorf((float)(st->clip_y * fy) * s->sy);
+    r.right = (LONG)ceilf((float)((st->clip_x + st->clip_w) * fx) * s->sx);
+    r.bottom = (LONG)ceilf((float)((st->clip_y + st->clip_h) * fy) * s->sy);
+    if (r.right > (LONG)s->pw) r.right = (LONG)s->pw;
+    if (r.bottom > (LONG)s->ph) r.bottom = (LONG)s->ph;
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &r);
 }
 
@@ -1328,7 +1395,7 @@ static void rt_dump(Surface *s, const char *name)
         return;
     snprintf(path, sizeof path, "%s%s.bmp", dir, name);
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s->staging,
-                                     (ID3D11Resource *)s->tex);
+                                     (ID3D11Resource *)surf_logical(s));
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s->staging, 0,
                                        D3D11_MAP_READ, 0, &m)))
         return;
@@ -1353,16 +1420,17 @@ static Surface *bind_target(const PbGpuState *st, Zeta **zout)
 
     if (!st->surf_addr || !st->surf_pitch || (st->surf_bpp != 4 && st->surf_bpp != 2))
         return NULL;
+    res_update();
     s = surface_get(st->surf_addr, st->surf_pitch, st->surf_bpp,
                     (st->clip_y + st->clip_h) * (((st->surf_format >> 12) & 0xF) == 2 ? 2u : 1u));
     if (!s)
         return NULL;
     if (st->zeta_addr)
-        z = zeta_get(st->zeta_addr, s->w, s->h);
+        z = zeta_get(st->zeta_addr, s->pw, s->ph);
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s->rtv, z ? z->dsv : NULL);
     vp.TopLeftX = vp.TopLeftY = 0;
-    vp.Width = (float)s->w;
-    vp.Height = (float)s->h;
+    vp.Width = (float)s->pw;
+    vp.Height = (float)s->ph;
     vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     set_scissor(st, s);
@@ -2172,7 +2240,7 @@ void pbgpu_readback(uint32_t addr)
     s = surface_find(addr);
     if (s && s->drawn && s->staging) {
         ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s->staging,
-                                         (ID3D11Resource *)s->tex);
+                                         (ID3D11Resource *)surf_logical(s));
         if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s->staging,
                                               0, D3D11_MAP_READ, 0, &m))) {
             for (y = 0; y < s->h; y++)
@@ -2213,11 +2281,122 @@ static const char k_blit_vs[] =
 "VO main(uint id : SV_VertexID) { VO o;\n"
 "  float2 t = float2((id << 1) & 2, id & 2);\n"
 "  o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = t; return o; }\n";
+/* foot.xy: one output pixel's footprint in the source, as uv; foot.z taps
+ * per axis averaged over it (1: plain bilinear); foot.w 1 keeps alpha. A
+ * scaled frame shown in a smaller window, or filtered down for guest
+ * memory, is averaged rather than point-sampled -- no shimmer. */
 static const char k_blit_ps[] =
-"cbuffer B : register(b0) { float4 uvmax; };\n"
+"cbuffer B : register(b0) { float4 uvmax; float4 foot; };\n"
 "Texture2D t : register(t0); SamplerState s : register(s0);\n"
 "float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
-"  return float4(t.Sample(s, uv * uvmax.xy).rgb, 1); }\n";
+"  float2 c = uv * uvmax.xy; int n = (int)foot.z; float4 acc = 0; int i, j;\n"
+"  if (n <= 1) acc = t.Sample(s, c);\n"
+"  else { for (j = 0; j < n; j++) for (i = 0; i < n; i++)\n"
+"      acc += t.Sample(s, c + ((float2(i, j) + 0.5) / n - 0.5) * foot.xy);\n"
+"    acc /= n * n; }\n"
+"  return float4(acc.rgb, foot.w != 0 ? acc.a : 1); }\n";
+
+/* The blit shaders, sampler and constants, made once, for the present and
+ * for surf_logical. */
+static int blit_init(void)
+{
+    D3D11_SAMPLER_DESC smd;
+    D3D11_BUFFER_DESC bd;
+    ID3DBlob *code;
+
+    if (s_blit_vs && s_blit_ps && s_blit_smp && s_blit_cb)
+        return 1;
+    if (!s_blit_vs && (code = compile(k_blit_vs, "vs_5_0")) != NULL) {
+        ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                        ID3D10Blob_GetBufferSize(code), NULL, &s_blit_vs);
+        ID3D10Blob_Release(code);
+    }
+    if (!s_blit_ps && (code = compile(k_blit_ps, "ps_5_0")) != NULL) {
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                       ID3D10Blob_GetBufferSize(code), NULL, &s_blit_ps);
+        ID3D10Blob_Release(code);
+    }
+    if (!s_blit_smp) {
+        memset(&smd, 0, sizeof smd);
+        smd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        smd.AddressU = smd.AddressV = smd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        smd.MaxLOD = D3D11_FLOAT32_MAX;
+        ID3D11Device_CreateSamplerState(s_dev, &smd, &s_blit_smp);
+    }
+    if (!s_blit_cb) {
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = 32;
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_blit_cb);
+    }
+    return s_blit_vs && s_blit_ps && s_blit_smp && s_blit_cb;
+}
+
+static void blit_consts(const float uvmax[2], float fx, float fy, float taps, float alpha)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    float c[8];
+    c[0] = uvmax[0]; c[1] = uvmax[1]; c[2] = 0; c[3] = 0;
+    c[4] = fx; c[5] = fy; c[6] = taps; c[7] = alpha;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        memcpy(m.pData, c, sizeof c);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_blit_cb, 0);
+    }
+}
+
+/* The surface at its guest size: the texture itself when unscaled, else a
+ * box-filtered copy -- for everything that goes back to guest memory. */
+static ID3D11Texture2D *surf_logical(Surface *s)
+{
+    D3D11_VIEWPORT vp;
+    D3D11_RECT r;
+    float one[2] = { 1, 1 }, taps;
+    ID3D11ShaderResourceView *none = NULL;
+
+    if (s->pw == s->w && s->ph == s->h)
+        return s->tex;
+    if (!blit_init())
+        return s->tex;
+    if (!s->down) {
+        D3D11_TEXTURE2D_DESC td;
+        memset(&td, 0, sizeof td);
+        td.Width = s->w; td.Height = s->h;
+        td.MipLevels = td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s->down)))
+            return s->tex;
+        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s->down, NULL, &s->down_rtv);
+    }
+    taps = ceilf(s->sx > s->sy ? s->sx : s->sy);
+    if (taps > 8) taps = 8;
+    blit_consts(one, 1.0f / (float)s->w, 1.0f / (float)s->h, taps, 1);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s->down_rtv, NULL);
+    vp.TopLeftX = vp.TopLeftY = 0;
+    vp.Width = (float)s->w; vp.Height = (float)s->h;
+    vp.MinDepth = 0; vp.MaxDepth = 1;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    r.left = r.top = 0; r.right = (LONG)s->w; r.bottom = (LONG)s->h;
+    ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &r);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s->srv);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+    return s->down;
+}
 
 static int present_init(HWND hwnd)
 {
@@ -2257,28 +2436,7 @@ static int present_init(HWND hwnd)
                         " through GDI\n", hr);
         return 0;
     }
-    if ((code = compile(k_blit_vs, "vs_5_0")) != NULL) {
-        ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
-                                        ID3D10Blob_GetBufferSize(code), NULL, &s_blit_vs);
-        ID3D10Blob_Release(code);
-    }
-    if ((code = compile(k_blit_ps, "ps_5_0")) != NULL) {
-        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
-                                       ID3D10Blob_GetBufferSize(code), NULL, &s_blit_ps);
-        ID3D10Blob_Release(code);
-    }
-    memset(&smd, 0, sizeof smd);
-    smd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    smd.AddressU = smd.AddressV = smd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    smd.MaxLOD = D3D11_FLOAT32_MAX;
-    ID3D11Device_CreateSamplerState(s_dev, &smd, &s_blit_smp);
-    memset(&bd, 0, sizeof bd);
-    bd.ByteWidth = 16;
-    bd.Usage = D3D11_USAGE_DYNAMIC;
-    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_blit_cb);
-    if (!s_blit_vs || !s_blit_ps || !s_blit_smp || !s_blit_cb)
+    if (!blit_init())
         return 0;
     fprintf(stderr, "  [PBGPU] presenting through a D3D11 swap chain\n");
     {
@@ -2363,10 +2521,11 @@ int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height)
         uv[0] = sw / (float)s->w;
         uv[1] = sh / (float)s->h;
         uv[2] = uv[3] = 0;
-        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
-                                              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-            memcpy(m.pData, uv, sizeof uv);
-            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_blit_cb, 0);
+        {
+            /* Averaged over each window pixel when the scaled frame is
+             * bigger than the window. */
+            float over = (sw * s->sx) / vp.Width;
+            blit_consts(uv, uv[0] / vp.Width, uv[1] / vp.Height, over > 1.25f ? 4.0f : 1.0f, 0);
         }
         ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
         ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
@@ -2427,7 +2586,7 @@ void pbgpu_readback_async(uint32_t addr)
     s = surface_find(addr);
     if (s && s->drawn && s->staging) {
         ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s->staging,
-                                         (ID3D11Resource *)s->tex);
+                                         (ID3D11Resource *)surf_logical(s));
         s->drawn = 0;
         pending = s;
     }
