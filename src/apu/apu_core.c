@@ -475,6 +475,8 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * Throttle (timing control for frame pacing)
  * ============================================================ */
 
+static int64_t g_prof_sleep, g_prof_relock, g_prof_waits;
+
 static void throttle(MCPXAPUState *d)
 {
     if (d->ep_frame_div % 8) {
@@ -483,19 +485,68 @@ static void throttle(MCPXAPUState *d)
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
+#if defined(_WIN32)
+    /* The wait below is in whole milliseconds, and at Windows' default
+     * 15.6 ms timer tick a 5 ms wait sleeps for 15. Ask for 1 ms ticks while
+     * the APU runs. */
+    {
+        static int raised;
+        if (!raised) {
+            raised = 1;
+            timeBeginPeriod(1);
+        }
+    }
+#endif
+
+    /* Resync only when far behind (a stall, a debugger). Resyncing whenever
+     * one period late threw away every oversleep, so the voice processor ran
+     * at half real time or less: Spartan's streamed audio -- and the XMV
+     * movie player timed off it -- crawled. Short lateness is caught up. */
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+        now_us - d->next_frame_time_us > EP_FRAME_US * 20) {
         d->next_frame_time_us = now_us;
     }
 
     while (!d->pause_requested) {
         now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-        int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
-        if (remaining_ms > 0) {
-            qemu_cond_timedwait(&d->cond, &d->lock, (int)remaining_ms);
-        } else {
+        int64_t remaining_us = d->next_frame_time_us - now_us;
+        if (remaining_us <= 0)
             break;
+#if defined(_WIN32)
+        {
+            /* A condition-variable wait only has timer-tick granularity, and
+             * Windows 11 ignores timeBeginPeriod for a process with no
+             * visible window, so every 5.3 ms wait took a 15.6 ms tick and
+             * the voice processor ran at 40% of real time. A high-resolution
+             * waitable timer is honoured regardless. The lock is dropped
+             * across the wait as the condition wait did; a pause request
+             * made meanwhile is seen on the next pass of this loop. */
+            static HANDLE timer;
+            LARGE_INTEGER due;
+            if (!timer)
+                timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */,
+                                               TIMER_ALL_ACCESS);
+            if (timer) {
+                due.QuadPart = -remaining_us * 10;        /* relative, 100 ns */
+                SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
+                qemu_mutex_unlock(&d->lock);
+                {
+                    int64_t a = qemu_clock_get_us(QEMU_CLOCK_REALTIME), b;
+                    WaitForSingleObject(timer, INFINITE);
+                    b = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+                    qemu_mutex_lock(&d->lock);
+                    g_prof_sleep += b - a;
+                    g_prof_relock += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - b;
+                    g_prof_waits++;
+                }
+                continue;
+            }
         }
+#endif
+        if (remaining_us >= 1000)
+            qemu_cond_timedwait(&d->cond, &d->lock, (int)(remaining_us / 1000));
+        else
+            break;
     }
     d->next_frame_time_us += EP_FRAME_US;
 
@@ -541,6 +592,9 @@ static void se_frame(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
+/* RECOMP_APU_VP_TRACE timing, per 1500 frames. */
+static int64_t g_prof_throttle, g_prof_irq, g_prof_yield;
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
@@ -555,10 +609,46 @@ static void *mcpx_apu_frame_thread(void *arg)
             continue;
         }
 
+        /* A brief "off" is not idle time.
+         *
+         * DirectSound turns the sample counter off and on again around its
+         * own register updates (SECTL 0x0F -> 0x07 -> 0x0F). On hardware the
+         * window is microseconds; here every APU access inside it is a
+         * trapped fault, so it stretched to two thirds of wall time, and each
+         * frame that saw it "off" was spent as an idle frame: the voice
+         * processor ran at a third of real time, streamed audio crawled, and
+         * the XMV movie player -- paced by its audio packets -- never showed
+         * a frame. So once the APU has run, an off window shorter than
+         * APU_OFF_GRACE_US is waited out rather than spent; only a longer one
+         * falls through to idle frames, which keep the output fed. */
+        {
+            enum { APU_OFF_GRACE_US = 20000 };
+            static int ran;
+            static int64_t off_since;
+            int on = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                              NV_PAPU_SECTL_XCNTMODE) != NV_PAPU_SECTL_XCNTMODE_OFF;
+            int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            if (on) {
+                ran = 1;
+                off_since = 0;
+            } else if (ran) {
+                if (!off_since)
+                    off_since = now;
+                if (now - off_since < APU_OFF_GRACE_US) {
+                    qemu_mutex_unlock(&d->lock);
+                    SwitchToThread();
+                    qemu_mutex_lock(&d->lock);
+                    continue;
+                }
+            }
+        }
+
         /* Always run the audio output loop — the software mixer and test tone
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
+        int64_t tt0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         throttle(d);
+        g_prof_throttle += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - tt0;
 
         /* The doorbell ack stands in for the GP DSP, which on hardware runs
          * whatever the front end is doing. Tying it to se_frame stopped it
@@ -569,6 +659,13 @@ static void *mcpx_apu_frame_thread(void *arg)
 
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
+        if (getenv("RECOMP_APU_VP_TRACE")) {
+            static uint32_t prev = 0xFFFFFFFFu; static unsigned shown;
+            uint32_t cur = qatomic_read(&d->regs[NV_PAPU_SECTL]);
+            if (cur != prev && shown++ < 40)
+                fprintf(stderr, "  [APUVP] SECTL %08X -> %08X (xcnt %d)\n", prev, cur, xcntmode);
+            prev = cur;
+        }
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
@@ -576,9 +673,37 @@ static void *mcpx_apu_frame_thread(void *arg)
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
+            int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
             se_frame(d);
+            if (getenv("RECOMP_APU_VP_TRACE")) {
+                static int64_t busy, wall0; static unsigned n;
+                int64_t t1 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+                busy += t1 - t0;
+                if (!wall0) wall0 = t1;
+                if (++n % 1500 == 0) {
+                    fprintf(stderr, "  [APUVP] 1500 frames: se_frame %lld us busy, %lld us wall,"
+                            " throttle %lld (sleep %lld relock %lld waits %lld), irq %lld, yield %lld\n",
+                            (long long)busy, (long long)(t1 - wall0),
+                            (long long)g_prof_throttle, (long long)g_prof_sleep,
+                            (long long)g_prof_relock, (long long)g_prof_waits,
+                            (long long)g_prof_irq,
+                            (long long)g_prof_yield);
+                    busy = 0; wall0 = t1;
+                    g_prof_throttle = g_prof_irq = g_prof_yield = 0;
+                    g_prof_sleep = g_prof_relock = g_prof_waits = 0;
+                }
+            }
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
+            if (getenv("RECOMP_APU_VP_TRACE")) {
+                static unsigned off, trap, halt, n;
+                if (xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF) off++;
+                if (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) trap++;
+                if (fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED) halt++;
+                if (++n % 3000 == 0)
+                    fprintf(stderr, "  [APUVP] skipped frames %u: xcnt off %u, trapped %u,"
+                            " halted %u (fectl %08X)\n", n, off, trap, halt, fectl);
+            }
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
@@ -591,7 +716,11 @@ static void *mcpx_apu_frame_thread(void *arg)
             update_irq(d);
             d->set_irq = false;
         }
-        apu_deliver_irq(d);
+        {
+            int64_t ti0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            apu_deliver_irq(d);
+            g_prof_irq += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - ti0;
+        }
 
         /* Let the guest in once per frame.
          *
@@ -603,9 +732,13 @@ static void *mcpx_apu_frame_thread(void *arg)
          * thread starved there indefinitely: Burnout 3 froze on its vehicle
          * select, blocked in voice_lock at raised IRQL, which in turn held
          * off every USB interrupt. */
-        qemu_mutex_unlock(&d->lock);
-        SwitchToThread();
-        qemu_mutex_lock(&d->lock);
+        {
+            int64_t ty0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            qemu_mutex_unlock(&d->lock);
+            SwitchToThread();
+            qemu_mutex_lock(&d->lock);
+            g_prof_yield += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - ty0;
+        }
     }
 
     qemu_mutex_unlock(&d->lock);

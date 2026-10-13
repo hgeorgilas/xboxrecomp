@@ -46,6 +46,17 @@ static const struct {
  * Notify status helper
  * ============================================================ */
 
+/* RECOMP_APU_VP_TRACE: notifier writes, and once a second the number of
+ * active voices per list -- whether a stream voice is being processed and
+ * whether its segments ever complete. */
+static int vp_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_APU_VP_TRACE") != NULL;
+    return on;
+}
+
 static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
                               int status)
 {
@@ -56,6 +67,13 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 
     stb_phys(address_space_memory, notify_offset, (uint8_t)status);
     stb_phys(address_space_memory, notify_offset - 1, 1);
+    if (vp_trace()) {
+        static unsigned n;
+        if (n++ < 40)
+            fprintf(stderr, "  [APUVP] notify voice %u notifier %d status %d"
+                    " at phys 0x%08llX\n", v, notifier, status,
+                    (unsigned long long)notify_offset);
+    }
 
     qatomic_or(&d->regs[NV_PAPU_ISTS],
                NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
@@ -1178,6 +1196,8 @@ static void voice_process(MCPXAPUState *d,
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    unsigned active[3] = { 0, 0, 0 };
+    static unsigned frames;
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {
@@ -1204,10 +1224,16 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                if (vp_trace())
+                    active[list]++;
             }
             d->regs[current] = d->regs[next];
         }
     }
+
+    if (vp_trace() && frames++ % 1500 == 0)       /* 1500 x 32 samples = 1 s */
+        fprintf(stderr, "  [APUVP] frame %u: active voices 2D %u 3D %u MP %u\n",
+                frames, active[0], active[1], active[2]);
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
