@@ -1,0 +1,1222 @@
+/**
+ * D3D11 back end for the pushbuffer executor. See nv2a_pb_gpu.h.
+ *
+ * Everything here mirrors a rule the software rasteriser in nv2a_pb_exec.c
+ * already gets right; where the two could differ, the comment names the
+ * function in that file this follows.
+ */
+#include "nv2a_pb_gpu.h"
+
+#if defined(_WIN32)
+
+#define COBJMACROS
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <d3d11.h>
+#include <d3dcompiler.h>
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+extern ptrdiff_t xbox_GetMemoryOffset(void);
+
+static ID3D11Device        *s_dev;
+static ID3D11DeviceContext *s_ctx;
+static CRITICAL_SECTION     s_lock;
+static pD3DCompile          s_compile;
+static uint32_t             s_flip;        /* flips seen, for ageing */
+
+/* ---- small helpers ----------------------------------------------------- */
+
+/* Guest addresses arrive through the contiguous (0x80000000) or tiled
+ * (0xF0000000) mirrors as well as directly; key everything on physical. */
+static uint32_t phys(uint32_t a) { return a & 0x0FFFFFFFu; }
+
+static uint8_t *guest(uint32_t a)
+{
+    return (uint8_t *)xbox_GetMemoryOffset() + a;
+}
+
+static uint64_t fnv64(const void *p, size_t n, uint64_t h)
+{
+    const uint32_t *w = (const uint32_t *)p;
+    size_t i, nw = n / 4;
+    for (i = 0; i < nw; i++)
+        h = (h ^ w[i]) * 1099511628211ull;
+    return h;
+}
+
+static ID3DBlob *compile(const char *src, const char *target)
+{
+    ID3DBlob *code = NULL, *err = NULL;
+    HRESULT hr;
+    if (!s_compile)
+        return NULL;
+    hr = s_compile(src, strlen(src), NULL, NULL, NULL, "main", target,
+                   D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    if (FAILED(hr)) {
+        fprintf(stderr, "  [PBGPU] shader compile failed: %s\n%s\n",
+                err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?", src);
+        fflush(stderr);
+        if (err) ID3D10Blob_Release(err);
+        return NULL;
+    }
+    if (err) ID3D10Blob_Release(err);
+    return code;
+}
+
+/* ---- fixed pipeline objects -------------------------------------------- */
+
+static ID3D11VertexShader *s_vs;
+static ID3D11InputLayout  *s_layout;
+static ID3D11Buffer       *s_vb, *s_vs_cb, *s_ps_cb;
+static uint32_t            s_vb_pos;
+static ID3D11RasterizerState *s_rs;
+static ID3D11Texture2D       *s_white_tex;
+static ID3D11ShaderResourceView *s_white;
+static ID3D11PixelShader  *s_clear_ps;
+static ID3D11VertexShader *s_clear_vs;
+
+#define VB_BYTES (16u << 20)
+
+/* Back to clip space: the executor's vertices are already divided by w and
+ * viewport-mapped (the XDK epilogue: c[58] scale, c[59] offset), so undo the
+ * divide with w and map the surface's pixel grid onto NDC. Pixel centres sit
+ * at +0.5 in both conventions (xf_rows samples px + 0.5). */
+static const char k_vs[] =
+"cbuffer V : register(b0) { float4 vp; };\n"
+"struct VI { float4 p:POSITION; float4 d0:COLOR0; float4 d1:COLOR1;\n"
+"  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2;\n"
+"  float4 t3:TEXCOORD3; float f:TEXCOORD4; };\n"
+"struct VO { float4 p:SV_Position; float4 d0:COLOR0; float4 d1:COLOR1;\n"
+"  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2;\n"
+"  float4 t3:TEXCOORD3; float f:TEXCOORD4; };\n"
+"VO main(VI i) {\n"
+"  VO o; float w = i.p.w;\n"
+"  float x = i.p.x * vp.x - 1.0, y = 1.0 - i.p.y * vp.y, z = i.p.z * vp.z;\n"
+"  o.p = float4(x * w, y * w, z * w, w);\n"
+"  o.d0 = i.d0; o.d1 = i.d1; o.t0 = i.t0; o.t1 = i.t1; o.t2 = i.t2;\n"
+"  o.t3 = i.t3; o.f = i.f; return o; }\n";
+
+static const char k_clear_vs[] =
+"float4 main(uint id : SV_VertexID) : SV_Position {\n"
+"  float2 p = float2((id & 1) ? 1.0 : -1.0, (id & 2) ? -1.0 : 1.0);\n"
+"  return float4(p, 0, 1); }\n";
+static const char k_clear_ps[] =
+"cbuffer P : register(b0) { float4 c; };\n"
+"float4 main() : SV_Target { return c; }\n";
+
+typedef struct {
+    float fac0[8][4], fac1[8][4];
+    float fc0[4], fc1[4], fogc[4];
+    float texsize[4][4];          /* 1/w, 1/h for texel-coordinate stages */
+    float misc[4];                /* x: alpha reference 0..255 */
+} PsConsts;
+
+static int init_device(void)
+{
+    static const D3D_FEATURE_LEVEL fl[] = { D3D_FEATURE_LEVEL_11_0 };
+    HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
+    D3D11_INPUT_ELEMENT_DESC ie[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,   D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR",    1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 48,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 64,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 80,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 96,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 4, DXGI_FORMAT_R32_FLOAT,          0, 112, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    ID3DBlob *b;
+    D3D11_BUFFER_DESC bd;
+    D3D11_RASTERIZER_DESC rd;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA sd;
+    uint32_t white = 0xFFFFFFFFu;
+    HRESULT hr;
+
+    if (dc)
+        s_compile = (pD3DCompile)GetProcAddress(dc, "D3DCompile");
+    if (!s_compile) {
+        fprintf(stderr, "  [PBGPU] d3dcompiler_47.dll not available\n");
+        return 0;
+    }
+    hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, fl, 1,
+                           D3D11_SDK_VERSION, &s_dev, NULL, &s_ctx);
+    if (FAILED(hr)) {
+        fprintf(stderr, "  [PBGPU] D3D11CreateDevice failed 0x%08lX\n", hr);
+        return 0;
+    }
+
+    if (!(b = compile(k_vs, "vs_5_0")))
+        return 0;
+    ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                    ID3D10Blob_GetBufferSize(b), NULL, &s_vs);
+    ID3D11Device_CreateInputLayout(s_dev, ie, 8, ID3D10Blob_GetBufferPointer(b),
+                                   ID3D10Blob_GetBufferSize(b), &s_layout);
+    ID3D10Blob_Release(b);
+    if (!(b = compile(k_clear_vs, "vs_5_0")))
+        return 0;
+    ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                    ID3D10Blob_GetBufferSize(b), NULL, &s_clear_vs);
+    ID3D10Blob_Release(b);
+    if (!(b = compile(k_clear_ps, "ps_5_0")))
+        return 0;
+    ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                   ID3D10Blob_GetBufferSize(b), NULL, &s_clear_ps);
+    ID3D10Blob_Release(b);
+
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = VB_BYTES;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_vb);
+    bd.ByteWidth = 16;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_vs_cb);
+    bd.ByteWidth = (sizeof(PsConsts) + 15) & ~15u;
+    ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_ps_cb);
+
+    /* No culling: the software rasteriser draws both windings (raster_triangle
+     * and xf_rows accept either sign). No depth clip: the NV2A clamps. */
+    memset(&rd, 0, sizeof rd);
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = FALSE;
+    rd.ScissorEnable = TRUE;
+    ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs);
+
+    /* An unusable stage reads white (rc_texel). */
+    memset(&td, 0, sizeof td);
+    td.Width = td.Height = 1;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    sd.pSysMem = &white; sd.SysMemPitch = 4; sd.SysMemSlicePitch = 4;
+    ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &s_white_tex);
+    ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_white_tex,
+                                          NULL, &s_white);
+    fprintf(stderr, "  [PBGPU] D3D11 back end up\n");
+    fflush(stderr);
+    return 1;
+}
+
+int pbgpu_enabled(void)
+{
+    static int state = -1;
+    if (state < 0) {
+        state = 0;
+        if (getenv("RECOMP_PB_GPU")) {
+            InitializeCriticalSection(&s_lock);
+            state = init_device();
+        }
+    }
+    return state;
+}
+
+/* ---- colour and depth surfaces ----------------------------------------- */
+
+typedef struct {
+    uint32_t key, addr, pitch, bpp, w, h;
+    ID3D11Texture2D *tex, *staging;
+    ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;
+    uint32_t drawn_flip;           /* last flip it was drawn in */
+    int drawn;                     /* drawn since the last readback */
+} Surface;
+
+typedef struct {
+    uint32_t key, w, h;
+    ID3D11Texture2D *tex;
+    ID3D11DepthStencilView *dsv;
+} Zeta;
+
+#define MAX_SURF 32
+#define MAX_ZETA 8
+static Surface s_surf[MAX_SURF];
+static Zeta    s_zeta[MAX_ZETA];
+static int     s_surf_next, s_zeta_next;
+
+static void surf_release(Surface *s)
+{
+    if (s->srv) ID3D11ShaderResourceView_Release(s->srv);
+    if (s->rtv) ID3D11RenderTargetView_Release(s->rtv);
+    if (s->tex) ID3D11Texture2D_Release(s->tex);
+    if (s->staging) ID3D11Texture2D_Release(s->staging);
+    memset(s, 0, sizeof *s);
+}
+
+/* Guest pixels (32 or 16 bpp) to B8G8R8A8 rows, and back. */
+static void to_bgra(const uint8_t *src, uint32_t bpp, uint32_t w, uint32_t *dst)
+{
+    uint32_t x;
+    if (bpp == 4) {
+        memcpy(dst, src, (size_t)w * 4);
+        return;
+    }
+    for (x = 0; x < w; x++) {
+        uint32_t t = ((const uint16_t *)src)[x];
+        dst[x] = 0xFF000000u | ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
+               | ((t & 0x001Fu) << 3);
+    }
+}
+
+static void from_bgra(const uint32_t *src, uint32_t bpp, uint32_t w, uint8_t *dst)
+{
+    uint32_t x;
+    if (bpp == 4) {
+        memcpy(dst, src, (size_t)w * 4);
+        return;
+    }
+    for (x = 0; x < w; x++) {
+        uint32_t c = src[x];
+        ((uint16_t *)dst)[x] = (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0)
+                                        | ((c >> 3) & 0x001F));
+    }
+}
+
+static Surface *surface_get(uint32_t addr, uint32_t pitch, uint32_t bpp, uint32_t need_h)
+{
+    uint32_t key = phys(addr), w = bpp ? pitch / bpp : 0, h, y;
+    D3D11_TEXTURE2D_DESC td;
+    Surface *s = NULL;
+    uint32_t *row;
+    int i;
+
+    if (!w || !need_h)
+        return NULL;
+    for (i = 0; i < MAX_SURF; i++)
+        if (s_surf[i].tex && s_surf[i].key == key) {
+            s = &s_surf[i];
+            if (s->pitch == pitch && s->bpp == bpp && s->h >= need_h)
+                return s;
+            surf_release(s);       /* reshaped: start again from guest memory */
+            break;
+        }
+    if (!s) {
+        for (i = 0; i < MAX_SURF && s_surf[i].tex; i++)
+            ;
+        if (i == MAX_SURF) {
+            i = s_surf_next++ % MAX_SURF;
+            surf_release(&s_surf[i]);
+        }
+        s = &s_surf[i];
+    }
+    h = need_h < 480 ? 480 : need_h;
+    memset(&td, 0, sizeof td);
+    td.Width = w; td.Height = h;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s->tex)))
+        return NULL;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s->staging);
+    ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s->tex, NULL, &s->rtv);
+    ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s->tex, NULL, &s->srv);
+    s->key = key; s->addr = addr; s->pitch = pitch; s->bpp = bpp;
+    s->w = w; s->h = h;
+
+    /* Start from what is in guest memory: a title may have written the
+     * surface with the CPU, and a first draw that only covers part of it
+     * must not leave the rest black. */
+    row = (uint32_t *)malloc((size_t)w * h * 4);
+    if (row) {
+        for (y = 0; y < h; y++)
+            to_bgra(guest(addr) + (size_t)y * pitch, bpp, w, row + (size_t)y * w);
+        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s->tex, 0,
+                                              NULL, row, w * 4, 0);
+        free(row);
+    }
+    return s;
+}
+
+static Surface *surface_find(uint32_t addr)
+{
+    uint32_t key = phys(addr);
+    int i;
+    for (i = 0; i < MAX_SURF; i++)
+        if (s_surf[i].tex && s_surf[i].key == key)
+            return &s_surf[i];
+    return NULL;
+}
+
+static Zeta *zeta_get(uint32_t addr, uint32_t w, uint32_t h)
+{
+    uint32_t key = phys(addr);
+    D3D11_TEXTURE2D_DESC td;
+    Zeta *z = NULL;
+    int i;
+
+    for (i = 0; i < MAX_ZETA; i++)
+        if (s_zeta[i].tex && s_zeta[i].key == key) {
+            z = &s_zeta[i];
+            if (z->w == w && z->h == h)
+                return z;
+            ID3D11DepthStencilView_Release(z->dsv);
+            ID3D11Texture2D_Release(z->tex);
+            memset(z, 0, sizeof *z);
+            break;
+        }
+    if (!z) {
+        for (i = 0; i < MAX_ZETA && s_zeta[i].tex; i++)
+            ;
+        if (i == MAX_ZETA) {
+            i = s_zeta_next++ % MAX_ZETA;
+            ID3D11DepthStencilView_Release(s_zeta[i].dsv);
+            ID3D11Texture2D_Release(s_zeta[i].tex);
+            memset(&s_zeta[i], 0, sizeof s_zeta[i]);
+        }
+        z = &s_zeta[i];
+    }
+    memset(&td, 0, sizeof td);
+    td.Width = w; td.Height = h;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &z->tex)))
+        return NULL;
+    ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)z->tex, NULL, &z->dsv);
+    /* The software depth buffer starts at "infinitely far" (zbuf_current). */
+    ID3D11DeviceContext_ClearDepthStencilView(s_ctx, z->dsv,
+        D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+    z->key = key; z->w = w; z->h = h;
+    return z;
+}
+
+/* ---- textures ----------------------------------------------------------- */
+
+typedef struct {
+    uint32_t addr, color, w, h, pitch, palette, cube, bytes;
+    uint64_t hash;
+    uint32_t checked_flip, used_flip;
+    ID3D11Texture2D *tex;
+    ID3D11ShaderResourceView *srv;
+} TexEntry;
+
+#define MAX_TEX 512
+static TexEntry s_tex[MAX_TEX];
+
+static uint64_t tex_hash(const PbGpuTexture *t)
+{
+    uint64_t h = 14695981039346656037ull;
+    if (t->bytes && t->bytes < (64u << 20))
+        h = fnv64(guest(t->addr), t->bytes, h);
+    if (t->palette)
+        h = fnv64(guest(t->palette), 1024, h);
+    return h;
+}
+
+static int tex_upload(TexEntry *e, const PbGpuTexture *t)
+{
+    uint32_t faces = t->cube ? 6 : 1, f, u, v, w = t->width, h = t->height;
+    uint32_t *px = (uint32_t *)malloc((size_t)w * h * faces * 4);
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA sd[6];
+
+    if (!px)
+        return 0;
+    for (f = 0; f < faces; f++)
+        for (v = 0; v < h; v++)
+            for (u = 0; u < w; u++) {
+                uint32_t c;
+                if (!t->fetch(t->src, f * t->face_stride, u, v, &c))
+                    c = 0xFFFFFFFFu;
+                if (t->no_alpha)
+                    c |= 0xFF000000u;
+                px[((size_t)f * h + v) * w + u] = c;
+            }
+    if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
+    if (e->tex) ID3D11Texture2D_Release(e->tex);
+    e->srv = NULL; e->tex = NULL;
+    memset(&td, 0, sizeof td);
+    td.Width = w; td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = faces;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    td.MiscFlags = t->cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
+    for (f = 0; f < faces; f++) {
+        sd[f].pSysMem = px + (size_t)f * w * h;
+        sd[f].SysMemPitch = w * 4;
+        sd[f].SysMemSlicePitch = w * h * 4;
+    }
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, sd, &e->tex)))
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex,
+                                              NULL, &e->srv);
+    free(px);
+    return e->srv != NULL;
+}
+
+/* A copy of the surface being drawn into, for a pass that samples its own
+ * target: D3D cannot read and write one resource in the same draw. */
+static ID3D11Texture2D          *s_copy;
+static ID3D11ShaderResourceView *s_copy_srv;
+
+static ID3D11ShaderResourceView *self_copy(const Surface *rt)
+{
+    D3D11_TEXTURE2D_DESC want, have;
+    ID3D11Texture2D_GetDesc(rt->tex, &want);
+    want.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (s_copy) {
+        ID3D11Texture2D_GetDesc(s_copy, &have);
+        if (have.Width != want.Width || have.Height != want.Height) {
+            ID3D11ShaderResourceView_Release(s_copy_srv);
+            ID3D11Texture2D_Release(s_copy);
+            s_copy = NULL; s_copy_srv = NULL;
+        }
+    }
+    if (!s_copy) {
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &want, NULL, &s_copy)))
+            return s_white;
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_copy,
+                                              NULL, &s_copy_srv);
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_copy,
+                                     (ID3D11Resource *)rt->tex);
+    return s_copy_srv ? s_copy_srv : s_white;
+}
+
+static ID3D11ShaderResourceView *tex_get(const PbGpuTexture *t, Surface *target)
+{
+    TexEntry *e = NULL, *oldest = NULL;
+    Surface *rt;
+    int i;
+
+    if (!t->valid || !t->width || !t->height || t->width > 4096 || t->height > 4096)
+        return s_white;
+
+    /* A surface drawn in the last few frames is read on the GPU: that is a
+     * render-to-texture pass (glow, blur, composite), and its guest memory is
+     * only written back at flips. Older aliases are stale -- the memory has
+     * likely been reused for an ordinary texture. */
+    rt = !t->cube ? surface_find(t->addr) : NULL;
+    if (rt && rt->drawn_flip + 4 >= s_flip)
+        return rt != target ? rt->srv : self_copy(rt);
+
+    for (i = 0; i < MAX_TEX; i++) {
+        TexEntry *c = &s_tex[i];
+        if (c->srv && c->addr == t->addr && c->color == t->color && c->w == t->width
+            && c->h == t->height && c->pitch == t->pitch && c->palette == t->palette
+            && c->cube == (uint32_t)t->cube) {
+            e = c;
+            break;
+        }
+        if (!oldest || c->used_flip < oldest->used_flip || !c->srv)
+            if (!oldest || oldest->srv)
+                oldest = c;
+    }
+    if (e) {
+        if (e->checked_flip != s_flip) {
+            uint64_t h = tex_hash(t);
+            e->checked_flip = s_flip;
+            if (h != e->hash) {
+                e->hash = h;
+                tex_upload(e, t);
+            }
+        }
+    } else {
+        e = oldest;
+        if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
+        if (e->tex) ID3D11Texture2D_Release(e->tex);
+        memset(e, 0, sizeof *e);
+        e->addr = t->addr; e->color = t->color; e->w = t->width; e->h = t->height;
+        e->pitch = t->pitch; e->palette = t->palette; e->cube = (uint32_t)t->cube;
+        e->bytes = t->bytes;
+        e->hash = tex_hash(t);
+        e->checked_flip = s_flip;
+        if (!tex_upload(e, t)) {
+            memset(e, 0, sizeof *e);
+            return s_white;
+        }
+    }
+    e->used_flip = s_flip;
+    return e->srv ? e->srv : s_white;
+}
+
+/* ---- pipeline state caches ---------------------------------------------- */
+
+static D3D11_BLEND blend_map(uint32_t f, int alpha)
+{
+    switch (f) {
+    case 0x0000: return D3D11_BLEND_ZERO;
+    case 0x0001: return D3D11_BLEND_ONE;
+    case 0x0300: return alpha ? D3D11_BLEND_SRC_ALPHA : D3D11_BLEND_SRC_COLOR;
+    case 0x0301: return alpha ? D3D11_BLEND_INV_SRC_ALPHA : D3D11_BLEND_INV_SRC_COLOR;
+    case 0x0302: return D3D11_BLEND_SRC_ALPHA;
+    case 0x0303: return D3D11_BLEND_INV_SRC_ALPHA;
+    case 0x0304: return D3D11_BLEND_DEST_ALPHA;
+    case 0x0305: return D3D11_BLEND_INV_DEST_ALPHA;
+    case 0x0306: return alpha ? D3D11_BLEND_DEST_ALPHA : D3D11_BLEND_DEST_COLOR;
+    case 0x0307: return alpha ? D3D11_BLEND_INV_DEST_ALPHA : D3D11_BLEND_INV_DEST_COLOR;
+    case 0x0308: return alpha ? D3D11_BLEND_ONE : D3D11_BLEND_SRC_ALPHA_SAT;
+    case 0x8001: case 0x8003: return D3D11_BLEND_BLEND_FACTOR;
+    case 0x8002: case 0x8004: return D3D11_BLEND_INV_BLEND_FACTOR;
+    default:     return f ? D3D11_BLEND_ONE : D3D11_BLEND_ZERO;
+    }
+}
+
+static D3D11_BLEND_OP blend_op(uint32_t eq)
+{
+    switch (eq) {
+    case 0x800A: return D3D11_BLEND_OP_SUBTRACT;
+    case 0x800B: return D3D11_BLEND_OP_REV_SUBTRACT;
+    case 0x8007: return D3D11_BLEND_OP_MIN;
+    case 0x8008: return D3D11_BLEND_OP_MAX;
+    default:     return D3D11_BLEND_OP_ADD;
+    }
+}
+
+typedef struct { uint64_t key; void *obj; } Cached;
+#define MAX_STATE 256
+static Cached s_blend[MAX_STATE], s_depth[MAX_STATE], s_samp[MAX_STATE];
+
+static void *cache_find(Cached *c, uint64_t key)
+{
+    int i;
+    for (i = 0; i < MAX_STATE && c[i].obj; i++)
+        if (c[i].key == key)
+            return c[i].obj;
+    return NULL;
+}
+
+static void cache_put(Cached *c, uint64_t key, void *obj)
+{
+    int i;
+    for (i = 0; i < MAX_STATE && c[i].obj; i++)
+        ;
+    if (i < MAX_STATE) {
+        c[i].key = key;
+        c[i].obj = obj;
+    }
+}
+
+static ID3D11BlendState *blend_get(const PbGpuState *st, uint32_t color_mask)
+{
+    /* put_pixel: blending is on unless the pair is ONE, ZERO. */
+    int on = st->blend_enable && !(st->blend_sfactor == 1 && st->blend_dfactor == 0);
+    uint64_t key = ((uint64_t)on << 63) | ((uint64_t)(st->blend_sfactor & 0xFFFF) << 40)
+                 | ((uint64_t)(st->blend_dfactor & 0xFFFF) << 24)
+                 | ((uint64_t)(st->blend_equation & 0xFFFF) << 8)
+                 | ((color_mask & 0x01000000u) ? 8 : 0) | ((color_mask & 0x00010000u) ? 4 : 0)
+                 | ((color_mask & 0x00000100u) ? 2 : 0) | ((color_mask & 0x00000001u) ? 1 : 0);
+    ID3D11BlendState *b = (ID3D11BlendState *)cache_find(s_blend, key);
+    D3D11_BLEND_DESC bd;
+    D3D11_RENDER_TARGET_BLEND_DESC *t = &bd.RenderTarget[0];
+
+    if (b)
+        return b;
+    memset(&bd, 0, sizeof bd);
+    t->BlendEnable = on;
+    t->SrcBlend = blend_map(st->blend_sfactor, 0);
+    t->DestBlend = blend_map(st->blend_dfactor, 0);
+    t->SrcBlendAlpha = blend_map(st->blend_sfactor, 1);
+    t->DestBlendAlpha = blend_map(st->blend_dfactor, 1);
+    t->BlendOp = t->BlendOpAlpha = blend_op(st->blend_equation);
+    t->RenderTargetWriteMask = (UINT8)(((color_mask & 0x00010000u) ? D3D11_COLOR_WRITE_ENABLE_RED : 0)
+                            | ((color_mask & 0x00000100u) ? D3D11_COLOR_WRITE_ENABLE_GREEN : 0)
+                            | ((color_mask & 0x00000001u) ? D3D11_COLOR_WRITE_ENABLE_BLUE : 0)
+                            | ((color_mask & 0x01000000u) ? D3D11_COLOR_WRITE_ENABLE_ALPHA : 0));
+    if (FAILED(ID3D11Device_CreateBlendState(s_dev, &bd, &b)))
+        return NULL;
+    cache_put(s_blend, key, b);
+    return b;
+}
+
+static ID3D11DepthStencilState *depth_get(const PbGpuState *st, int have_z)
+{
+    uint64_t key = ((uint64_t)!!have_z << 40) | ((uint64_t)!!st->depth_test << 32)
+                 | ((uint64_t)!!st->depth_mask << 31) | (st->depth_func & 0xFFFF);
+    ID3D11DepthStencilState *d = (ID3D11DepthStencilState *)cache_find(s_depth, key);
+    D3D11_DEPTH_STENCIL_DESC dd;
+
+    if (d)
+        return d;
+    memset(&dd, 0, sizeof dd);
+    /* xf_rows: test when enabled, write whenever the mask allows -- even with
+     * the test off, which D3D expresses as a test that always passes. */
+    dd.DepthEnable = have_z && (st->depth_test || st->depth_mask);
+    dd.DepthWriteMask = st->depth_mask ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+    dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    if (st->depth_test && st->depth_func >= 0x200 && st->depth_func <= 0x207)
+        dd.DepthFunc = (D3D11_COMPARISON_FUNC)(st->depth_func - 0x200 + 1);
+    if (FAILED(ID3D11Device_CreateDepthStencilState(s_dev, &dd, &d)))
+        return NULL;
+    cache_put(s_depth, key, d);
+    return d;
+}
+
+static D3D11_TEXTURE_ADDRESS_MODE addr_map(uint32_t m)
+{
+    switch (m) {
+    case 2:  return D3D11_TEXTURE_ADDRESS_MIRROR;
+    case 3:  return D3D11_TEXTURE_ADDRESS_CLAMP;
+    case 4:  return D3D11_TEXTURE_ADDRESS_BORDER;
+    case 5:  return D3D11_TEXTURE_ADDRESS_CLAMP;
+    default: return D3D11_TEXTURE_ADDRESS_WRAP;
+    }
+}
+
+static ID3D11SamplerState *sampler_get(const PbGpuTexture *t)
+{
+    uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
+    /* rc_texel: bilinear when either direction asks for TENT. */
+    int lin = mag == 2 || min == 2 || min == 4 || min == 6;
+    uint64_t key = ((uint64_t)lin << 16) | ((t->addr_u & 0xFF) << 8) | (t->addr_v & 0xFF);
+    ID3D11SamplerState *s = (ID3D11SamplerState *)cache_find(s_samp, key);
+    D3D11_SAMPLER_DESC sd;
+
+    if (s)
+        return s;
+    memset(&sd, 0, sizeof sd);
+    sd.Filter = lin ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = addr_map(t->addr_u);
+    sd.AddressV = addr_map(t->addr_v);
+    sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    if (FAILED(ID3D11Device_CreateSamplerState(s_dev, &sd, &s)))
+        return NULL;
+    cache_put(s_samp, key, s);
+    return s;
+}
+
+/* ---- generated pixel shaders --------------------------------------------- */
+
+typedef struct {
+    Nv2aCombiner rc;           /* factors zeroed: they are constants, not code */
+    uint32_t use_rc, alpha_test, alpha_func, clip_plane_mode;
+    uint32_t stage_kind[4];    /* 0 none 1 2D 2 cube 3 rect-2D */
+    uint32_t no_alpha[4];
+} PsKey;
+
+typedef struct { PsKey key; ID3D11PixelShader *ps; } PsEntry;
+#define MAX_PS 1024
+static PsEntry s_ps[MAX_PS];
+static int s_nps;
+
+typedef struct { char *p; size_t n, cap; } Sb;
+
+static void sb(Sb *b, const char *fmt, ...)
+{
+    va_list ap;
+    int k;
+    if (b->n + 512 > b->cap) {
+        b->cap = b->cap ? b->cap * 2 : 16384;
+        b->p = (char *)realloc(b->p, b->cap);
+    }
+    va_start(ap, fmt);
+    k = vsnprintf(b->p + b->n, b->cap - b->n, fmt, ap);
+    va_end(ap);
+    if (k > 0)
+        b->n += (size_t)k;
+}
+
+/* map_in, as an HLSL expression over `x` (the raw value). */
+static void map_in(Sb *b, const char *x, uint32_t byte)
+{
+    switch ((byte >> 5) & 7) {
+    case 0:  sb(b, "max(%s,0)", x); break;
+    case 1:  sb(b, "(1-saturate(%s))", x); break;
+    case 2:  sb(b, "(2*max(%s,0)-1)", x); break;
+    case 3:  sb(b, "(-2*max(%s,0)+1)", x); break;
+    case 4:  sb(b, "(max(%s,0)-0.5)", x); break;
+    case 5:  sb(b, "(-max(%s,0)+0.5)", x); break;
+    case 6:  sb(b, "(%s)", x); break;
+    default: sb(b, "(-(%s))", x); break;
+    }
+}
+
+static void read_rgb(Sb *b, uint32_t byte)
+{
+    char x[32];
+    snprintf(x, sizeof x, (byte & 0x10) ? "R[%u].aaa" : "R[%u].rgb", byte & 0xF);
+    map_in(b, x, byte);
+}
+
+static void read_alpha(Sb *b, uint32_t byte)
+{
+    char x[32];
+    snprintf(x, sizeof x, (byte & 0x10) ? "R[%u].a" : "R[%u].b", byte & 0xF);
+    map_in(b, x, byte);
+}
+
+static const char *map_out(uint32_t m)
+{
+    switch (m) {
+    case 0x08: return "(%s-0.5)";
+    case 0x10: return "(%s*2)";
+    case 0x18: return "((%s-0.5)*2)";
+    case 0x20: return "(%s*4)";
+    case 0x30: return "(%s*0.5)";
+    default:   return "(%s)";
+    }
+}
+
+static void gen_ps(const PsKey *k, Sb *b)
+{
+    static const char *const cmp[8] = {
+        "false", "v<r", "v==r", "v<=r", "v>r", "v!=r", "v>=r", "true" };
+    uint32_t st, s, n = k->rc.control & 0xFF, flags = k->rc.control >> 8;
+
+    sb(b, "cbuffer P : register(b0) { float4 fac0[8]; float4 fac1[8];\n"
+          "  float4 fc0; float4 fc1; float4 fogc; float4 texsize[4]; float4 misc; };\n"
+          "struct VO { float4 p:SV_Position; float4 d0:COLOR0; float4 d1:COLOR1;\n"
+          "  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2;\n"
+          "  float4 t3:TEXCOORD3; float f:TEXCOORD4; };\n");
+    for (st = 0; st < 4; st++) {
+        sb(b, "%s tx%u : register(t%u); SamplerState sm%u : register(s%u);\n",
+           k->stage_kind[st] == 2 ? "TextureCube" : "Texture2D", st, st, st, st);
+    }
+    sb(b, "float4 main(VO i) : SV_Target {\n"
+          "  float4 R[16]; [unroll] for (int k = 0; k < 16; k++) R[k] = 0;\n"
+          "  float4 tc[4] = { i.t0, i.t1, i.t2, i.t3 };\n"
+          "  float4 o;\n");
+
+    if (!k->use_rc) {
+        /* xf_rows without combiners: diffuse, times texture 0 if bound. */
+        sb(b, "  o = i.d0;\n");
+        if (k->stage_kind[0]) {
+            sb(b, "  { float2 uv = tc[0].xy");
+            if (k->stage_kind[0] == 3) sb(b, " * texsize[0].xy");
+            sb(b, "; float4 t = tx0.Sample(sm0, uv);%s o *= t; }\n",
+               k->no_alpha[0] ? " t.a = 1;" : "");
+        }
+    } else {
+        sb(b, "  R[3] = float4(fogc.rgb, i.f);\n"
+              "  R[4] = i.d0; R[5] = i.d1;\n");
+        /* rc_stage_fetch, by SHADER_STAGE_PROGRAM mode. */
+        for (st = 0; st < 4; st++) {
+            uint32_t mode = (k->rc.stage_program >> (st * 5)) & 0x1F, j;
+            sb(b, "  { float4 c = tc[%u]; float q = c.w != 0 ? c.w : 1; float4 t;\n", st);
+            switch (mode) {
+            case 0:
+                sb(b, "    t = float4(0,0,0,1);\n");
+                break;
+            case 1: case 2:                    /* PROJECT2D / 3D */
+                sb(b, "    float2 uv = c.xy / q;\n");
+                if (k->stage_kind[st] == 3)    /* texel coordinates */
+                    sb(b, "    uv *= texsize[%u].xy;\n", st);
+                if (k->stage_kind[st] == 2)
+                    sb(b, "    t = tx%u.Sample(sm%u, float3(uv, 0));\n", st, st);
+                else
+                    sb(b, "    t = tx%u.Sample(sm%u, uv);\n", st, st);
+                break;
+            case 3:                            /* CUBEMAP */
+                if (k->stage_kind[st] == 2) {
+                    sb(b, "    t = tx%u.Sample(sm%u, c.xyz);\n", st, st);
+                } else {
+                    /* Not a cube: rc_stage_fetch reads it as 2D, unprojected. */
+                    sb(b, "    float2 uv = c.xy;\n");
+                    if (k->stage_kind[st] == 3)
+                        sb(b, "    uv *= texsize[%u].xy;\n", st);
+                    sb(b, "    t = tx%u.Sample(sm%u, uv);\n", st, st);
+                }
+                break;
+            case 4:
+                sb(b, "    t = saturate(c);\n");
+                break;
+            case 5:
+                for (j = 0; j < 4; j++) {
+                    int ge = (k->clip_plane_mode >> (st * 4 + j)) & 1;
+                    sb(b, "    if (c[%u] %s 0) discard;\n", j, ge ? ">=" : "<");
+                }
+                sb(b, "    t = 0;\n");
+                break;
+            default:
+                sb(b, "    t = 0;\n");
+                break;
+            }
+            if (k->no_alpha[st] && (mode == 1 || mode == 2 || mode == 3))
+                sb(b, "    t.a = 1;\n");
+            sb(b, "    R[%u] = t; }\n", 8 + st);
+        }
+        /* r0.a starts as texture 0's alpha, or 1 with stage 0 off. */
+        sb(b, "  R[12].a = %s;\n", (k->rc.stage_program & 0x1F) ? "R[8].a" : "1");
+
+        if (n > 8) n = 8;
+        for (s = 0; s < n; s++) {
+            uint32_t icw = k->rc.color_icw[s], ocw = k->rc.color_ocw[s];
+            uint32_t aicw = k->rc.alpha_icw[s], aocw = k->rc.alpha_ocw[s];
+            uint32_t fl = ocw >> 12, afl = aocw >> 12;
+            const char *mo = map_out(fl & 0x38), *amo = map_out(afl & 0x38);
+            char e[64];
+
+            sb(b, "  { R[1] = fac0[%u]; R[2] = fac1[%u];\n",
+               (flags & 0x010) ? s : 0, (flags & 0x100) ? s : 0);
+            if (flags & 1)
+                sb(b, "    bool mux = R[12].a >= 0.5;\n");
+            else
+                sb(b, "    bool mux = (((uint)(R[12].a * 255.0)) & 1) != 0;\n");
+            sb(b, "    float3 A = "); read_rgb(b, icw >> 24); sb(b, ";\n");
+            sb(b, "    float3 B = "); read_rgb(b, (icw >> 16) & 0xFF); sb(b, ";\n");
+            sb(b, "    float3 C = "); read_rgb(b, (icw >> 8) & 0xFF); sb(b, ";\n");
+            sb(b, "    float3 D = "); read_rgb(b, icw & 0xFF); sb(b, ";\n");
+            sb(b, "    float aA = "); read_alpha(b, aicw >> 24); sb(b, ";\n");
+            sb(b, "    float aB = "); read_alpha(b, (aicw >> 16) & 0xFF); sb(b, ";\n");
+            sb(b, "    float aC = "); read_alpha(b, (aicw >> 8) & 0xFF); sb(b, ";\n");
+            sb(b, "    float aD = "); read_alpha(b, aicw & 0xFF); sb(b, ";\n");
+            sb(b, "    float3 pab = %s;\n", (fl & 2) ? "dot(A,B).xxx" : "A*B");
+            sb(b, "    float3 pcd = %s;\n", (fl & 1) ? "dot(C,D).xxx" : "C*D");
+            sb(b, "    float3 sm = %s;\n", (fl & 4) ? "(mux ? pcd : pab)" : "pab + pcd");
+            snprintf(e, sizeof e, mo, "pab"); sb(b, "    float3 ab = clamp(%s,-1,1);\n", e);
+            snprintf(e, sizeof e, mo, "pcd"); sb(b, "    float3 cd = clamp(%s,-1,1);\n", e);
+            snprintf(e, sizeof e, mo, "sm");  sb(b, "    float3 ms = clamp(%s,-1,1);\n", e);
+            sb(b, "    float apab = aA*aB, apcd = aC*aD;\n");
+            sb(b, "    float asm_ = %s;\n", (afl & 4) ? "(mux ? apcd : apab)" : "apab + apcd");
+            snprintf(e, sizeof e, amo, "apab"); sb(b, "    float aab = clamp(%s,-1,1);\n", e);
+            snprintf(e, sizeof e, amo, "apcd"); sb(b, "    float acd = clamp(%s,-1,1);\n", e);
+            snprintf(e, sizeof e, amo, "asm_"); sb(b, "    float ams = clamp(%s,-1,1);\n", e);
+            if ((ocw >> 4) & 0xF) {
+                sb(b, "    R[%u].rgb = ab;\n", (ocw >> 4) & 0xF);
+                if (fl & 0x80) sb(b, "    R[%u].a = ab.b;\n", (ocw >> 4) & 0xF);
+            }
+            if (ocw & 0xF) {
+                sb(b, "    R[%u].rgb = cd;\n", ocw & 0xF);
+                if (fl & 0x40) sb(b, "    R[%u].a = cd.b;\n", ocw & 0xF);
+            }
+            if ((ocw >> 8) & 0xF)
+                sb(b, "    R[%u].rgb = ms;\n", (ocw >> 8) & 0xF);
+            if ((aocw >> 4) & 0xF) sb(b, "    R[%u].a = aab;\n", (aocw >> 4) & 0xF);
+            if (aocw & 0xF)        sb(b, "    R[%u].a = acd;\n", aocw & 0xF);
+            if ((aocw >> 8) & 0xF) sb(b, "    R[%u].a = ams;\n", (aocw >> 8) & 0xF);
+            sb(b, "    R[0] = 0; }\n");
+        }
+
+        if (k->rc.final0 || k->rc.final1) {
+            uint32_t f0 = k->rc.final0, f1 = k->rc.final1, ff = f1 & 0xFF;
+            sb(b, "  { R[1] = fc0; R[2] = fc1;\n");
+            sb(b, "    float3 sa = %s, sb_ = %s;\n",
+               (ff & 0x40) ? "1 - R[5].rgb" : "R[5].rgb",
+               (ff & 0x20) ? "1 - R[12].rgb" : "R[12].rgb");
+            sb(b, "    R[14] = float4(%s, 0);\n", (ff & 0x80) ? "saturate(sa + sb_)" : "sa + sb_");
+            sb(b, "    float3 E = "); read_rgb(b, f1 >> 24); sb(b, ";\n");
+            sb(b, "    float3 F = "); read_rgb(b, (f1 >> 16) & 0xFF); sb(b, ";\n");
+            sb(b, "    R[15] = float4(E * F, 0);\n");
+            sb(b, "    float3 A = "); read_rgb(b, f0 >> 24); sb(b, ";\n");
+            sb(b, "    float3 B = "); read_rgb(b, (f0 >> 16) & 0xFF); sb(b, ";\n");
+            sb(b, "    float3 C = "); read_rgb(b, (f0 >> 8) & 0xFF); sb(b, ";\n");
+            sb(b, "    float3 D = "); read_rgb(b, f0 & 0xFF); sb(b, ";\n");
+            sb(b, "    o.rgb = D + C * (1 - A) + B * A;\n");
+            sb(b, "    o.a = "); read_alpha(b, (f1 >> 8) & 0xFF); sb(b, "; }\n");
+        } else {
+            sb(b, "  o = R[12];\n");
+        }
+    }
+    sb(b, "  o = saturate(o);\n");
+    if (k->alpha_test) {
+        uint32_t f = k->alpha_func;
+        sb(b, "  { int v = (int)(o.a * 255.0 + 0.5), r = (int)misc.x;\n"
+              "    if (!(%s)) discard; }\n",
+           (f >= 0x200 && f <= 0x207) ? cmp[f - 0x200] : "true");
+    }
+    sb(b, "  return o; }\n");
+}
+
+static ID3D11PixelShader *ps_get(const PsKey *k)
+{
+    int i;
+    Sb b = { 0, 0, 0 };
+    ID3DBlob *code;
+    ID3D11PixelShader *ps = NULL;
+
+    for (i = 0; i < s_nps; i++)
+        if (!memcmp(&s_ps[i].key, k, sizeof *k))
+            return s_ps[i].ps;
+    gen_ps(k, &b);
+    code = compile(b.p, "ps_5_0");
+    if (getenv("RECOMP_PB_GPU_DUMP"))
+        fprintf(stderr, "  [PBGPU] pixel shader %d:\n%s\n", s_nps, b.p);
+    free(b.p);
+    if (code) {
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                       ID3D10Blob_GetBufferSize(code), NULL, &ps);
+        ID3D10Blob_Release(code);
+    }
+    if (s_nps < MAX_PS) {
+        s_ps[s_nps].key = *k;
+        s_ps[s_nps].ps = ps;
+        s_nps++;
+    }
+    return ps;
+}
+
+/* ---- drawing ------------------------------------------------------------ */
+
+static void unpack(uint32_t c, float o[4])
+{
+    o[0] = (float)((c >> 16) & 0xFF) / 255.0f;
+    o[1] = (float)((c >>  8) & 0xFF) / 255.0f;
+    o[2] = (float)( c        & 0xFF) / 255.0f;
+    o[3] = (float)( c >> 24        ) / 255.0f;
+}
+
+static void set_scissor(const PbGpuState *st, const Surface *s)
+{
+    D3D11_RECT r;
+    r.left = (LONG)st->clip_x;
+    r.top = (LONG)st->clip_y;
+    r.right = (LONG)(st->clip_x + st->clip_w);
+    r.bottom = (LONG)(st->clip_y + st->clip_h);
+    if (r.right > (LONG)s->w) r.right = (LONG)s->w;
+    if (r.bottom > (LONG)s->h) r.bottom = (LONG)s->h;
+    ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &r);
+}
+
+static Surface *bind_target(const PbGpuState *st, Zeta **zout)
+{
+    Surface *s;
+    Zeta *z = NULL;
+    D3D11_VIEWPORT vp;
+
+    if (!st->surf_addr || !st->surf_pitch || (st->surf_bpp != 4 && st->surf_bpp != 2))
+        return NULL;
+    s = surface_get(st->surf_addr, st->surf_pitch, st->surf_bpp,
+                    st->clip_y + st->clip_h);
+    if (!s)
+        return NULL;
+    if (st->zeta_addr)
+        z = zeta_get(st->zeta_addr, s->w, s->h);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s->rtv, z ? z->dsv : NULL);
+    vp.TopLeftX = vp.TopLeftY = 0;
+    vp.Width = (float)s->w;
+    vp.Height = (float)s->h;
+    vp.MinDepth = 0; vp.MaxDepth = 1;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    set_scissor(st, s);
+    s->drawn_flip = s_flip;
+    s->drawn = 1;
+    *zout = z;
+    return s;
+}
+
+void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
+{
+    Surface *s;
+    Zeta *z;
+    PsKey key;
+    PsConsts pc;
+    ID3D11ShaderResourceView *srv[4];
+    ID3D11SamplerState *smp[4];
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t bytes = count * sizeof(PbGpuVertex), st_i, zmax;
+    float vpc[4], bf[4];
+    UINT stride = sizeof(PbGpuVertex), off;
+    ID3D11PixelShader *ps;
+    ID3D11BlendState *bs;
+
+    if (!count || bytes > VB_BYTES || !pbgpu_enabled())
+        return;
+    EnterCriticalSection(&s_lock);
+    if (!(s = bind_target(st, &z)))
+        goto out;
+
+    /* Pixel shader key: the combiner program's shape, not its constants. */
+    memset(&key, 0, sizeof key);
+    key.rc = st->rc;
+    memset(key.rc.factor0, 0, sizeof key.rc.factor0);
+    memset(key.rc.factor1, 0, sizeof key.rc.factor1);
+    key.rc.final_c0 = key.rc.final_c1 = 0;
+    key.use_rc = (uint32_t)st->use_rc;
+    key.alpha_test = st->alpha_test ? 1 : 0;
+    key.alpha_func = st->alpha_test ? st->alpha_func : 0;
+    if (!st->use_rc)
+        memset(&key.rc, 0, sizeof key.rc);
+    key.clip_plane_mode = st->clip_plane_mode;
+
+    memset(&pc, 0, sizeof pc);
+    for (st_i = 0; st_i < 4; st_i++) {
+        const PbGpuTexture *t = &st->tex[st_i];
+        uint32_t mode = st->use_rc ? (st->rc.stage_program >> (st_i * 5)) & 0x1F
+                                   : (st_i == 0 && t->valid ? 1 : 0);
+        srv[st_i] = s_white;
+        smp[st_i] = NULL;
+        if (mode >= 1 && mode <= 3) {
+            key.stage_kind[st_i] = (mode == 3 && t->cube) ? 2
+                                 : (t->valid && !t->normalized) ? 3 : 1;
+            key.no_alpha[st_i] = (uint32_t)t->no_alpha;
+            srv[st_i] = tex_get(t, s);
+            smp[st_i] = sampler_get(t);
+            if (key.stage_kind[st_i] == 2 && srv[st_i] == s_white)
+                key.stage_kind[st_i] = 1;      /* no cube to bind */
+            if (t->width && t->height) {
+                pc.texsize[st_i][0] = 1.0f / (float)t->width;
+                pc.texsize[st_i][1] = 1.0f / (float)t->height;
+            }
+        }
+    }
+    if (!(ps = ps_get(&key)))
+        goto out;
+
+    for (st_i = 0; st_i < 8; st_i++) {
+        unpack(st->rc.factor0[st_i], pc.fac0[st_i]);
+        unpack(st->rc.factor1[st_i], pc.fac1[st_i]);
+    }
+    unpack(st->rc.final_c0, pc.fc0);
+    unpack(st->rc.final_c1, pc.fc1);
+    memcpy(pc.fogc, st->fog_color, sizeof pc.fogc);
+    pc.misc[0] = (float)(st->alpha_ref & 0xFF);
+
+    /* Vertices. */
+    if (s_vb_pos + bytes > VB_BYTES)
+        s_vb_pos = 0;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vb, 0,
+            s_vb_pos ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        goto out;
+    memcpy((uint8_t *)m.pData + s_vb_pos, v, bytes);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
+    off = s_vb_pos;
+    s_vb_pos += bytes;
+
+    zmax = st->zeta_format == 1 ? 0xFFFFu : 0xFFFFFFu;
+    vpc[0] = 2.0f / (float)s->w;
+    vpc[1] = 2.0f / (float)s->h;
+    vpc[2] = 1.0f / (float)zmax;
+    vpc[3] = 0;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vs_cb, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        memcpy(m.pData, vpc, sizeof vpc);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vs_cb, 0);
+    }
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_ps_cb, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        memcpy(m.pData, &pc, sizeof pc);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_ps_cb, 0);
+    }
+
+    bs = blend_get(st, st->color_mask);
+    {
+        /* CONSTANT_COLOR and CONSTANT_ALPHA share D3D's one blend factor. */
+        float c[4];
+        unpack(st->blend_color, c);
+        if (st->blend_sfactor == 0x8003 || st->blend_sfactor == 0x8004
+            || st->blend_dfactor == 0x8003 || st->blend_dfactor == 0x8004)
+            bf[0] = bf[1] = bf[2] = bf[3] = c[3];
+        else
+            memcpy(bf, c, sizeof bf);
+    }
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, depth_get(st, z != NULL), 0);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &off);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_vs_cb);
+    ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_ps_cb);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, smp);
+    ID3D11DeviceContext_Draw(s_ctx, count, 0);
+    {
+        ID3D11ShaderResourceView *none[4] = { 0, 0, 0, 0 };
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, none);
+    }
+out:
+    LeaveCriticalSection(&s_lock);
+}
+
+void pbgpu_clear(const PbGpuState *st, uint32_t flags, uint32_t color,
+                 float depth, uint32_t stencil)
+{
+    Surface *s;
+    Zeta *z;
+
+    if (!pbgpu_enabled())
+        return;
+    EnterCriticalSection(&s_lock);
+    if (!(s = bind_target(st, &z)))
+        goto out;
+    if ((flags & 0x03) && z) {
+        UINT f = ((flags & 1) ? D3D11_CLEAR_DEPTH : 0) | ((flags & 2) ? D3D11_CLEAR_STENCIL : 0);
+        ID3D11DeviceContext_ClearDepthStencilView(s_ctx, z->dsv, f, depth, (UINT8)stencil);
+    }
+    if (flags & 0xF0) {
+        /* A quad through the clip rectangle and the clear's own channel mask
+         * (clear_surface honours both). 16-bit surfaces store R5G6B5. */
+        PbGpuState cs = *st;
+        D3D11_MAPPED_SUBRESOURCE m;
+        float c[4];
+        if (st->surf_bpp == 2) {
+            uint32_t t = color & 0xFFFF;
+            color = 0xFF000000u | ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
+                  | ((t & 0x001Fu) << 3);
+        }
+        unpack(color, c);
+        cs.blend_enable = 0;
+        cs.blend_sfactor = 1; cs.blend_dfactor = 0;
+        cs.blend_equation = 0x8006;
+        cs.color_mask = ((flags & 0x80) ? 0x01000000u : 0) | ((flags & 0x10) ? 0x00010000u : 0)
+                      | ((flags & 0x20) ? 0x00000100u : 0) | ((flags & 0x40) ? 0x00000001u : 0);
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_ps_cb, 0,
+                                              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            memcpy(m.pData, c, sizeof c);
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_ps_cb, 0);
+        }
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s->rtv, NULL);
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_get(&cs, cs.color_mask), NULL, 0xFFFFFFFFu);
+        ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        ID3D11DeviceContext_VSSetShader(s_ctx, s_clear_vs, NULL, 0);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_clear_ps, NULL, 0);
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_ps_cb);
+        ID3D11DeviceContext_Draw(s_ctx, 4, 0);
+    }
+out:
+    LeaveCriticalSection(&s_lock);
+}
+
+void pbgpu_readback(uint32_t addr)
+{
+    Surface *s;
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t y;
+
+    if (!pbgpu_enabled())
+        return;
+    EnterCriticalSection(&s_lock);
+    s = surface_find(addr);
+    if (s && s->drawn && s->staging) {
+        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s->staging,
+                                         (ID3D11Resource *)s->tex);
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s->staging,
+                                              0, D3D11_MAP_READ, 0, &m))) {
+            for (y = 0; y < s->h; y++)
+                from_bgra((const uint32_t *)((const uint8_t *)m.pData + (size_t)y * m.RowPitch),
+                          s->bpp, s->w, guest(s->addr) + (size_t)y * s->pitch);
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s->staging, 0);
+        }
+        s->drawn = 0;
+    }
+    LeaveCriticalSection(&s_lock);
+}
+
+void pbgpu_flip(void)
+{
+    s_flip++;
+}
+
+#else  /* !_WIN32: no D3D11; the software rasteriser stays in charge. */
+
+int  pbgpu_enabled(void) { return 0; }
+void pbgpu_draw(const PbGpuState *s, const PbGpuVertex *v, uint32_t n) { (void)s; (void)v; (void)n; }
+void pbgpu_clear(const PbGpuState *s, uint32_t f, uint32_t c, float d, uint32_t t)
+{ (void)s; (void)f; (void)c; (void)d; (void)t; }
+void pbgpu_readback(uint32_t a) { (void)a; }
+void pbgpu_flip(void) {}
+
+#endif

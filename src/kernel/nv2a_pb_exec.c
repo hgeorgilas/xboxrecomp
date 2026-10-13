@@ -37,6 +37,7 @@
 #include "../d3d/d3d8_swizzle.h"
 #include "nv2a_vsh_interp.h"
 #include "nv2a_combiner.h"
+#include "nv2a_pb_gpu.h"
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -598,6 +599,11 @@ static void dump_surface_bmp(void)
     uint32_t h = drawn ? s_gpu.drawn_h : s_gpu.clip_h, y, x;
     uint32_t bpp = drawn ? s_gpu.drawn_bpp : surface_bpp();
     uint32_t row_bytes, pad, filesz;
+
+    /* With the D3D11 back end the pixels live on the GPU until a flip;
+     * bring this surface back first or the dump shows the last flip. */
+    if (pbgpu_enabled())
+        pbgpu_readback(dma_resolve(offset));
     uint8_t hdr[54];
     FILE *f;
 
@@ -660,8 +666,22 @@ static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2]);
 
+/* RECOMP_PB_NORASTER: decode everything, draw nothing. Measures how fast
+ * the title itself runs with the pixel cost taken out -- the ceiling any
+ * renderer can reach -- and separates "the rasteriser is slow" from "the
+ * game is". */
+static int pb_noraster(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_PB_NORASTER") != NULL;
+    return on;
+}
+
 static void clear_surface(uint32_t param)
 {
+    if (pb_noraster())
+        return;
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
@@ -1985,6 +2005,105 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
 }
 #endif
 
+/* ── D3D11 back end (RECOMP_PB_GPU) ─────────────────────────────────────
+ *
+ * Triangles that reach raster_xf_triangle are collected here instead of
+ * rasterised, and a whole batch goes to nv2a_pb_gpu.c as one draw. Every
+ * decision above this point -- vertex programs, near-plane clipping, which
+ * surface -- is unchanged; only the pixels move to the GPU. */
+#define NV_GPU_MAX_VERTS (NV_MAX_INDICES * 6)
+static PbGpuVertex s_gv[NV_GPU_MAX_VERTS];
+static uint32_t    s_gn;
+
+static int gpu_fetch(const void *tex, uint32_t face_offset, uint32_t u,
+                     uint32_t v, uint32_t *argb)
+{
+    return sample_tex((const Texture *)tex, face_offset, u, v, argb);
+}
+
+static void gpu_state(PbGpuState *g)
+{
+    int st;
+    uint32_t zf = (s_gpu.format >> 4) & 0xF;
+
+    memset(g, 0, sizeof *g);
+    g->surf_addr = dma_resolve(s_gpu.color_offset);
+    g->surf_pitch = s_gpu.pitch;
+    g->surf_bpp = surface_bpp();
+    g->clip_x = s_gpu.clip_x; g->clip_y = s_gpu.clip_y;
+    g->clip_w = s_gpu.clip_w; g->clip_h = s_gpu.clip_h;
+    g->zeta_addr = s_gpu.zeta_offset ? dma_resolve(s_gpu.zeta_offset) : 0;
+    g->zeta_format = zf == 1 ? 1 : 2;
+    g->depth_test = s_gpu.depth_test;
+    g->depth_func = s_gpu.depth_func;
+    g->depth_mask = s_gpu.depth_mask;
+    g->blend_enable = s_gpu.blend_enable;
+    g->blend_sfactor = s_gpu.blend_sfactor;
+    g->blend_dfactor = s_gpu.blend_dfactor;
+    g->blend_equation = s_gpu.blend_equation;
+    g->blend_color = s_gpu.blend_color;
+    g->color_mask = s_gpu.color_mask;
+    g->alpha_test = s_gpu.alpha_test;
+    g->alpha_func = s_gpu.alpha_func;
+    g->alpha_ref = s_gpu.alpha_ref;
+    {
+        static int no_rc = -1;
+        if (no_rc < 0)
+            no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+        g->use_rc = s_gpu.rc_seen && !no_rc;
+    }
+    g->rc = s_gpu.rc;
+    g->clip_plane_mode = s_gpu.clip_plane_mode;
+    /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
+    nv2a_rc_unpack(s_gpu.fog_color, g->fog_color);
+    { float r = g->fog_color[2]; g->fog_color[2] = g->fog_color[0]; g->fog_color[0] = r; }
+    for (st = 0; st < 4; st++) {
+        const Texture *t = &s_gpu.texs[st];
+        PbGpuTexture *d = &g->tex[st];
+        d->valid = t->valid;
+        if (!t->valid)
+            continue;
+        d->addr = t->offset;
+        d->color = t->color;
+        d->width = t->width; d->height = t->height; d->pitch = t->pitch;
+        d->levels = t->levels; d->palette = t->palette; d->cube = t->cube;
+        d->normalized = tex_size_from_format(t->color);
+        d->no_alpha = t->color == 0x07 || t->color == 0x1E;
+        d->addr_u = t->addr_u; d->addr_v = t->addr_v; d->filter = t->filter;
+        d->face_stride = tex_face_stride(t);
+        d->bytes = t->cube ? d->face_stride * 6
+                 : (d->normalized ? d->face_stride : t->pitch * t->height);
+        d->src = t;
+        d->fetch = gpu_fetch;
+    }
+}
+
+static void gpu_flush(void)
+{
+    PbGpuState g;
+    if (!s_gn)
+        return;
+    gpu_state(&g);
+    pbgpu_draw(&g, s_gv, s_gn);
+    s_gn = 0;
+    note_drawn();
+}
+
+static void gpu_add_triangle(const Nv2aVshOutput *const v[3])
+{
+    int k;
+    if (s_gn + 3 > NV_GPU_MAX_VERTS)
+        gpu_flush();
+    for (k = 0; k < 3; k++) {
+        PbGpuVertex *o = &s_gv[s_gn++];
+        memcpy(o->pos, v[k]->pos, sizeof o->pos);
+        memcpy(o->d0, v[k]->d0, sizeof o->d0);
+        memcpy(o->d1, v[k]->d1, sizeof o->d1);
+        memcpy(o->tex, v[k]->tex, sizeof o->tex);
+        o->fog = fog_factor(v[k]->fog[0]);
+    }
+}
+
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
@@ -2028,6 +2147,12 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     s_gpu.xf_seeded = 1;
     if (!surface_begin_batch(T.mem))
         return;
+    if (pbgpu_enabled()) {
+        gpu_add_triangle(v);
+        s_gpu.xf_drawn++;
+        s_gpu.tris_drawn++;
+        return;
+    }
     if (s_gpu.depth_test || s_gpu.depth_mask)
         T.zb = zbuf_current(1);
     if (tex_size_from_format(s_gpu.texs[0].color)) {
@@ -2285,6 +2410,7 @@ static void raster_batch_program(void)
     default:
         break;
     }
+    gpu_flush();
 }
 
 static void raster_batch(void)
@@ -2432,6 +2558,8 @@ static void draw_primitive(void)
     if ((s_gpu.draws % 200) == 0)
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
+    if (pb_noraster())
+        return;
 
     /* How many batches carry coordinates at all, and what range they span.
      * A pipeline that decodes perfectly and draws nothing is indistinguishable
@@ -3023,6 +3151,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "[FTRACE] clear %X surf %08X %ux%u colour %08X%c",
                     param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                     s_gpu.clear_color, 10);
+        if (pbgpu_enabled()) {
+            PbGpuState g;
+            uint32_t zf = (s_gpu.format >> 4) & 0xF;
+            gpu_flush();
+            gpu_state(&g);
+            pbgpu_clear(&g, param, s_gpu.clear_color,
+                        zclear_value() / (zf == 1 ? 65535.0f : 16777215.0f),
+                        s_gpu.zstencil_clear & 0xFF);
+            break;
+        }
         clear_surface(param);
         if (param & 0x01)                         /* Z */
             zbuf_clear();
@@ -3132,6 +3270,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             static uint32_t draws_at_flip;
             xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
             draws_at_flip = s_gpu.draws;
+        }
+        if (pbgpu_enabled()) {
+            gpu_flush();
+            pbgpu_readback(dma_resolve(s_gpu.drawn_offset ? s_gpu.drawn_offset
+                                                          : s_gpu.color_offset));
+            pbgpu_flip();
         }
         if (s_gpu.pitch) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
