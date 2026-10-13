@@ -142,9 +142,9 @@ void panel()
     ImGui::SeparatorText("HD texture pack");
     {
         bool use = xbox_setting_int("RECOMP_TEXPACK", 1) != 0;
-        if (ImGui::Checkbox("Use HD textures (textures\replace)", &use))
+        if (ImGui::Checkbox("HD textures", &use))
             set_int("RECOMP_TEXPACK", use ? 1 : 0);
-        ImGui::SetItemTooltip("Applies after a restart.");
+        ImGui::SetItemTooltip("The upscaled textures in spartan\\textures\\replace.");
         bool dump = xbox_setting_int("RECOMP_TEXPACK_DUMP", 0) != 0;
         if (ImGui::Checkbox("Dump textures while playing", &dump))
             set_int("RECOMP_TEXPACK_DUMP", dump ? 1 : 0);

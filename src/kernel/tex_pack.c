@@ -209,7 +209,8 @@ static void init(void)
         fprintf(stderr, "  [TEXPACK] dumping new textures to %s (%u already there)\n",
                 DUMP_DIR, s_dumped.n);
     }
-    if (s_use && (f = FindFirstFileA(REPL_DIR "*.png", &fd)) != INVALID_HANDLE_VALUE) {
+    /* Listed even when off: the overlay can turn the pack on later. */
+    if ((f = FindFirstFileA(REPL_DIR "*.png", &fd)) != INVALID_HANDLE_VALUE) {
         do {
             uint64_t k = _strtoui64(fd.cFileName, NULL, 16);
             Slot *sl;
@@ -330,6 +331,25 @@ int texpack_lookup(uint64_t key, uint32_t **px, uint32_t *w, uint32_t *h)
         }
     }
     return r;
+}
+
+/* RECOMP_TEXPACK, live: nonzero when it changed since the last call, so
+ * the renderer re-uploads its textures -- replaced or original. */
+int texpack_use_changed(void)
+{
+    static long gen;
+    extern long xbox_settings_gen(void);
+    int was, now;
+    init();
+    if (gen == xbox_settings_gen())
+        return 0;
+    gen = xbox_settings_gen();
+    was = s_use;
+    now = xbox_setting_int("RECOMP_TEXPACK", 1) != 0;
+    s_use = now;
+    if (was != now)
+        fprintf(stderr, "  [TEXPACK] HD textures %s\n", now ? "on" : "off");
+    return was != now;
 }
 
 void texpack_free(uint32_t *px)

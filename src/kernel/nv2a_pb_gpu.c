@@ -492,6 +492,7 @@ extern uint64_t texpack_key(const uint32_t *px, uint32_t w, uint32_t h, uint32_t
 extern void texpack_dump(uint64_t key, const uint32_t *px, uint32_t w, uint32_t h, uint32_t fmt);
 extern int  texpack_lookup(uint64_t key, uint32_t **px, uint32_t *w, uint32_t *h);
 extern void texpack_free(uint32_t *px);
+extern int  texpack_use_changed(void);
 
 #define MAX_TEX 512
 static TexEntry s_tex[MAX_TEX];
@@ -676,6 +677,16 @@ static ID3D11ShaderResourceView *tex_get(const PbGpuTexture *t, Surface *target)
 
     if (!t->valid || !t->width || !t->height || t->width > 4096 || t->height > 4096)
         return s_white;
+
+    /* The HD pack switched on or off: every texture goes up again, from
+     * whichever source is now in force. */
+    if (texpack_use_changed()) {
+        for (i = 0; i < MAX_TEX; i++) {
+            if (s_tex[i].srv) ID3D11ShaderResourceView_Release(s_tex[i].srv);
+            if (s_tex[i].tex) ID3D11Texture2D_Release(s_tex[i].tex);
+            memset(&s_tex[i], 0, sizeof s_tex[i]);
+        }
+    }
 
     /* A surface drawn in the last few frames is read on the GPU: that is a
      * render-to-texture pass (glow, blur, composite), and its guest memory is
