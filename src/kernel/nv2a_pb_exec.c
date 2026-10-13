@@ -2378,6 +2378,77 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
     return nv2a_vsh_run((const float (*)[4])in, out);
 }
 
+/* Vertex programs on worker threads.
+ *
+ * Gameplay is bound by the executor, and half of the executor is the vertex
+ * program interpreter (Spartan: the game thread waits on the GPU two thirds
+ * of the time). Distinct vertices of a batch are independent once the
+ * program cannot write c[], so they are split across a few threads; the
+ * executor thread takes a share too. RECOMP_XF_THREADS sets the worker
+ * count, 0 to keep it all on the executor. */
+#define XF_MAX_WORKERS 8
+#define XF_CHUNK 32
+static struct {
+    int nworkers;
+    HANDLE go[XF_MAX_WORKERS], done[XF_MAX_WORKERS];
+    const uint16_t *list;
+    Nv2aVshOutput *out;
+    uint32_t count;
+    volatile LONG next;
+} s_xfp = { -1 };
+
+static void xf_share(void)
+{
+    for (;;) {
+        uint32_t k = (uint32_t)InterlockedExchangeAdd(&s_xfp.next, XF_CHUNK), e;
+        if (k >= s_xfp.count)
+            return;
+        e = k + XF_CHUNK < s_xfp.count ? k + XF_CHUNK : s_xfp.count;
+        for (; k < e; k++)
+            transform_vertex(s_xfp.list[k], &s_xfp.out[k]);
+    }
+}
+
+static DWORD WINAPI xf_worker(LPVOID arg)
+{
+    int i = (int)(intptr_t)arg;
+    for (;;) {
+        WaitForSingleObject(s_xfp.go[i], INFINITE);
+        xf_share();
+        SetEvent(s_xfp.done[i]);
+    }
+}
+
+static void xf_run(const uint16_t *list, Nv2aVshOutput *out, uint32_t count)
+{
+    int i;
+    if (s_xfp.nworkers < 0) {
+        const char *e = getenv("RECOMP_XF_THREADS");
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        s_xfp.nworkers = e ? atoi(e) : (int)si.dwNumberOfProcessors - 4;
+        if (s_xfp.nworkers > XF_MAX_WORKERS) s_xfp.nworkers = XF_MAX_WORKERS;
+        if (s_xfp.nworkers < 0) s_xfp.nworkers = 0;
+        for (i = 0; i < s_xfp.nworkers; i++) {
+            s_xfp.go[i] = CreateEventW(NULL, FALSE, FALSE, NULL);
+            s_xfp.done[i] = CreateEventW(NULL, FALSE, FALSE, NULL);
+            CloseHandle(CreateThread(NULL, 0, xf_worker, (LPVOID)(intptr_t)i, 0, NULL));
+        }
+    }
+    s_xfp.list = list;
+    s_xfp.out = out;
+    s_xfp.count = count;
+    s_xfp.next = 0;
+    if (!s_xfp.nworkers || count < 4 * XF_CHUNK) {
+        xf_share();
+        return;
+    }
+    for (i = 0; i < s_xfp.nworkers; i++)
+        SetEvent(s_xfp.go[i]);
+    xf_share();
+    WaitForMultipleObjects((DWORD)s_xfp.nworkers, s_xfp.done, TRUE, INFINITE);
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
@@ -2388,24 +2459,38 @@ static void raster_batch_program(void)
      * thread then sat in KickOff waiting for it. A program has no side
      * effects unless it may write c[] (CXT_WRITE), so the result for an
      * index is reused; with CXT_WRITE every index is run as before. */
-    static uint32_t s_vgen, s_vstamp[65536];
-    static uint16_t s_vwhere[65536];
+    static uint32_t s_vgen, s_vstamp[65536], s_vwhere[65536];
+    static uint32_t s_map[NV_MAX_INDICES];
+    static uint16_t s_uniq[NV_MAX_INDICES];
+    static Nv2aVshOutput s_uout[NV_MAX_INDICES];
     int reuse = !nv2a_vsh_cxt_write();
 
-    if (++s_vgen == 0) {
-        memset(s_vstamp, 0, sizeof s_vstamp);
-        s_vgen = 1;
-    }
-    for (i = 0; i < n; i++) {
-        uint16_t v = s_gpu.idx[i];
-        if (reuse && s_vstamp[v] == s_vgen) {
-            s_xf[i] = s_xf[s_vwhere[v]];
-            continue;
+    if (!n)
+        return;
+    if (reuse) {
+        uint32_t nu = 0;
+        if (++s_vgen == 0) {
+            memset(s_vstamp, 0, sizeof s_vstamp);
+            s_vgen = 1;
         }
-        if (!transform_vertex(v, &s_xf[i]))
+        for (i = 0; i < n; i++) {
+            uint16_t v = s_gpu.idx[i];
+            if (s_vstamp[v] != s_vgen) {
+                s_vstamp[v] = s_vgen;
+                s_vwhere[v] = nu;
+                s_uniq[nu++] = v;
+            }
+            s_map[i] = s_vwhere[v];
+        }
+        if (!transform_vertex(s_uniq[0], &s_uout[0]))
             return;                                    /* no program loaded */
-        s_vstamp[v] = s_vgen;
-        s_vwhere[v] = (uint16_t)i;
+        xf_run(s_uniq + 1, s_uout + 1, nu - 1);
+        for (i = 0; i < n; i++)
+            s_xf[i] = s_uout[s_map[i]];
+    } else {
+        for (i = 0; i < n; i++)
+            if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+                return;                                /* no program loaded */
     }
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
