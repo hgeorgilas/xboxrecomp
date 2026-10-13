@@ -326,6 +326,14 @@ static struct {
     int xf_nfmt, xf_seeded;
     uint32_t depth_test, depth_func, depth_mask;
     uint32_t zeta_offset, zstencil_clear;
+    /* Stencil, culling and polygon offset: what stencil shadow volumes and
+     * decals are built from. */
+    uint32_t stencil_test, stencil_mask, stencil_func, stencil_ref,
+             stencil_func_mask, stencil_op_fail, stencil_op_zfail,
+             stencil_op_zpass;
+    uint32_t cull_enable, cull_face, front_face;
+    uint32_t poly_offset_fill;
+    float    poly_offset_scale, poly_offset_bias;
 } s_gpu;
 
 /* Unhandled methods, ranked. The interesting output is not that something was
@@ -2057,6 +2065,20 @@ static void gpu_state(PbGpuState *g)
     g->depth_test = s_gpu.depth_test;
     g->depth_func = s_gpu.depth_func;
     g->depth_mask = s_gpu.depth_mask;
+    g->stencil_test = s_gpu.stencil_test;
+    g->stencil_mask = s_gpu.stencil_mask;
+    g->stencil_func = s_gpu.stencil_func;
+    g->stencil_ref = s_gpu.stencil_ref;
+    g->stencil_func_mask = s_gpu.stencil_func_mask;
+    g->stencil_op_fail = s_gpu.stencil_op_fail;
+    g->stencil_op_zfail = s_gpu.stencil_op_zfail;
+    g->stencil_op_zpass = s_gpu.stencil_op_zpass;
+    g->cull_enable = s_gpu.cull_enable;
+    g->cull_face = s_gpu.cull_face;
+    g->front_face = s_gpu.front_face;
+    g->poly_offset_fill = s_gpu.poly_offset_fill;
+    g->poly_offset_scale = s_gpu.poly_offset_scale;
+    g->poly_offset_bias = s_gpu.poly_offset_bias;
     g->blend_enable = s_gpu.blend_enable;
     g->blend_sfactor = s_gpu.blend_sfactor;
     g->blend_dfactor = s_gpu.blend_dfactor;
@@ -2236,23 +2258,29 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
  * behind it, so the bottom of the frame showed a hole -- a quarter of every
  * race frame's triangles went this way.
  *
- * Clipping has to happen in clip space, but the D3D epilogue has already
- * divided x, y and z by w and applied the viewport (c[58] scale, c[59]
- * offset) while leaving w itself alone. So each vertex is taken back to clip
- * space first: clip = (screen - offset) / scale * w. Everything else the
- * vertex carries -- colours, fog, texture coordinates -- is linear in clip
- * space and is interpolated directly. The polygon is clipped against
- * w = NV_CLIP_W (Sutherland-Hodgman, one plane), re-projected, and fanned.
+ * Clipping has to happen in clip space, but the program has already divided
+ * x, y and z by w and applied a viewport, leaving w alone. Screen position
+ * times w is still linear in clip space -- screen = clip/w*scale + offset,
+ * so screen*w = clip*scale + offset*w -- so each vertex is carried as
+ * (screen*w, w) and divided back afterwards, whatever viewport the program
+ * used. This used to undo the viewport explicitly from c[58]/c[59], the
+ * XDK's default epilogue constants; Spartan's programs map the viewport
+ * from constants of their own and leave other data there, so every
+ * clipped triangle -- the sky dome, and floor and walls near the camera --
+ * landed scaled into the top-left quarter instead of where it belonged.
+ * Everything else the vertex carries -- colours, fog, texture coordinates
+ * -- is linear in clip space and is interpolated directly. The polygon is
+ * clipped against w = NV_CLIP_W (Sutherland-Hodgman, one plane),
+ * re-projected, and fanned.
  * ponytail: the near plane only; x/y/far fall to the rasteriser's bounds
  * check, which is correct, just slower for huge off-screen triangles. */
 #define NV_CLIP_W 1e-3f
 
-static void xf_to_clip(const Nv2aVshOutput *v, const float k[3],
-                       const float o[3], float c[3])
+static void xf_to_clip(const Nv2aVshOutput *v, float c[3])
 {
     int i;
     for (i = 0; i < 3; i++)
-        c[i] = k[i] != 0.0f ? (v->pos[i] - o[i]) / k[i] * v->pos[3] : 0.0f;
+        c[i] = v->pos[i] * v->pos[3];
 }
 
 static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
@@ -2270,7 +2298,7 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
 {
     const Nv2aVshOutput *in[3];
     Nv2aVshOutput poly[4], va, vb;
-    float k[3], o[3], ca[3], cb[3];
+    float ca[3], cb[3];
     int n = 0, i, j;
 
     if (a->pos[3] > NV_CLIP_W && b->pos[3] > NV_CLIP_W && c->pos[3] > NV_CLIP_W) {
@@ -2282,33 +2310,29 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         s_gpu.tris_behind++;                  /* wholly behind: nothing */
         return;
     }
-    {
-        const float *sc = nv2a_vsh_constant(58), *of = nv2a_vsh_constant(59);
-        for (i = 0; i < 3; i++) { k[i] = sc[i]; o[i] = of[i]; }
-    }
     in[0] = a; in[1] = b; in[2] = c;
     for (i = 0; i < 3; i++) {
         const Nv2aVshOutput *p = in[i], *q = in[(i + 1) % 3];
         int pin = p->pos[3] > NV_CLIP_W, qin = q->pos[3] > NV_CLIP_W;
         if (pin) {
             va = *p;
-            xf_to_clip(p, k, o, ca);
+            xf_to_clip(p, ca);
             for (j = 0; j < 3; j++) va.pos[j] = ca[j];
             poly[n++] = va;
         }
         if (pin != qin) {
             float t = (NV_CLIP_W - p->pos[3]) / (q->pos[3] - p->pos[3]);
             va = *p; vb = *q;
-            xf_to_clip(p, k, o, ca);
-            xf_to_clip(q, k, o, cb);
+            xf_to_clip(p, ca);
+            xf_to_clip(q, cb);
             for (j = 0; j < 3; j++) { va.pos[j] = ca[j]; vb.pos[j] = cb[j]; }
             xf_lerp(&va, &vb, t, &poly[n++]);
         }
     }
-    /* Back to screen space: divide by the (now positive) w, viewport. */
+    /* Back to screen space: divide by the (now positive) w. */
     for (i = 0; i < n; i++)
         for (j = 0; j < 3; j++)
-            poly[i].pos[j] = poly[i].pos[j] / poly[i].pos[3] * k[j] + o[j];
+            poly[i].pos[j] = poly[i].pos[j] / poly[i].pos[3];
     for (i = 1; i + 1 < n; i++)
         raster_xf_triangle(&poly[0], &poly[i], &poly[i + 1]);
 }
@@ -2571,8 +2595,14 @@ static void raster_batch_program(void)
             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
+        /* Every other triangle of a strip has its winding reversed; with
+         * face culling honoured, emitting them as (i, i+1, i+2) culled
+         * half of every strip. */
         for (i = 0; i + 2 < n; i++)
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+            if (i & 1)
+                raster_xf_clipped(&s_xf[i+1], &s_xf[i], &s_xf[i+2]);
+            else
+                raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
@@ -3355,7 +3385,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
-        note_unhandled(method, param);
+        note_unhandled(method | (subch << 16), param);   /* subch in the top half */
         return;
     }
     switch (method) {
@@ -3659,6 +3689,30 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
+
+    /* Stencil. Spartan's shadows are stencil volumes: invisible geometry
+     * counts itself into the stencil buffer, then one screen quad darkens
+     * where the count is non-zero. Ignored, that quad darkened its whole
+     * rectangle -- a dark box over the top-left of every frame. */
+    case 0x032C: s_gpu.stencil_test = param; break;      /* STENCIL_TEST_ENABLE */
+    case 0x0360: s_gpu.stencil_mask = param; break;      /* STENCIL_MASK (write) */
+    case 0x0364: s_gpu.stencil_func = param; break;      /* STENCIL_FUNC */
+    case 0x0368: s_gpu.stencil_ref = param; break;       /* STENCIL_FUNC_REF */
+    case 0x036C: s_gpu.stencil_func_mask = param; break; /* STENCIL_FUNC_MASK */
+    case 0x0370: s_gpu.stencil_op_fail = param; break;   /* STENCIL_OP_FAIL */
+    case 0x0374: s_gpu.stencil_op_zfail = param; break;  /* STENCIL_OP_ZFAIL */
+    case 0x0378: s_gpu.stencil_op_zpass = param; break;  /* STENCIL_OP_ZPASS */
+
+    /* Face culling: shadow volumes draw front and back faces in separate
+     * passes, which cancel each other out unless culling is honoured. */
+    case 0x0308: s_gpu.cull_enable = param; break;       /* CULL_FACE_ENABLE */
+    case 0x039C: s_gpu.cull_face = param; break;         /* CULL_FACE */
+    case 0x03A0: s_gpu.front_face = param; break;        /* FRONT_FACE */
+
+    /* Polygon offset, for decals laid on the surface beneath them. */
+    case 0x0338: s_gpu.poly_offset_fill = param; break;  /* POLY_OFFSET_FILL_ENABLE */
+    case 0x0384: memcpy(&s_gpu.poly_offset_scale, &param, 4); break;
+    case 0x0388: memcpy(&s_gpu.poly_offset_bias, &param, 4); break;
 
     default:
         if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
@@ -4014,8 +4068,9 @@ void nv2a_pb_exec_report(void)
              * is using. */
             union { uint32_t u; float f; } v;
             v.u = s_unhandled[i].last_param;
-            fprintf(stderr, "  [GPU]   0x%04X x%-8u last=0x%08X (%.4f)\n",
-                    s_unhandled[i].method, s_unhandled[i].count,
+            fprintf(stderr, "  [GPU]   %u:0x%04X x%-8u last=0x%08X (%.4f)\n",
+                    s_unhandled[i].method >> 16,
+                    s_unhandled[i].method & 0xFFFF, s_unhandled[i].count,
                     v.u, v.f);
         }
     }

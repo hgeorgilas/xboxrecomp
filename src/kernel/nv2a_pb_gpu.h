@@ -68,6 +68,12 @@ typedef struct {
     /* Depth: guest address (0 = none), 1 = Z16, 2 = Z24S8. */
     uint32_t zeta_addr, zeta_format;
     uint32_t depth_test, depth_func, depth_mask;
+    uint32_t stencil_test, stencil_mask, stencil_func, stencil_ref,
+             stencil_func_mask, stencil_op_fail, stencil_op_zfail,
+             stencil_op_zpass;        /* NV097 values: GL enums */
+    uint32_t cull_enable, cull_face, front_face;
+    uint32_t poly_offset_fill;
+    float    poly_offset_scale, poly_offset_bias;
     uint32_t blend_enable, blend_sfactor, blend_dfactor, blend_equation;
     uint32_t blend_color, color_mask;
     uint32_t alpha_test, alpha_func, alpha_ref;

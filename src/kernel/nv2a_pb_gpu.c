@@ -94,7 +94,11 @@ static const char k_vs[] =
 "  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2;\n"
 "  float4 t3:TEXCOORD3; float f:TEXCOORD4; };\n"
 "VO main(VI i) {\n"
-"  VO o; float w = i.p.w;\n"
+/* A screen-space pass can carry w = inf (Spartan's depth-of-field quad:
+ * a reciprocal of 0). Rebuilding clip space as screen * w then makes inf/inf
+ * = NaN and the quad rasterised into one corner. Equal w at every vertex
+ * changes nothing about the result, so any finite stand-in is exact. */
+"  VO o; float w = i.p.w; if (!(w > 0 && w < 1e30)) w = 1;\n"
 "  float x = i.p.x * vp.x - 1.0, y = 1.0 - i.p.y * vp.y, z = i.p.z * vp.z;\n"
 "  o.p = float4(x * w, y * w, z * w, w);\n"
 "  o.d0 = i.d0; o.d1 = i.d1; o.t0 = i.t0; o.t1 = i.t1; o.t2 = i.t2;\n"
@@ -658,13 +662,105 @@ static ID3D11BlendState *blend_get(const PbGpuState *st, uint32_t color_mask)
     return b;
 }
 
+/* NV097 stencil ops are GL enums. */
+static D3D11_STENCIL_OP stencil_op(uint32_t op)
+{
+    switch (op) {
+    case 0x0000: return D3D11_STENCIL_OP_ZERO;
+    case 0x1E01: return D3D11_STENCIL_OP_REPLACE;
+    case 0x1E02: return D3D11_STENCIL_OP_INCR_SAT;
+    case 0x1E03: return D3D11_STENCIL_OP_DECR_SAT;
+    case 0x150A: return D3D11_STENCIL_OP_INVERT;
+    case 0x8507: return D3D11_STENCIL_OP_INCR;
+    case 0x8508: return D3D11_STENCIL_OP_DECR;
+    default:     return D3D11_STENCIL_OP_KEEP;          /* 0x1E00 KEEP */
+    }
+}
+
+/* Culling and polygon offset, one rasterizer state per combination.
+ *
+ * Winding: the executor hands over screen-space positions (y down) and the
+ * vertex shader flips y into NDC, which D3D11 flips back through the
+ * viewport -- so a triangle's winding in the render target is its winding
+ * in NV2A screen space, and the NV2A's CW/CCW is in that same y-down space
+ * (checked on Spartan: the swapped reading culled every floor and turned
+ * characters inside out). RECOMP_CULL=0 turns culling off and
+ * RECOMP_CULL_FLIP reverses the winding, should a title prove this wrong. */
+static ID3D11RasterizerState *rs_get(const PbGpuState *st)
+{
+    static int mode = -2;
+    static ID3D11RasterizerState *cache[64];
+    static uint32_t keys[64];
+    static int n;
+    D3D11_RASTERIZER_DESC rd;
+    D3D11_CULL_MODE cull = D3D11_CULL_NONE;
+    BOOL ccw;
+    int bias = 0, i;
+    float slope = 0;
+    uint32_t key;
+
+    if (mode == -2) {
+        const char *e = getenv("RECOMP_CULL");
+        mode = e ? atoi(e) : 1;
+        if (getenv("RECOMP_CULL_FLIP"))
+            mode |= 2;
+    }
+    if ((mode & 1) && st->cull_enable) {
+        if (st->cull_face == 0x0404)       cull = D3D11_CULL_FRONT;
+        else if (st->cull_face == 0x0405)  cull = D3D11_CULL_BACK;
+        /* FRONT_AND_BACK (0x408) draws nothing but lines and points. */
+    }
+    ccw = st->front_face == 0x0901;               /* GL CCW */
+    if (mode & 2)
+        ccw = !ccw;
+    if (st->poly_offset_fill) {
+        /* D3D11's depth bias is in units of the depth buffer's resolution,
+         * as GL's polygon-offset units are. */
+        bias = (int)st->poly_offset_bias;
+        slope = st->poly_offset_scale;
+    }
+    key = (uint32_t)cull | (uint32_t)ccw << 4 | ((uint32_t)bias & 0xFFFF) << 8
+        | ((uint32_t)(slope * 16.0f) & 0xFF) << 24;
+    for (i = 0; i < n; i++)
+        if (keys[i] == key)
+            return cache[i];
+    memset(&rd, 0, sizeof rd);
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = cull;
+    rd.FrontCounterClockwise = ccw;
+    rd.DepthBias = bias;
+    rd.SlopeScaledDepthBias = slope;
+    rd.DepthClipEnable = FALSE;
+    rd.ScissorEnable = TRUE;
+    if (n == 64)
+        return s_rs;
+    if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &cache[n])))
+        return s_rs;
+    keys[n] = key;
+    return cache[n++];
+}
+
 static ID3D11DepthStencilState *depth_get(const PbGpuState *st, int have_z)
 {
     uint64_t key = ((uint64_t)!!have_z << 40) | ((uint64_t)!!st->depth_test << 32)
                  | ((uint64_t)!!st->depth_mask << 31) | (st->depth_func & 0xFFFF);
-    ID3D11DepthStencilState *d = (ID3D11DepthStencilState *)cache_find(s_depth, key);
+    ID3D11DepthStencilState *d;
     D3D11_DEPTH_STENCIL_DESC dd;
+    int stencil = have_z && st->stencil_test;
 
+    if (stencil) {
+        /* Fold the stencil setup into the key: func, masks and the three
+         * ops. The reference value is passed at bind time, not baked in. */
+        uint64_t h = 1469598103934665603ull;
+        h = (h ^ st->stencil_func) * 1099511628211ull;
+        h = (h ^ (st->stencil_mask & 0xFF)) * 1099511628211ull;
+        h = (h ^ (st->stencil_func_mask & 0xFF)) * 1099511628211ull;
+        h = (h ^ st->stencil_op_fail) * 1099511628211ull;
+        h = (h ^ st->stencil_op_zfail) * 1099511628211ull;
+        h = (h ^ st->stencil_op_zpass) * 1099511628211ull;
+        key ^= (h & 0xFFFFFF) << 41 | 1ull << 16;
+    }
+    d = (ID3D11DepthStencilState *)cache_find(s_depth, key);
     if (d)
         return d;
     memset(&dd, 0, sizeof dd);
@@ -675,6 +771,25 @@ static ID3D11DepthStencilState *depth_get(const PbGpuState *st, int have_z)
     dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
     if (st->depth_test && st->depth_func >= 0x200 && st->depth_func <= 0x207)
         dd.DepthFunc = (D3D11_COMPARISON_FUNC)(st->depth_func - 0x200 + 1);
+    if (stencil) {
+        dd.StencilEnable = TRUE;
+        dd.StencilReadMask = (UINT8)st->stencil_func_mask;
+        dd.StencilWriteMask = (UINT8)st->stencil_mask;
+        dd.FrontFace.StencilFunc = (st->stencil_func >= 0x200 && st->stencil_func <= 0x207)
+            ? (D3D11_COMPARISON_FUNC)(st->stencil_func - 0x200 + 1)
+            : D3D11_COMPARISON_ALWAYS;
+        dd.FrontFace.StencilFailOp = stencil_op(st->stencil_op_fail);
+        dd.FrontFace.StencilDepthFailOp = stencil_op(st->stencil_op_zfail);
+        dd.FrontFace.StencilPassOp = stencil_op(st->stencil_op_zpass);
+        dd.BackFace = dd.FrontFace;         /* the NV2A has one-sided stencil */
+        /* The stencil lives in the depth buffer; it must be bound even
+         * when the depth test itself is off. */
+        if (!dd.DepthEnable) {
+            dd.DepthEnable = TRUE;
+            dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+            dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        }
+    }
     if (FAILED(ID3D11Device_CreateDepthStencilState(s_dev, &dd, &d)))
         return NULL;
     cache_put(s_depth, key, d);
@@ -1215,6 +1330,61 @@ void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
     if (!(s = bind_target(st, &z)))
         goto out;
 
+    if (s_cap.active && s_flip == s_cap.flip && s_cap.log) {
+        /* One line per draw: its screen extent and the state that decides
+         * what it does to the target. */
+        float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f, z0 = 1e30f, z1 = -1e30f;
+        uint32_t k;
+        for (k = 0; k < count; k++) {
+            if (v[k].pos[0] < x0) x0 = v[k].pos[0];
+            if (v[k].pos[0] > x1) x1 = v[k].pos[0];
+            if (v[k].pos[1] < y0) y0 = v[k].pos[1];
+            if (v[k].pos[1] > y1) y1 = v[k].pos[1];
+            if (v[k].pos[2] < z0) z0 = v[k].pos[2];
+            if (v[k].pos[2] > z1) z1 = v[k].pos[2];
+        }
+        fprintf(s_cap.log, "     draw %u verts x %.0f..%.0f y %.0f..%.0f z %.0f..%.0f"
+                " w0 %.3f blend %u %X/%X ztest %u zmask %u cmask %08X stages %05X"
+                " t0 %08X %ux%u d0 %.2f,%.2f,%.2f,%.2f\n",
+                count, x0, x1, y0, y1, z0, z1, count ? v[0].pos[3] : 0.0f,
+                st->blend_enable, st->blend_sfactor, st->blend_dfactor,
+                st->depth_test, st->depth_mask, st->color_mask,
+                st->use_rc ? st->rc.stage_program : 0xFFFFF,
+                st->tex[0].valid ? st->tex[0].addr : 0, st->tex[0].width,
+                st->tex[0].height, count ? v[0].d0[0] : 0, count ? v[0].d0[1] : 0,
+                count ? v[0].d0[2] : 0, count ? v[0].d0[3] : 0);
+        {
+            extern const float *nv2a_vsh_constant(uint32_t index);
+            const float *c58 = nv2a_vsh_constant(58), *c59 = nv2a_vsh_constant(59);
+            fprintf(s_cap.log, "          c58 %.1f %.1f %.1f  c59 %.1f %.1f %.1f\n",
+                    c58[0], c58[1], c58[2], c59[0], c59[1], c59[2]);
+            if (count >= 3) {
+                /* Where the bulk of the draw lands: the extent of the
+                 * vertices with a sane w (clipped ones run off to huge
+                 * values and hide it). */
+                float sx0 = 1e30f, sy0 = 1e30f, sx1 = -1e30f, sy1 = -1e30f;
+                uint32_t sane = 0;
+                for (k = 0; k < count; k++)
+                    if (v[k].pos[3] > 0.05f && v[k].pos[3] < 1e6f) {
+                        sane++;
+                        if (v[k].pos[0] < sx0) sx0 = v[k].pos[0];
+                        if (v[k].pos[0] > sx1) sx1 = v[k].pos[0];
+                        if (v[k].pos[1] < sy0) sy0 = v[k].pos[1];
+                        if (v[k].pos[1] > sy1) sy1 = v[k].pos[1];
+                    }
+                fprintf(s_cap.log, "          sane-w verts %u: x %.1f..%.1f y %.1f..%.1f;"
+                        " v0 (%.1f %.1f %.4f %.3f)\n", sane, sx0, sx1, sy0, sy1,
+                        v[0].pos[0], v[0].pos[1], v[0].pos[2], v[0].pos[3]);
+                fprintf(s_cap.log, "          tex0 v0 (%.3f %.3f %.3f %.3f) v1 (%.3f %.3f %.3f %.3f)"
+                        " v2 (%.3f %.3f %.3f %.3f) fmt %02X\n",
+                        v[0].tex[0][0], v[0].tex[0][1], v[0].tex[0][2], v[0].tex[0][3],
+                        v[1].tex[0][0], v[1].tex[0][1], v[1].tex[0][2], v[1].tex[0][3],
+                        v[2].tex[0][0], v[2].tex[0][1], v[2].tex[0][2], v[2].tex[0][3],
+                        st->tex[0].color);
+            }
+        }
+    }
+
     /* Pixel shader key: the combiner program's shape, not its constants. */
     memset(&key, 0, sizeof key);
     key.rc = st->rc;
@@ -1321,8 +1491,9 @@ void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
             memcpy(bf, c, sizeof bf);
     }
     ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
-    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, depth_get(st, z != NULL), 0);
-    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, depth_get(st, z != NULL),
+                                               st->stencil_ref & 0xFF);
+    ID3D11DeviceContext_RSSetState(s_ctx, rs_get(st));
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &off);
@@ -1336,6 +1507,14 @@ void pbgpu_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t count)
     {
         ID3D11ShaderResourceView *none[4] = { 0, 0, 0, 0 };
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, none);
+    }
+    if (s_cap.active && s_flip == s_cap.flip && s_cap.draws <= 3) {
+        /* The first few draws of each pass, one image each: what a single
+         * draw did to the target, where the per-pass images only show the
+         * sum. */
+        char name[64];
+        snprintf(name, sizeof name, "%02u_%08X_draw%u", s_cap.n, s->addr, s_cap.draws);
+        rt_dump(s, name);
     }
 out:
     LeaveCriticalSection(&s_lock);
