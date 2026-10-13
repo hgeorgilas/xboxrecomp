@@ -187,7 +187,7 @@ static NTSTATUS xbox_wait_result_to_ntstatus(DWORD result, ULONG count)
 
     switch (result) {
         case WAIT_TIMEOUT:          return STATUS_TIMEOUT;
-        case WAIT_IO_COMPLETION:    return STATUS_ALERTED;
+        case WAIT_IO_COMPLETION:    return STATUS_USER_APC;   /* an APC ran */
         case WAIT_ABANDONED_0:      return STATUS_ABANDONED;
         case WAIT_FAILED:           return STATUS_UNSUCCESSFUL;
         default:                    return STATUS_UNSUCCESSFUL;

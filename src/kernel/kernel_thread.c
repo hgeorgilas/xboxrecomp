@@ -193,7 +193,7 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
     if (Alertable) {
         DWORD result = SleepEx(ms, TRUE);
         if (result == WAIT_IO_COMPLETION)
-            return STATUS_ALERTED;
+            return STATUS_USER_APC;   /* an APC ran */
     } else {
         Sleep(ms);
     }

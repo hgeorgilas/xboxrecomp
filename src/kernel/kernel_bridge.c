@@ -7620,14 +7620,75 @@ static void bridge_NtProtectVirtualMemory(void)
     }
 }
 
-/* --- NtQueueApcThread (ordinal 206, 5 args = 20 bytes) --- */
+/* --- NtQueueApcThread (ordinal 206, 5 args = 20 bytes) ---
+ *
+ * NTSTATUS NtQueueApcThread(HANDLE Thread, PPS_APC_ROUTINE ApcRoutine,
+ *                           PVOID Arg1, PVOID Arg2, PVOID Arg3);
+ *
+ * Was a stub that returned success and dropped the APC. XAPI's QueueUserAPC
+ * is built on it, and a title that hands work to a thread that sleeps
+ * alertably then waits forever: Spartan's level loader queues each read to
+ * its streaming thread this way, so loading the first mission stopped dead
+ * with the main thread pumping DirectSound.
+ *
+ * The APC is queued to the target's host thread as a host APC, so Windows
+ * delivers it exactly when the guest asked: at that thread's next alertable
+ * wait (the bridged waits pass Alertable through to the host). It then runs
+ * on that thread, with that thread's guest stack and registers. The
+ * interrupted guest state is saved around the call, because an APC fires in
+ * the middle of a kernel call the guest expects to return with its
+ * callee-saved registers intact. */
+typedef struct {
+    uint32_t routine, arg1, arg2, arg3;
+} BridgeUserApc;
+
+static VOID CALLBACK bridge_user_apc(ULONG_PTR param)
+{
+    BridgeUserApc *a = (BridgeUserApc *)param;
+    recomp_func_t fn = recomp_lookup(a->routine);
+    uint32_t s_eax = g_eax, s_ecx = g_ecx, s_edx = g_edx, s_esp = g_esp;
+    uint32_t s_ebx = g_ebx, s_esi = g_esi, s_edi = g_edi;
+
+    if (!fn) fn = recomp_lookup_manual(a->routine);
+    if (!fn) fn = recomp_lookup_kernel(a->routine);
+    if (fn) {
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = a->arg3;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = a->arg2;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = a->arg1;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;      /* dummy return address */
+        fn();
+    } else {
+        fprintf(stderr, "  [KERNEL] user APC 0x%08X unresolved\n", a->routine);
+        fflush(stderr);
+    }
+    g_eax = s_eax; g_ecx = s_ecx; g_edx = s_edx; g_esp = s_esp;
+    g_ebx = s_ebx; g_esi = s_esi; g_edi = s_edi;
+    free(a);
+}
+
 static void bridge_NtQueueApcThread(void)
 {
-    (void)STACK_ARG(0);
-    (void)STACK_ARG(1);
-    (void)STACK_ARG(2);
-    (void)STACK_ARG(3);
-    (void)STACK_ARG(4);
+    uint32_t thread  = STACK_ARG(0);
+    BridgeUserApc *a = (BridgeUserApc *)malloc(sizeof *a);
+    HANDLE h = bridge_resolve_handle(thread);
+
+    if (!a) {
+        g_eax = 0xC000009Au;                      /* INSUFFICIENT_RESOURCES */
+        return;
+    }
+    a->routine = STACK_ARG(1);
+    a->arg1 = STACK_ARG(2);
+    a->arg2 = STACK_ARG(3);
+    a->arg3 = STACK_ARG(4);
+    if (!h || !QueueUserAPC(bridge_user_apc, h, (ULONG_PTR)a)) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [KERNEL] NtQueueApcThread: cannot queue to "
+                            "thread 0x%08X (error %lu)\n", thread, GetLastError());
+        free(a);
+        g_eax = 0xC0000008u;                      /* STATUS_INVALID_HANDLE */
+        return;
+    }
     g_eax = 0;
 }
 

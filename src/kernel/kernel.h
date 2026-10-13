@@ -69,6 +69,7 @@ enum {
 #endif
 #ifndef STATUS_ALERTED
 #define STATUS_ALERTED                  ((NTSTATUS)0x00000101L)
+#define STATUS_USER_APC                 ((NTSTATUS)0x000000C0L)
 #endif
 #ifndef STATUS_TIMEOUT
 #define STATUS_TIMEOUT                  ((NTSTATUS)0x00000102L)
