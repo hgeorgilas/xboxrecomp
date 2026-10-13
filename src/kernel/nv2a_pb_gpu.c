@@ -2156,6 +2156,21 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
     long aoff, ioff;
     int k, ok = 0;
 
+    if (slot[0] >= 0 && nverts && !getenv("RECOMP_DRAW_RHW0")) {
+        /* A batch whose every vertex has position w 0 -- a pre-transformed
+         * vertex's RHW -- draws nothing: 1/0 sends it to infinity. Spartan's
+         * pause screen sends one each frame (a 640-wide quad over a 320-wide
+         * blur buffer, rhw 0); drawn, it magnified the frozen frame's left
+         * half twice over into the buffer the next frame reads, and the
+         * background collapsed to its left edge and smeared. */
+        uint32_t v;
+        for (v = 0; v < nverts; v++)
+            if (attr[(v * stride + (uint32_t)slot[0]) * 4 + 3] != 0.0f)
+                break;
+        if (v == nverts)
+            return 1;
+    }
+
     if (!nidx || !nverts || !pbgpu_enabled())
         return 1;
     EnterCriticalSection(&s_lock);
