@@ -1255,6 +1255,39 @@ static void cap_poll(void)
             s_cap.last = NULL;
             s_cap.n = s_cap.draws = 0;
             fprintf(s_cap.log, "capture of flip %u\n", s_cap.flip);
+            {
+                /* RECOMP_CAP_FIND=<hex dword>[,<hex dword>]: guest RAM
+                 * addresses holding that dword (pair), to find which game
+                 * variable a value in the trace comes from. */
+                const char *f = getenv("RECOMP_CAP_FIND");
+                if (f) {
+                    extern uintptr_t g_xbox_mem_offset;
+                    char *e2;
+                    uint32_t a = (uint32_t)strtoul(f, &e2, 16), b = 0, va;
+                    int pair = *e2 == ',', hits = 0;
+                    if (pair)
+                        b = (uint32_t)strtoul(e2 + 1, NULL, 16);
+                    for (va = 0x10000; va < 0x04000000 && hits < 64; ) {
+                        MEMORY_BASIC_INFORMATION mi;
+                        uint8_t *p = (uint8_t *)(g_xbox_mem_offset + va);
+                        uint32_t len, k;
+                        if (!VirtualQuery(p, &mi, sizeof mi))
+                            break;
+                        len = (uint32_t)((uint8_t *)mi.BaseAddress + mi.RegionSize - p);
+                        if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                            for (k = 0; k + 8 <= len && hits < 64; k += 4)
+                                if (*(uint32_t *)(p + k) == a
+                                        && (!pair || *(uint32_t *)(p + k + 4) == b)) {
+                                    const uint32_t *q = (const uint32_t *)(p + k);
+                                    fprintf(s_cap.log, "  found %08X at %08X: %08X %08X [%08X] %08X %08X %08X\n",
+                                            a, va + k, k >= 8 ? q[-2] : 0, k >= 4 ? q[-1] : 0,
+                                            q[0], q[1], q[2], q[3]);
+                                    hits++;
+                                }
+                        va += len;
+                    }
+                }
+            }
             if (env_flip >= 0 && s_cap.flip == (uint32_t)env_flip)
                 env_flip = -1;                 /* the env trigger fires once */
         }
@@ -1863,6 +1896,39 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
         }
         fprintf(s_cap.log, "          c14 (%.3f %.3f %.3f %.3f) c15 (%.3f %.3f %.3f %.3f)\n",
                 c14[0], c14[1], c14[2], c14[3], c15[0], c15[1], c15[2], c15[3]);
+    }
+    if (s_cap.active && s_flip == s_cap.flip && s_cap.log && nverts > 8 && slot[0] >= 0) {
+        /* Larger draws: the extent of their positions (text, HUD). */
+        float lo[4] = { 1e30f, 1e30f, 1e30f, 1e30f }, hi[4] = { -1e30f, -1e30f, -1e30f, -1e30f };
+        uint32_t k, c;
+        for (k = 0; k < nverts; k++)
+            for (c = 0; c < 4; c++) {
+                float v = attr[(k * stride + (uint32_t)slot[0]) * 4 + c];
+                if (v < lo[c]) lo[c] = v;
+                if (v > hi[c]) hi[c] = v;
+            }
+        fprintf(s_cap.log, "          v0 min (%.1f %.1f %.1f %.1f) max (%.1f %.1f %.1f %.1f)\n",
+                lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]);
+        {
+            /* The program and its constants, once per program per capture. */
+            char path[300];
+            FILE *fp;
+            snprintf(path, sizeof path, "%sprog_%016llX.txt", s_cap.dir,
+                     (unsigned long long)nv2a_vsh_program_hash());
+            if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES
+                    && (fp = fopen(path, "w")) != NULL) {
+                static char body[96 * 1024];
+                int i;
+                if (nv2a_vsh_hlsl(body, sizeof body, NULL))
+                    fputs(body, fp);
+                for (i = 0; i < 192; i++) {
+                    const float *c = nv2a_vsh_constant(i);
+                    if (c[0] || c[1] || c[2] || c[3])
+                        fprintf(fp, "c%d = (%g %g %g %g)\n", i, c[0], c[1], c[2], c[3]);
+                }
+                fclose(fp);
+            }
+        }
     }
     if (!draw_begin(st, &s, &z))
         goto out;

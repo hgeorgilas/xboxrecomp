@@ -701,6 +701,13 @@ ULONG __stdcall xbox_AvGetSavedDataAddress(void)
     return g_av_saved_data_address;
 }
 
+/* The AV pack reported to the title: HDTV, or RECOMP_AV_PACK=<n>. */
+static ULONG av_pack(void)
+{
+    const char *e = getenv("RECOMP_AV_PACK");
+    return e ? (ULONG)strtoul(e, NULL, 0) : AV_PACK_HDTV;
+}
+
 VOID __stdcall xbox_AvSendTVEncoderOption(
     PVOID RegisterBase, ULONG Option, ULONG Param, PULONG Result)
 {
@@ -727,7 +734,7 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
          * HDTV pack keeps 480p/720p available to titles that offer them;
          * NTSC-M and 60Hz are the North American retail default, and match
          * the region reported by ExQueryNonVolatileSetting. */
-        *Result = AV_PACK_HDTV
+        *Result = av_pack()
                 | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
                 | AV_REFRESH_60Hz;
         break;
@@ -833,7 +840,7 @@ NTSTATUS __stdcall xbox_HalReadSMBusValue(
             break;
         case SMC_CMD_AV_PACK:
             /* HDTV/Component pack */
-            *DataValue = AV_PACK_HDTV;
+            *DataValue = av_pack();
             break;
         case SMC_CMD_CPU_TEMP:
             *DataValue = 40; /* 40 degrees C */
