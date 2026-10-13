@@ -445,32 +445,78 @@ static void ac97_arm_write_trap(void)
  *
  * RECOMP_DSP_ACK=0x804A8810[,...] -- up to 8 words, zeroed whenever non-zero.
  */
+/*
+ * Each entry may also be a pointer chain, re-evaluated on every poll:
+ *   RECOMP_DSP_ACK=[[[[[0x353664]+0x14]+8]+0x10]]+0x810
+ * "[x]" reads the dword at x, "+n"/"-n" adds. The doorbell lives in a
+ * DirectSound heap block, so a literal address is only right until anything
+ * allocated before it changes size -- on Spartan, replacing XInputOpen moved
+ * it by 0x8000 and the title hung in DirectSound init again. A chain from the
+ * title's own static IDirectSound pointer follows it wherever it lands.
+ */
 #define XBOX_MAX_DSP_ACK 8
-static uint32_t g_dsp_ack[XBOX_MAX_DSP_ACK];
+static char g_dsp_ack[XBOX_MAX_DSP_ACK][96];
 static int g_dsp_ack_count = 0;
+
+static int fence_readable(uint32_t va, uint32_t bytes);  /* defined below */
+
+/* Evaluate a pointer-chain expression: term := '[' term ']' | number, each
+ * followed by any number of +n / -n. Returns 0 if a dereference is not
+ * readable guest memory (e.g. the object is not allocated yet). */
+static int chain_eval(const char **pp, uint32_t *out)
+{
+    const char *p = *pp;
+    uint32_t v;
+
+    if (*p == '[') {
+        p++;
+        if (!chain_eval(&p, &v) || *p != ']')
+            return 0;
+        p++;
+        if (!fence_readable(v, 4))
+            return 0;
+        v = *(volatile uint32_t *)((uintptr_t)v + g_memory_offset);
+    } else {
+        char *end;
+        v = (uint32_t)strtoul(p, &end, 0);
+        if (end == p)
+            return 0;
+        p = end;
+    }
+    while (*p == '+' || *p == '-') {
+        char *end;
+        uint32_t n = (uint32_t)strtoul(p + 1, &end, 0);
+        if (end == p + 1)
+            return 0;
+        v = (*p == '+') ? v + n : v - n;
+        p = end;
+    }
+    *pp = p;
+    *out = v;
+    return 1;
+}
 
 static void dsp_ack_init(void)
 {
     const char *spec = getenv("RECOMP_DSP_ACK");
-    char buf[128], *q, *end;
+    const char *q;
 
     if (!spec || !*spec)
         return;
-    strncpy(buf, spec, sizeof buf - 1);
-    buf[sizeof buf - 1] = 0;
-    for (q = buf; *q && g_dsp_ack_count < XBOX_MAX_DSP_ACK; ) {
-        unsigned long va = strtoul(q, &end, 0);
-        if (end == q)
-            break;
-        g_dsp_ack[g_dsp_ack_count++] = (uint32_t)va;
-        q = (*end == ',') ? end + 1 : end;
+    for (q = spec; *q && g_dsp_ack_count < XBOX_MAX_DSP_ACK; ) {
+        size_t n = strcspn(q, ",");
+        size_t keep = n < sizeof g_dsp_ack[0] ? n : sizeof g_dsp_ack[0] - 1;
+        memcpy(g_dsp_ack[g_dsp_ack_count], q, keep);
+        g_dsp_ack[g_dsp_ack_count][keep] = 0;
+        g_dsp_ack_count++;
+        q += n;
+        if (*q == ',')
+            q++;
     }
     if (g_dsp_ack_count)
         fprintf(stderr, "  DSP ack: %d command word(s) will be completed"
-                        " immediately\n", g_dsp_ack_count);
+                        " immediately (%s)\n", g_dsp_ack_count, spec);
 }
-
-static int fence_readable(uint32_t va, uint32_t bytes);  /* defined below */
 
 /* Hold a guest global at a value. A bring-up probe, like the DSP ack.
  *
@@ -533,16 +579,23 @@ static void dsp_ack_tick(void)
     int i;
 
     for (i = 0; i < g_dsp_ack_count; i++) {
+        const char *p = g_dsp_ack[i];
+        uint32_t va;
         /* fence_readable rather than a bare bounds test: these land in the
          * contiguous window, which a plain size check against the main map
          * rejects. */
-        if (!fence_readable(g_dsp_ack[i], 4))
+        if (!chain_eval(&p, &va) || *p || !fence_readable(va, 4))
             continue;
         {
             volatile uint32_t *w = (volatile uint32_t *)
-                ((uintptr_t)g_dsp_ack[i] + g_memory_offset);
-            if (*w)
+                ((uintptr_t)va + g_memory_offset);
+            if (*w) {
+                static int shown[XBOX_MAX_DSP_ACK];
+                if (!shown[i]++)
+                    fprintf(stderr, "  DSP ack: %s -> 0x%08X (command %u)"
+                                    " completed\n", g_dsp_ack[i], va, *w);
                 *w = 0;
+            }
         }
     }
 }
@@ -1546,33 +1599,24 @@ void xbox_PeekSample(const char *label)
     buf[sizeof buf - 1] = 0;
     fprintf(stderr, "  %s:", label ? label : "peek");
     for (q = buf; *q; ) {
-        /* "[[0x006DF414]]+0x14" follows two pointers and adds an offset.
-         * The fields worth watching during bring-up are usually inside heap
-         * objects whose addresses change run to run but which are always
-         * reachable from a static one, and a peek that cannot follow a
-         * pointer cannot see them at all. */
-        unsigned derefs = 0, k;
-        unsigned long va;
+        /* Each entry is a pointer chain (chain_eval): "[[0x006DF414]]+0x14"
+         * follows two pointers and adds an offset, and offsets may sit
+         * between dereferences too: "[[[0x353664]+0x14]+8]". The fields worth
+         * watching during bring-up are usually inside heap objects whose
+         * addresses change run to run but which are always reachable from a
+         * static one, and a peek that cannot follow a pointer cannot see them
+         * at all. Same syntax as RECOMP_DSP_ACK. */
+        const char *p = q;
         uint32_t a;
-        int ok = 1;
 
-        while (*q == '[') { derefs++; q++; }
-        va = strtoul(q, &end, 0);
-        if (end == q)
-            break;
-        while (*end == ']')
-            end++;
-        a = (uint32_t)va;
-        for (k = 0; k < derefs && ok; k++) {
-            if (!peek_readable(a) || !(a = *(const uint32_t *)(mem + a)))
-                ok = 0;
-        }
-        if (*end == '+')
-            a += (uint32_t)strtoul(end + 1, &end, 0);
-        if (ok && peek_readable(a))
+        if (!chain_eval(&p, &a)) {
+            fprintf(stderr, " %.*s=??", (int)strcspn(q, ","), q);
+        } else if (peek_readable(a)) {
             fprintf(stderr, " [%08X]=%08X", a, *(const uint32_t *)(mem + a));
-        else
+        } else {
             fprintf(stderr, " [%08X]=??", a);
+        }
+        end = (char *)q + strcspn(q, ",");
         q = (*end == ',') ? end + 1 : end;
     }
     fprintf(stderr, "\n");
