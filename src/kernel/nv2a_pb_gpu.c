@@ -1036,10 +1036,75 @@ static void set_scissor(const PbGpuState *st, const Surface *s)
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &r);
 }
 
-/* Write a surface as it is on the GPU now to <RECOMP_RT_DUMP><name>.bmp. */
+/* Frame capture: every render target one frame draws to, in order, with
+ * the state it was drawn with, and each target as it stood when the frame
+ * moved on from it -- to find a pass landing on the wrong surface or
+ * sampling the wrong thing.
+ *
+ * F12 in the game window captures the next frame into capture\NNN\ under
+ * the working directory (trace.txt plus one BMP per pass);
+ * RECOMP_RT_TRACE=<flip> captures that flip without a key. */
+static struct {
+    int active;
+    uint32_t flip;
+    FILE *log;
+    char dir[260];
+    Surface *last;
+    unsigned n, draws;
+} s_cap;
+
+static void rt_dump(Surface *s, const char *name);
+
+static void cap_poll(void)
+{
+    extern int xbox_FramebufferKeyDown(int vk);
+    static int was, env_flip = -2;
+    int down = xbox_FramebufferKeyDown(VK_F12);
+
+    if (s_cap.active && s_flip >= s_cap.flip) {
+        if (s_cap.last) {
+            char name[64];
+            snprintf(name, sizeof name, "%02u_%08X_final", s_cap.n, s_cap.last->addr);
+            rt_dump(s_cap.last, name);
+            fprintf(s_cap.log, "  (%u draws)\n", s_cap.draws);
+        }
+        fclose(s_cap.log);
+        fprintf(stderr, "  [CAPTURE] frame written to %s\n", s_cap.dir);
+        s_cap.active = 0;
+    }
+    if (env_flip == -2) {
+        const char *e = getenv("RECOMP_RT_TRACE");
+        env_flip = e ? atoi(e) : -1;
+    }
+    if (!s_cap.active && ((down && !was)
+                          || (env_flip >= 0 && s_flip + 1 == (uint32_t)env_flip))) {
+        int i;
+        CreateDirectoryA("capture", NULL);
+        for (i = 0; i < 1000; i++) {
+            snprintf(s_cap.dir, sizeof s_cap.dir, "capture\\%03d\\", i);
+            if (CreateDirectoryA(s_cap.dir, NULL))
+                break;
+        }
+        {
+            char path[300];
+            snprintf(path, sizeof path, "%strace.txt", s_cap.dir);
+            s_cap.log = fopen(path, "w");
+        }
+        if (s_cap.log) {
+            s_cap.active = 1;
+            s_cap.flip = s_flip + 1;
+            s_cap.last = NULL;
+            s_cap.n = s_cap.draws = 0;
+            fprintf(s_cap.log, "capture of flip %u\n", s_cap.flip);
+        }
+    }
+    was = down;
+}
+
+/* Write a surface as it is on the GPU now to <capture dir><name>.bmp. */
 static void rt_dump(Surface *s, const char *name)
 {
-    const char *dir = getenv("RECOMP_RT_DUMP");
+    const char *dir = s_cap.active ? s_cap.dir : NULL;
     D3D11_MAPPED_SUBRESOURCE m;
     char path[512];
     FILE *fp;
@@ -1087,55 +1152,39 @@ static Surface *bind_target(const PbGpuState *st, Zeta **zout)
     vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     set_scissor(st, s);
-    {
-        /* RECOMP_RT_TRACE=<flip>: every target a frame draws to, in order,
-         * with what it samples -- to find a pass landing on the wrong one. */
-        static long trace_flip = -2;
-        static const Surface *last;
-        static unsigned n;
-        if (trace_flip == -2) {
-            const char *e = getenv("RECOMP_RT_TRACE");
-            trace_flip = e ? atol(e) : -1;
-        }
-        if (trace_flip >= 0 && s_flip >= (uint32_t)trace_flip
-            && s_flip <= (uint32_t)trace_flip + 1 && n < 400) {
-            if (s != last) {
-                n++;
-                if (last) {
-                    char name[64];
-                    snprintf(name, sizeof name, "rt%u_%02u_%08X", s_flip, n,
-                             ((Surface *)last)->addr);
-                    rt_dump((Surface *)last, name);
-                }
-                fprintf(stderr, "  [RT] flip %u -> %08X pitch %u clip %u,%u %ux%u"
-                        " (surf %ux%u) tex0 %08X %ux%u blend %u %X/%X z %08X%c",
-                        s_flip, st->surf_addr, st->surf_pitch, st->clip_x,
-                        st->clip_y, st->clip_w, st->clip_h, s->w, s->h,
-                        st->tex[0].valid ? st->tex[0].addr : 0,
-                        st->tex[0].width, st->tex[0].height, st->blend_enable,
-                        st->blend_sfactor, st->blend_dfactor, st->zeta_addr, 10);
-                {
-                    int k;
-                    fprintf(stderr, "  [RT]    fac0 %08X fac1 %08X fc0 %08X fc1 %08X%c",
-                            st->rc.factor0[0], st->rc.factor1[0], st->rc.final_c0,
-                            st->rc.final_c1, 10);
-                    fprintf(stderr, "  [RT]    rc %d stages %05X ctl-count %u", st->use_rc,
-                            st->rc.stage_program, st->rc.control & 0xF);
-                    for (k = 0; k < 4; k++)
-                        if (st->tex[k].valid)
-                            fprintf(stderr, " | t%d %08X %ux%u fmt %02X norm %d addr %u/%u"
-                                    " bm %.3f %.3f %.3f %.3f", k,
-                                    st->tex[k].addr, st->tex[k].width,
-                                    st->tex[k].height, st->tex[k].color,
-                                    st->tex[k].normalized, st->tex[k].addr_u,
-                                    st->tex[k].addr_v, st->tex[k].bump_mat[0],
-                                    st->tex[k].bump_mat[1], st->tex[k].bump_mat[2],
-                                    st->tex[k].bump_mat[3]);
-                    fprintf(stderr, "%c", 10);
-                }
+    if (s_cap.active && s_flip == s_cap.flip && s_cap.n < 400) {
+        FILE *lg = s_cap.log;
+        if (s != s_cap.last) {
+            int k;
+            if (s_cap.last) {
+                char name[64];
+                snprintf(name, sizeof name, "%02u_%08X", s_cap.n, s_cap.last->addr);
+                rt_dump(s_cap.last, name);
+                fprintf(lg, "  (%u draws)\n", s_cap.draws);
             }
-            last = s;
+            s_cap.n++;
+            s_cap.draws = 0;
+            fprintf(lg, "%02u -> %08X pitch %u clip %u,%u %ux%u (surf %ux%u) blend %u"
+                    " %X/%X eq %X z %08X ztest %u func %X zmask %u cmask %08X\n",
+                    s_cap.n, st->surf_addr, st->surf_pitch, st->clip_x, st->clip_y,
+                    st->clip_w, st->clip_h, s->w, s->h, st->blend_enable,
+                    st->blend_sfactor, st->blend_dfactor, st->blend_equation,
+                    st->zeta_addr, st->depth_test, st->depth_func, st->depth_mask,
+                    st->color_mask);
+            fprintf(lg, "     rc %d stages %05X combiners %u fac0 %08X fac1 %08X"
+                    " fc0 %08X fc1 %08X alphatest %u\n", st->use_rc,
+                    st->rc.stage_program, st->rc.control & 0xF, st->rc.factor0[0],
+                    st->rc.factor1[0], st->rc.final_c0, st->rc.final_c1,
+                    st->alpha_test);
+            for (k = 0; k < 4; k++)
+                if (st->tex[k].valid)
+                    fprintf(lg, "     t%d %08X %ux%u fmt %02X norm %d addr %u/%u\n", k,
+                            st->tex[k].addr, st->tex[k].width, st->tex[k].height,
+                            st->tex[k].color, st->tex[k].normalized,
+                            st->tex[k].addr_u, st->tex[k].addr_v);
         }
+        s_cap.last = s;
+        s_cap.draws++;
     }
     s->drawn_flip = s_flip;
     s->drawn = 1;
@@ -1368,6 +1417,7 @@ void pbgpu_readback(uint32_t addr)
 
 void pbgpu_flip(void)
 {
+    cap_poll();
     s_flip++;
 }
 

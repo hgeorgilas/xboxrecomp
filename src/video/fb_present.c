@@ -266,6 +266,42 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
+/* The frame, scaled to the window's client area at its own aspect ratio,
+ * centred, with the rest black. It used to be drawn 1:1 at the top-left, so
+ * a resized or DPI-scaled window showed it in a corner. */
+static void fb_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+{
+    RECT c;
+    int cw, ch, w, h, x, y;
+    GetClientRect(hwnd, &c);
+    cw = c.right - c.left;
+    ch = c.bottom - c.top;
+    if (cw <= 0 || ch <= 0)
+        return;
+    if ((long long)cw * s_fb_height > (long long)ch * s_fb_width) {
+        h = ch;
+        w = (int)((long long)ch * s_fb_width / s_fb_height);
+    } else {
+        w = cw;
+        h = (int)((long long)cw * s_fb_height / s_fb_width);
+    }
+    x = (cw - w) / 2;
+    y = (ch - h) / 2;
+    if (x > 0) {
+        PatBlt(hdc, 0, 0, x, ch, BLACKNESS);
+        PatBlt(hdc, x + w, 0, cw - x - w, ch, BLACKNESS);
+    }
+    if (y > 0) {
+        PatBlt(hdc, 0, 0, cw, y, BLACKNESS);
+        PatBlt(hdc, 0, y + h, cw, ch - y - h, BLACKNESS);
+    }
+    SetStretchBltMode(hdc, (w == (int)s_fb_width && h == (int)s_fb_height)
+                           ? COLORONCOLOR : HALFTONE);
+    SetBrushOrgEx(hdc, 0, 0, NULL);
+    StretchDIBits(hdc, x, y, w, h, 0, 0, (int)s_fb_width, (int)s_fb_height,
+                  s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
@@ -324,18 +360,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            fb_blit(hwnd, hdc, &bi);
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            fb_blit(hwnd, hdc, &bi);
         }
         {
             /* One dump a few seconds in, so the title has had time to render
