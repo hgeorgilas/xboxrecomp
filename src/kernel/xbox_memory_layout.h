@@ -192,6 +192,11 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
+/* Evaluate a guest pointer chain: "[x]" reads the dword at x, "+n"/"-n"
+ * adds, nested to any depth -- e.g. [[[0x353664]+0xC]+0x14]+8. The syntax
+ * RECOMP_DSP_ACK and RECOMP_PEEK accept. Returns 1 and sets *out on success. */
+int xbox_EvalChain(const char *expr, uint32_t *out);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**

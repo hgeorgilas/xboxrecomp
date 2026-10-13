@@ -496,6 +496,14 @@ static int chain_eval(const char **pp, uint32_t *out)
     return 1;
 }
 
+/* Public form, for the other RECOMP_* switches that name guest memory.
+ * Returns 0 if the expression is malformed or a dereference is unreadable. */
+int xbox_EvalChain(const char *expr, uint32_t *out)
+{
+    const char *p = expr;
+    return chain_eval(&p, out) && (*p == 0 || *p == ',');
+}
+
 static void dsp_ack_init(void)
 {
     const char *spec = getenv("RECOMP_DSP_ACK");

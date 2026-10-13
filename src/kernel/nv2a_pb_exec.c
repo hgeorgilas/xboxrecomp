@@ -3564,10 +3564,12 @@ static void peek_addresses(void)
     strncpy(buf, spec, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = 0;
     for (tok = strtok_s(buf, ",", &ctx); tok; tok = strtok_s(NULL, ",", &ctx)) {
-        uint32_t va = (uint32_t)strtoul(tok, NULL, 0);
-        uint32_t v;
+        uint32_t va, v;
         float f;
-        if (va < 0x1000u || va >= 0x04000000u)
+        /* Same pointer-chain syntax as the other RECOMP_PEEK reader. */
+        if (!xbox_EvalChain(tok, &va))
+            continue;
+        if (va < 0x1000u || (va >= 0x04000000u && (va < 0x80000000u || va >= 0x84000000u)))
             continue;
         v = *(const uint32_t *)(mem + va);
         memcpy(&f, &v, 4);
