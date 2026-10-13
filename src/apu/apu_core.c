@@ -383,37 +383,71 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
+    /* XAudio2 path.
+     *
+     * frame_buf holds what the emulated APU produced over the last eight VP
+     * frames (256 samples, written by mcpx_apu_dsp_frame). This used to
+     * clear it and send only the test tone and the software mixer, so every
+     * sound a title played through the real voice processor -- all of
+     * DirectSound -- was mixed, then wiped just before output: no audio at
+     * all. It also sent a 1024-sample buffer per 256 samples produced.
+     *
+     * Now the APU's samples stay, the test tone and software mixer add on
+     * top, and four monitor frames fill one XAudio2 buffer. The buffer is
+     * cleared once consumed, so a stretch where the VP did not run plays
+     * silence rather than repeating the last block. */
     if (xa2_is_active()) {
+        enum { MON = (int)(sizeof(d->monitor.frame_buf) / sizeof(d->monitor.frame_buf[0])) };
+        static int16_t stage[1024][2];          /* XA2_BUF_SAMPLES max */
+        static int fill;
         int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
 
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
+        if (buf_size > 1024)
+            buf_size = 1024;
+        if (g_audio_muted)
             memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        if (g_test_tone.active && !g_audio_muted) {
+            for (int i = 0; i < MON; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                d->monitor.frame_buf[i][0] = s;
+                d->monitor.frame_buf[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
+            }
+        }
+        if (!g_audio_muted)
+            mixer_render(d->monitor.frame_buf, MON);
 
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
+        for (int i = 0; i < MON && fill < buf_size; i++, fill++) {
+            stage[fill][0] = d->monitor.frame_buf[i][0];
+            stage[fill][1] = d->monitor.frame_buf[i][1];
+        }
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        if (fill >= buf_size) {
+            int ok = xa2_submit_samples((const int16_t *)stage, buf_size);
+            static int level = -1;
+            if (level < 0)
+                level = getenv("RECOMP_APU_LEVEL") != NULL;
+            if (level) {
+                /* RECOMP_APU_LEVEL: peak level of what goes to the speakers,
+                 * every ~2 s -- "is anything audible" without listening. */
+                static int peak, blocks, sent, dropped;
+                for (int i = 0; i < buf_size; i++) {
+                    int a = stage[i][0] < 0 ? -stage[i][0] : stage[i][0];
+                    int b = stage[i][1] < 0 ? -stage[i][1] : stage[i][1];
+                    if (a > peak) peak = a;
+                    if (b > peak) peak = b;
+                }
+                if (ok) sent++; else dropped++;
+                if (++blocks >= 94) {
+                    fprintf(stderr, "[APU-LEVEL] peak %d/32767 over %d buffers"
+                            " (%d sent, %d dropped)\n", peak, blocks, sent, dropped);
+                    peak = blocks = sent = dropped = 0;
                 }
             }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
+            fill = 0;
         }
-
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
         return;
     }
 
