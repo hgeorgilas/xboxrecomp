@@ -174,6 +174,21 @@ void panel()
                             xbox_InputActiveKind() ? "PlayStation" : "Xbox");
     }
 
+    ImGui::SeparatorText("Anti-aliasing");
+    {
+        static const char *names[] = { "Off", "FXAA (cheap)", "MSAA 2x", "MSAA 4x", "MSAA 8x" };
+        static const int values[] = { 0, 1, 2, 4, 8 };
+        int cur = xbox_setting_int("RECOMP_AA", 0), sel = 0;
+        for (int i = 0; i < 5; i++)
+            if (values[i] == cur)
+                sel = i;
+        if (ImGui::Combo("Anti-aliasing", &sel, names, 5))
+            set_int("RECOMP_AA", values[sel]);
+        ImGui::SetItemTooltip("Smooths jagged edges. FXAA is a cheap filter over the whole"
+                              " picture; MSAA is sharper but costs more, most at high"
+                              " resolutions.");
+    }
+
     ImGui::SeparatorText("Textures");
     {
         static const char *names[] = { "Off", "2x", "4x", "8x", "16x" };
