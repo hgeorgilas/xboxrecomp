@@ -172,9 +172,9 @@ enum {
 #define MAX_BIND 3
 
 static const struct { const char *name, *keys; } k_controls[C_COUNT] = {
-    { "A", "SPACE,ENTER" }, { "B", "E,BACKSPACE" }, { "X", "MOUSE1" },
-    { "Y", "MOUSE2" }, { "BLACK", "C" }, { "WHITE", "R" },
-    { "LT", "SHIFT" }, { "RT", "Q" }, { "START", "ESC" }, { "BACK", "TAB" },
+    { "A", "MOUSE2,ENTER" }, { "B", "E,BACKSPACE" }, { "X", "MOUSE1" },
+    { "Y", "SPACE" }, { "BLACK", "C" }, { "WHITE", "R" },
+    { "LT", "Q" }, { "RT", "SHIFT" }, { "START", "ESC" }, { "BACK", "TAB" },
     { "LS", "F" }, { "RS", "MOUSE3" },
     { "UP", "UP" }, { "DOWN", "DOWN" }, { "LEFT", "LEFT" }, { "RIGHT", "RIGHT" },
     { "MOVE_UP", "W" }, { "MOVE_DOWN", "S" }, { "MOVE_LEFT", "A" }, { "MOVE_RIGHT", "D" },
@@ -221,6 +221,62 @@ static void bindings_update(void)
     }
 }
 
+/* ---- the bindings, for a settings screen ----------------------------------
+ * Controls are listed in k_controls order. A title may name them for its
+ * own actions ("Jump", ...); otherwise the pad control's name is shown. */
+static const char *const *s_labels;
+
+void xbox_InputSetBindLabels(const char *const *labels)
+{
+    s_labels = labels;
+}
+
+int xbox_InputBindCount(void)
+{
+    return C_COUNT;
+}
+
+/* The setting that holds control i's keys, and its label. */
+const char *xbox_InputBindSetting(int i, char *buf, int n)
+{
+    snprintf(buf, (size_t)n, "RECOMP_BIND_%s", k_controls[i].name);
+    return buf;
+}
+
+const char *xbox_InputBindLabel(int i)
+{
+    return s_labels && s_labels[i] ? s_labels[i] : k_controls[i].name;
+}
+
+const char *xbox_InputBindDefault(int i)
+{
+    return k_controls[i].keys;
+}
+
+/* A key's name as the bindings write it, or NULL for one they cannot. */
+const char *xbox_InputKeyName(int vk)
+{
+    static char one[2];
+    size_t i;
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+        one[0] = (char)vk;
+        return one;
+    }
+    for (i = 0; i < sizeof k_keys / sizeof k_keys[0]; i++)
+        if (k_keys[i].vk == vk)
+            return k_keys[i].name;
+    return NULL;
+}
+
+/* The title screen is up (the game says so: settings_menu.c). Spartan's
+ * takes only Start, so there the confirm keys stand in for it. */
+static volatile LONG s_title_screen;
+
+void xbox_InputSetTitleScreen(int on)
+{
+    InterlockedExchange(&s_title_screen, on != 0);
+}
+
 static BOOL control_down(int c)
 {
     int i;
@@ -256,15 +312,27 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     static DWORD packet;
     WORD b = 0;
     int dx, dy;
+    /* At the title the confirm keys are Start, alone: with A held too the
+     * press is not taken. */
+    BOOL title = s_title_screen != 0;
+    /* ...and that press is the title's alone: held on, it would also be
+     * taken by the menu that follows, so it counts for nothing until the
+     * key is let go. */
+    static BOOL title_press;
+    BOOL confirm = control_down(C_A);
+    if (title && confirm)
+        title_press = TRUE;
+    else if (!confirm)
+        title_press = FALSE;
 
     bindings_update();
     memset(pState, 0, sizeof(*pState));
-
     if (control_down(C_UP))    b |= XBOX_GAMEPAD_DPAD_UP;
     if (control_down(C_DOWN))  b |= XBOX_GAMEPAD_DPAD_DOWN;
     if (control_down(C_LEFT))  b |= XBOX_GAMEPAD_DPAD_LEFT;
     if (control_down(C_RIGHT)) b |= XBOX_GAMEPAD_DPAD_RIGHT;
-    if (control_down(C_START)) b |= XBOX_GAMEPAD_START;
+    if (control_down(C_START) || (title && confirm))
+        b |= XBOX_GAMEPAD_START;
     if (control_down(C_BACK))  b |= XBOX_GAMEPAD_BACK;
     if (control_down(C_LS))    b |= XBOX_GAMEPAD_LEFT_THUMB;
     if (control_down(C_RS))    b |= XBOX_GAMEPAD_RIGHT_THUMB;
@@ -272,7 +340,7 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
 
     /* Analog on the console, so a key is 255 rather than a flag -- a title
      * that reads these as a pressure never sees a press if they are 1. */
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = control_down(C_A) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = confirm && !title_press ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = control_down(C_B) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = control_down(C_X) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = control_down(C_Y) ? 255 : 0;
@@ -291,6 +359,28 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     /* The title's input layer looks for button edges, so the packet number
      * has to move whenever the state does or a press is never noticed. */
     pState->dwPacketNumber = ++packet;
+}
+
+/* The keyboard and mouse on top of a pad's state: buttons and triggers
+ * added, sticks the keyboard's where it has a deflection. One merge for
+ * every kind of pad -- a Sony pad's used to leave the sticks out, so WASD
+ * did nothing with a DualSense plugged in. */
+static void merge_keyboard(XBOX_INPUT_STATE *st)
+{
+    XBOX_INPUT_STATE kb;
+    int i;
+    keyboard_state(&kb);
+    st->Gamepad.wButtons |= kb.Gamepad.wButtons;
+    for (i = 0; i < 8; i++)
+        if (kb.Gamepad.bAnalogButtons[i] > st->Gamepad.bAnalogButtons[i])
+            st->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
+    if (kb.Gamepad.sThumbLX) st->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
+    if (kb.Gamepad.sThumbLY) st->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
+    if (kb.Gamepad.sThumbRX) st->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
+    if (kb.Gamepad.sThumbRY) st->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
+    /* The input layer records edges, so an unchanged packet number is read
+     * as the same state and a change from the keyboard never happens. */
+    st->dwPacketNumber = kb.dwPacketNumber;
 }
 
 void xbox_InputInit(void)
@@ -336,20 +426,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
             /* The packet number is the pad's own; offset so a port that
              * changes source still sees it move. */
             pState->dwPacketNumber += 0x10000000u;
-            if (dwPort == 0 && keyboard_enabled()) {
-                XBOX_INPUT_STATE kb;
-                int i, any = 0;
-                keyboard_state(&kb);
-                pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
-                for (i = 0; i < 8; i++)
-                    if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
-                        pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
-                for (i = 0; i < 8; i++)
-                    any |= kb.Gamepad.bAnalogButtons[i] != 0;
-                /* A key press moves the packet number too. */
-                if (any || kb.Gamepad.wButtons)
-                    pState->dwPacketNumber = kb.dwPacketNumber;
-            }
+            if (dwPort == 0 && keyboard_enabled())
+                merge_keyboard(pState);
             return ERROR_SUCCESS;
         }
         if (dwPort == 0 && keyboard_enabled()) {
@@ -399,22 +477,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
      * Merging is also the better rule. A real pad keeps working -- its
      * buttons are already in pState and the keyboard only adds to them --
      * and there is no special case left to get wrong. */
-    if (dwPort == 0 && keyboard_enabled()) {
-        XBOX_INPUT_STATE kb;
-        int i;
-        keyboard_state(&kb);
-        pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
-        for (i = 0; i < 8; i++)
-            if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
-                pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
-        if (kb.Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
-        if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
-        if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
-        if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
-        /* The input layer records edges, so an unchanged packet number is
-         * read as the same state and the press never happens. */
-        pState->dwPacketNumber = kb.dwPacketNumber;
-    }
+    if (dwPort == 0 && keyboard_enabled())
+        merge_keyboard(pState);
 
     return ERROR_SUCCESS;
 }

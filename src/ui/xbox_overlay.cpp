@@ -36,6 +36,11 @@ int   xbox_settings_save(void);
 const char *xbox_settings_path(void);
 int   hidpad_count(void);
 int   xbox_InputActiveKind(void);
+int   xbox_InputBindCount(void);
+const char *xbox_InputBindSetting(int i, char *buf, int n);
+const char *xbox_InputBindLabel(int i);
+const char *xbox_InputBindDefault(int i);
+const char *xbox_InputKeyName(int vk);
 }
 
 namespace {
@@ -46,6 +51,9 @@ SRWLOCK g_qlock = SRWLOCK_INIT;
 Msg     g_q[512];
 int     g_qn;
 volatile LONG g_visible;
+volatile LONG g_capture = -1;  /* binding waiting for a key: control * 2 + slot */
+volatile LONG g_captured;      /* the key (or mouse button) pressed for it */
+volatile LONG g_show_binds;    /* opened to the key bindings */
 volatile LONG g_scan;          /* F9: dump every texture in memory */
 int     g_scan_found = -1;
 bool    g_ready;
@@ -68,6 +76,8 @@ void set_int(const char *key, int v)
     snprintf(b, sizeof b, "%d", v);
     xbox_setting_set(key, b);
 }
+
+void bindings();
 
 void panel()
 {
@@ -175,6 +185,16 @@ void panel()
                             : xbox_InputActiveKind() ? "PlayStation" : "Xbox");
     }
 
+    bool to_binds = InterlockedExchange(&g_show_binds, 0) != 0;
+    if (to_binds)
+        ImGui::SetNextItemOpen(true);
+    if (ImGui::CollapsingHeader("Keyboard and mouse controls")) {
+        if (to_binds)
+            ImGui::SetScrollHereY(0.0f);    /* the header at the top */
+        bindings();
+        ImGui::Spacing();
+    }
+
     ImGui::SeparatorText("Anti-aliasing");
     {
         static const char *names[] = { "Off", "FXAA (cheap)", "MSAA 2x", "MSAA 4x", "MSAA 8x" };
@@ -244,6 +264,95 @@ void panel()
         InterlockedExchange(&g_visible, 0);
 }
 
+/* A control's keys, as up to two names. */
+void binds_get(int c, char out[2][24])
+{
+    char key[40], list[96], *tok, *ctx = NULL;
+    const char *v;
+    int n = 0;
+    out[0][0] = out[1][0] = 0;
+    v = xbox_setting_get(xbox_InputBindSetting(c, key, sizeof key));
+    snprintf(list, sizeof list, "%s", v && *v ? v : xbox_InputBindDefault(c));
+    for (tok = strtok_s(list, ", ", &ctx); tok && n < 2; tok = strtok_s(NULL, ", ", &ctx))
+        if (_stricmp(tok, "NONE"))
+            snprintf(out[n++], 24, "%s", tok);
+}
+
+void binds_set(int c, char keys[2][24])
+{
+    char key[40], v[64];
+    if (keys[0][0] && keys[1][0] && _stricmp(keys[0], keys[1]))
+        snprintf(v, sizeof v, "%s,%s", keys[0], keys[1]);
+    else
+        snprintf(v, sizeof v, "%s", keys[0][0] ? keys[0] : keys[1][0] ? keys[1] : "NONE");
+    xbox_setting_set(xbox_InputBindSetting(c, key, sizeof key), v);
+}
+
+/* Keyboard and mouse: each control's two keys; click one, press the new. */
+void bindings()
+{
+    LONG cap = g_capture;
+    if (cap >= 0) {
+        LONG vk = InterlockedExchange(&g_captured, 0);
+        if (vk) {
+            int c = cap / 2, slot = cap % 2;
+            char keys[2][24];
+            const char *name = xbox_InputKeyName((int)vk);
+            if (vk == VK_ESCAPE) {
+                InterlockedExchange(&g_capture, -1);
+            } else if (vk == VK_DELETE || name) {
+                binds_get(c, keys);
+                snprintf(keys[slot], 24, "%s", vk == VK_DELETE ? "" : name);
+                binds_set(c, keys);
+                InterlockedExchange(&g_capture, -1);
+            }
+        }
+    }
+    if (g_capture >= 0)
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                           "Press a key or mouse button for \"%s\" (Esc cancels, Delete clears)",
+                           xbox_InputBindLabel((int)(g_capture / 2)));
+    else
+        ImGui::TextDisabled("Click a key to change it.");
+    if (ImGui::BeginTable("binds", 3, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 200.0f);
+        ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("Also", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableHeadersRow();
+        for (int c = 0; c < xbox_InputBindCount(); c++) {
+            char keys[2][24];
+            binds_get(c, keys);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(xbox_InputBindLabel(c));
+            for (int slot = 0; slot < 2; slot++) {
+                char id[48];
+                bool waiting = g_capture == c * 2 + slot;
+                ImGui::TableNextColumn();
+                snprintf(id, sizeof id, "%s##b%d_%d", waiting ? "..." : keys[slot][0] ? keys[slot]
+                         : "-", c, slot);
+                if (ImGui::Button(id, ImVec2(110.0f, 0))) {
+                    InterlockedExchange(&g_captured, 0);
+                    InterlockedExchange(&g_capture, c * 2 + slot);
+                }
+            }
+        }
+        ImGui::EndTable();
+    }
+    {
+        float sens = xbox_setting_float("RECOMP_MOUSE_SENS", 1.0f);
+        if (ImGui::SliderFloat("Mouse sensitivity", &sens, 0.25f, 4.0f, "%.2f"))
+            set_float("RECOMP_MOUSE_SENS", sens);
+    }
+    if (ImGui::Button("Reset to defaults")) {
+        for (int c = 0; c < xbox_InputBindCount(); c++) {
+            char key[40];
+            xbox_setting_set(xbox_InputBindSetting(c, key, sizeof key), "");
+        }
+        set_float("RECOMP_MOUSE_SENS", 1.0f);
+    }
+}
+
 void fps_corner()
 {
     ImGui::SetNextWindowPos(ImVec2(8, 8));
@@ -297,6 +406,22 @@ void xbox_overlay_init(HWND hwnd, ID3D11Device *dev, ID3D11DeviceContext *ctx)
 /* Window thread. Returns nonzero when the overlay takes the message. */
 int xbox_overlay_msg(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    if (g_visible && g_capture >= 0) {
+        LONG vk = 0;
+        switch (m) {
+        case WM_KEYDOWN: case WM_SYSKEYDOWN: vk = (LONG)w; break;
+        case WM_LBUTTONDOWN: vk = VK_LBUTTON; break;
+        case WM_RBUTTONDOWN: vk = VK_RBUTTON; break;
+        case WM_MBUTTONDOWN: vk = VK_MBUTTON; break;
+        case WM_XBUTTONDOWN:
+            vk = GET_XBUTTON_WPARAM(w) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2;
+            break;
+        }
+        if (vk) {
+            InterlockedExchange(&g_captured, vk);
+            return 1;
+        }
+    }
     if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30))) {
         InterlockedExchange(&g_scan, 1);
         return 1;
@@ -322,6 +447,13 @@ int xbox_overlay_msg(HWND h, UINT m, WPARAM w, LPARAM l)
     return g_visible && m != WM_KILLFOCUS && m != WM_SETFOCUS
            && (m == WM_KEYDOWN || m == WM_KEYUP || m == WM_CHAR
                || (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST));
+}
+
+/* Open the overlay at the key bindings (the game's own menu asks for it). */
+void xbox_overlay_show_bindings(void)
+{
+    InterlockedExchange(&g_show_binds, 1);
+    InterlockedExchange(&g_visible, 1);
 }
 
 int xbox_overlay_visible(void)

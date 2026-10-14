@@ -21,6 +21,7 @@ typedef struct {
     char key[64];
     char val[192];
     int  from_env;                  /* the environment overrode the file */
+    char file[192];                 /* then the file's value, which Save keeps */
 } Setting;
 
 static Setting s_set[SET_MAX];
@@ -86,6 +87,7 @@ void xbox_settings_load(const char *path)
         if (getenv(line)) {
             s->from_env = 1;
             strncpy(s->val, getenv(line), sizeof s->val - 1);
+            strncpy(s->file, eq + 1, sizeof s->file - 1);
             fprintf(stderr, "[SETTINGS] %s=%s from the environment (file says %s)\n",
                     line, s->val, eq + 1);
         } else {
@@ -122,6 +124,7 @@ void xbox_setting_set(const char *key, const char *val)
     if ((s = add(key)) != NULL) {
         strncpy(s->val, val, sizeof s->val - 1);
         s->val[sizeof s->val - 1] = 0;
+        s->from_env = 0;            /* changed here: this is what to save */
     }
     _putenv_s(key, val);
     ReleaseSRWLockExclusive(&s_lock);
@@ -144,8 +147,11 @@ int xbox_settings_save(void)
     fprintf(f, "# Settings, written by the in-game settings overlay (F1).\n"
                "# KEY=VALUE; a variable set in the environment overrides a line here.\n");
     AcquireSRWLockShared(&s_lock);
+    /* A value the environment overrode, and nothing changed since, goes
+     * back as the file had it: a launcher's one-off is not a setting. */
     for (i = 0; i < s_n; i++)
-        fprintf(f, "%s=%s\n", s_set[i].key, s_set[i].val);
+        fprintf(f, "%s=%s\n", s_set[i].key,
+                s_set[i].from_env ? s_set[i].file : s_set[i].val);
     ReleaseSRWLockShared(&s_lock);
     fclose(f);
     fprintf(stderr, "[SETTINGS] saved %d setting(s) to %s\n", s_n, s_path);

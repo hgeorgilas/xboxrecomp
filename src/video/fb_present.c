@@ -301,7 +301,8 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_SETCURSOR:
         if (LOWORD(l) == HTCLIENT) {
             extern int xbox_setting_int(const char *key, int def);
-            if (xbox_setting_int("RECOMP_KEYBOARD", 1)) {
+            extern int xbox_overlay_visible(void);
+            if (xbox_setting_int("RECOMP_KEYBOARD", 1) && !xbox_overlay_visible()) {
                 SetCursor(NULL);
                 return TRUE;
             }
