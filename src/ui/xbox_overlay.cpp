@@ -97,18 +97,18 @@ void panel()
             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Applies after a restart.");
     }
     {
-        static const char *names[] = { "1x (480p, original)", "1.5x (720p)", "2.25x (1080p)",
-                                       "3x (1440p)", "4.5x (2160p / 4K)" };
-        static const float values[] = { 1.0f, 1.5f, 2.25f, 3.0f, 4.5f };
-        float cur = xbox_setting_float("RECOMP_RES_SCALE", 1.0f);
+        static const char *names[] = { "Match window", "480p (original)", "720p", "1080p",
+                                       "1440p", "4K (2160p)" };
+        static const float values[] = { 0.0f, 1.0f, 1.5f, 2.25f, 3.0f, 4.5f };
+        float cur = xbox_setting_float("RECOMP_RES_SCALE", 0.0f);
         int sel = 0;
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < 6; i++)
             if (fabsf(cur - values[i]) < 0.01f)
                 sel = i;
-        if (ImGui::Combo("Internal resolution", &sel, names, 5))
+        if (ImGui::Combo("Resolution", &sel, names, 6))
             set_float("RECOMP_RES_SCALE", values[sel]);
-        ImGui::SetItemTooltip("Renders the game at a multiple of 640x480 (wider in"
-                              " widescreen). Higher is sharper and smoother edges.");
+        ImGui::SetItemTooltip("The height the game is rendered at (wider in widescreen)."
+                              " Match window renders at the window's own resolution.");
     }
     {
         bool fill = xbox_setting_int("RECOMP_SAFE_AREA_FILL", 1) != 0;

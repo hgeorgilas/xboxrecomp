@@ -277,16 +277,26 @@ static void surf_release(Surface *s)
 extern float xbox_DisplayAspect(void);
 extern float xbox_setting_float(const char *key, float def);
 static float s_res_sx = 1, s_res_sy = 1;
+static volatile UINT s_window_h;        /* client height at the last present */
+static int s_res_auto;
 
+/* RECOMP_RES_SCALE 0 (the default) matches the window: the scale that makes
+ * the picture's height the window's, followed as the window is resized. */
 static void res_update(void)
 {
     static long gen;
+    static UINT match_h;
     float sc, a, sx, sy;
     int i;
-    if (gen == xbox_settings_gen())
+    if (gen == xbox_settings_gen() && (s_res_auto == 0 || match_h == s_window_h))
         return;
     gen = xbox_settings_gen();
-    sc = xbox_setting_float("RECOMP_RES_SCALE", 1.0f);
+    sc = xbox_setting_float("RECOMP_RES_SCALE", 0.0f);
+    s_res_auto = sc <= 0;
+    if (s_res_auto) {
+        match_h = s_window_h;
+        sc = match_h ? (float)match_h / 480.0f : 1.0f;
+    }
     sc = sc < 1 ? 1 : sc > 6 ? 6 : sc;
     a = xbox_DisplayAspect();
     sx = sc * (a > 4.0f / 3.0f ? a * 0.75f : 1.0f);
@@ -2749,6 +2759,7 @@ int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height)
         /* The largest box of the display aspect in the window. */
         vp.Height = (float)cw / aspect < (float)ch ? (float)cw / aspect : (float)ch;
         vp.Width = vp.Height * aspect;
+        s_window_h = (UINT)(vp.Height + 0.5f);      /* for "match window" */
         vp.TopLeftX = ((float)cw - vp.Width) * 0.5f;
         vp.TopLeftY = ((float)ch - vp.Height) * 0.5f;
         vp.MinDepth = 0;
