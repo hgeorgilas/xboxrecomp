@@ -215,25 +215,36 @@ void xbox_FramebufferSetFullscreen(int on)
  * (Alt+Tab). Re-applied a few times a second, since Windows drops a clip
  * whenever the focus changes. */
 static volatile LONG s_sizing;
+static int s_pinned;
+
+/* Let go now, from the window procedure: the loop that pins may not run
+ * again before the pointer is wanted elsewhere (Windows' Alt menu handling
+ * runs a loop of its own). */
+static void unpin_cursor(void)
+{
+    if (s_pinned) {
+        ClipCursor(NULL);
+        s_pinned = 0;
+    }
+}
 
 static void pin_cursor(HWND h)
 {
     extern int xbox_setting_int(const char *key, int def);
     extern int xbox_overlay_visible(void);
-    static int pinned;
     static DWORD last;
     RECT rc;
+    /* Not while Alt is held: Alt+Tab and the other Alt keys get the pointer
+     * back at once. */
     int want = GetForegroundWindow() == h && !IsIconic(h) && !s_sizing
+            && !s_key_down[VK_MENU] && !s_key_down[VK_LMENU] && !s_key_down[VK_RMENU]
             && xbox_setting_int("RECOMP_KEYBOARD", 1) && !xbox_overlay_visible()
             && GetClientRect(h, &rc) && rc.right > 0 && rc.bottom > 0;
     if (!want) {
-        if (pinned) {
-            ClipCursor(NULL);
-            pinned = 0;
-        }
+        unpin_cursor();
         return;
     }
-    if (pinned && GetTickCount() - last < 250)
+    if (s_pinned && GetTickCount() - last < 250)
         return;
     {
         POINT c = { rc.right / 2, rc.bottom / 2 };
@@ -241,7 +252,7 @@ static void pin_cursor(HWND h)
         ClientToScreen(h, &c);
         pin.left = c.x; pin.top = c.y; pin.right = c.x + 1; pin.bottom = c.y + 1;
         ClipCursor(&pin);
-        pinned = 1;
+        s_pinned = 1;
         last = GetTickCount();
     }
 }
@@ -251,8 +262,14 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     if (m == WM_ENTERSIZEMOVE || m == WM_EXITSIZEMOVE) {
         InterlockedExchange(&s_sizing, m == WM_ENTERSIZEMOVE);
         if (m == WM_ENTERSIZEMOVE)
-            ClipCursor(NULL);
+            unpin_cursor();
     }
+    /* The pointer goes back the moment Alt goes down or the focus goes. */
+    if (((m == WM_SYSKEYDOWN || m == WM_KEYDOWN) && w == VK_MENU)
+            || m == WM_KILLFOCUS || m == WM_ENTERMENULOOP
+            || (m == WM_ACTIVATE && LOWORD(w) == WA_INACTIVE)
+            || (m == WM_ACTIVATEAPP && !w))
+        unpin_cursor();
     if (m == WM_FB_FULLSCREEN) {
         fb_set_fullscreen(h, (int)w);
         return 0;
