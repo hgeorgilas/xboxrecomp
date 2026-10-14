@@ -572,6 +572,8 @@ typedef struct {
 extern uint64_t texpack_key(const uint32_t *px, uint32_t w, uint32_t h, uint32_t fmt);
 extern void texpack_dump(uint64_t key, const uint32_t *px, uint32_t w, uint32_t h, uint32_t fmt);
 extern int  texpack_lookup(uint64_t key, uint32_t **px, uint32_t *w, uint32_t *h);
+extern int  texpack_prompt(uint64_t key, const uint32_t *orig, uint32_t w, uint32_t h,
+                           uint32_t **px, uint32_t *ow, uint32_t *oh);
 extern void texpack_free(uint32_t *px);
 extern int  texpack_use_changed(void);
 
@@ -642,7 +644,10 @@ static int tex_upload(TexEntry *e, const PbGpuTexture *t)
         int r;
         e->pack_key = texpack_key(px, w, h, t->color);
         texpack_dump(e->pack_key, px, w, h, t->color);
-        r = texpack_lookup(e->pack_key, &rpx, &rw, &rh);
+        /* A texture that draws controller buttons, with the set in use. */
+        r = texpack_prompt(e->pack_key, px, w, h, &rpx, &rw, &rh);
+        if (r != 1)
+            r = texpack_lookup(e->pack_key, &rpx, &rw, &rh);
         if (r == 1) {
             int ok = tex_create(e, rpx, rw, rh, 1, t->normalized, 0);
             texpack_free(rpx);

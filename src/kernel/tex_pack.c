@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -36,17 +37,16 @@ extern int xbox_setting_int(const char *key, int def);
 #define DUMP_DIR    "textures\\dump\\"
 #define REPL_DIR    "textures\\replace\\"
 
-/* Button prompts: textures/prompts/<style>/ holds replacements, named like
- * the pack's, for the textures that draw controller buttons -- one set per
- * pad family. RECOMP_BUTTON_PROMPTS picks the set: "auto" (the default)
- * follows the pad last used, the title's own art for an Xbox pad and the
- * PlayStation set for a DualShock/DualSense; "original", "xbox" and
- * "playstation" fix it. They sit in the replacement set under the texture's
- * key salted with the style, and apply with the HD pack on or off. */
+/* Button prompts: one icon set per device, drawn onto the textures that draw
+ * controller buttons as they load (texpack_prompt, below).
+ * RECOMP_BUTTON_PROMPTS picks the set: "auto" (the default) follows the
+ * device last used -- the title's own art for an Xbox pad, the PlayStation
+ * set for a DualShock/DualSense, the keyboard's for keys and mouse;
+ * "original", "xbox", "playstation" and "keyboard" fix it. Applies with the
+ * HD pack on or off. (Ready-made replacements under a per-set folder, salted
+ * keys, were the first way; s_prompt_dir lists none now.) */
 enum { PROMPT_ORIGINAL, PROMPT_XBOX, PROMPT_PLAYSTATION, PROMPT_KEYBOARD, PROMPT_STYLES };
-static const char *const s_prompt_dir[PROMPT_STYLES] = {
-    NULL, "textures\\prompts\\xbox\\", "textures\\prompts\\playstation\\",
-    "textures\\prompts\\keyboard\\" };
+static const char *const s_prompt_dir[PROMPT_STYLES] = { NULL, NULL, NULL, NULL };
 #define PROMPT_KEY(k, style) ((k) ^ (0xB077011CDA5E0000ull * (uint64_t)(style)))
 static int s_prompt;            /* the style in force */
 
@@ -381,6 +381,230 @@ int texpack_lookup(uint64_t key, uint32_t **px, uint32_t *w, uint32_t *h)
         }
     }
     return r;
+}
+
+/* ---- button prompts, drawn onto the title's textures as they load ---------
+ *
+ * prompts\layout.txt (beside the working directory) names the textures
+ * that draw controller buttons, by their pack hash, and where each button
+ * sits in them; prompts\<set>\<button>.png are the icons, and
+ * prompts\<set>\<HASH>_<button>.png one texture's own (the menus' OK and
+ * Back are Enter and Backspace on the keyboard). Each sprite is found by the
+ * original's alpha in its search box, cleared, and the icon drawn centred on
+ * it, scaled uniformly to the sprite's height and at most its width plus the
+ * layout's extra pixels. Onto the HD pack's version when there is one, else
+ * the original at four times its size, so the icons are sharp either way.
+ * Nothing of the title's is shipped: only the icons and where they go. */
+
+#define PROMPT_ICONS "prompts\\"
+
+typedef struct { char button[8]; int l, t, r, b, grow; } PSprite;
+typedef struct { uint64_t key; int n; PSprite s[16]; } PTex;
+static PTex s_ptex[8];
+static int s_nptex = -1;
+static const char *const s_prompt_set[PROMPT_STYLES] = { NULL, "xbox", "playstation", "keyboard" };
+
+static void prompt_layout(void)
+{
+    FILE *f;
+    char line[256];
+    PTex *cur = NULL;
+    s_nptex = 0;
+    if (!(f = fopen(PROMPT_ICONS "layout.txt", "r")))
+        return;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long k;
+        PSprite sp;
+        if (line[0] == '#')
+            continue;
+        if (sscanf(line, "texture %llx", &k) == 1) {
+            cur = s_nptex < 8 ? &s_ptex[s_nptex++] : NULL;
+            if (cur) {
+                cur->key = k;
+                cur->n = 0;
+            }
+        } else if (cur && cur->n < 16 && sscanf(line, "%7s %d %d %d %d %d", sp.button,
+                                                &sp.l, &sp.t, &sp.r, &sp.b, &sp.grow) == 6) {
+            cur->s[cur->n++] = sp;
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "  [TEXPACK] button prompts: %d texture(s) in %slayout.txt\n",
+            s_nptex, PROMPT_ICONS);
+}
+
+/* RGBA bytes at (x, y) in pixel units, bilinear, premultiplied. */
+static void icon_sample(const uint8_t *img, int w, int h, float x, float y, float o[4])
+{
+    int x0 = (int)floorf(x - 0.5f), y0 = (int)floorf(y - 0.5f), dx, dy;
+    float fx = x - 0.5f - (float)x0, fy = y - 0.5f - (float)y0;
+    o[0] = o[1] = o[2] = o[3] = 0;
+    for (dy = 0; dy < 2; dy++)
+        for (dx = 0; dx < 2; dx++) {
+            int xi = x0 + dx, yi = y0 + dy;
+            float wt = (dx ? fx : 1 - fx) * (dy ? fy : 1 - fy), a;
+            const uint8_t *p;
+            xi = xi < 0 ? 0 : xi >= w ? w - 1 : xi;
+            yi = yi < 0 ? 0 : yi >= h ? h - 1 : yi;
+            p = img + ((size_t)yi * w + xi) * 4;
+            a = p[3] / 255.0f * wt;
+            o[0] += p[0] * a; o[1] += p[1] * a; o[2] += p[2] * a; o[3] += a;
+        }
+}
+
+/* The icon over dst (BGRA, straight alpha) at x0, y0, scaled to dw x dh:
+ * 4x4 samples a pixel, alpha "over". */
+static void icon_draw(uint32_t *dst, uint32_t W, uint32_t H, const uint8_t *img, int iw, int ih,
+                      int x0, int y0, int dw, int dh)
+{
+    int i, j, s, t;
+    for (j = 0; j < dh; j++) {
+        int y = y0 + j;
+        if (y < 0 || y >= (int)H)
+            continue;
+        for (i = 0; i < dw; i++) {
+            int x = x0 + i;
+            float c[4] = { 0, 0, 0, 0 }, o[4], da, oa, r, g, b;
+            uint32_t d;
+            if (x < 0 || x >= (int)W)
+                continue;
+            for (t = 0; t < 4; t++)
+                for (s = 0; s < 4; s++) {
+                    icon_sample(img, iw, ih, ((float)i + (s + 0.5f) / 4) * iw / dw,
+                                ((float)j + (t + 0.5f) / 4) * ih / dh, o);
+                    c[0] += o[0]; c[1] += o[1]; c[2] += o[2]; c[3] += o[3];
+                }
+            c[0] /= 16; c[1] /= 16; c[2] /= 16; c[3] /= 16;
+            if (c[3] <= 0)
+                continue;
+            d = dst[(size_t)y * W + x];
+            da = (d >> 24) / 255.0f;
+            oa = c[3] + da * (1 - c[3]);
+            r = (c[0] + ((d >> 16) & 0xFF) * da * (1 - c[3])) / oa;
+            g = (c[1] + ((d >> 8) & 0xFF) * da * (1 - c[3])) / oa;
+            b = (c[2] + (d & 0xFF) * da * (1 - c[3])) / oa;
+            dst[(size_t)y * W + x] = ((uint32_t)(oa * 255 + 0.5f) << 24)
+                | ((uint32_t)(r > 255 ? 255 : r + 0.5f) << 16)
+                | ((uint32_t)(g > 255 ? 255 : g + 0.5f) << 8) | (uint32_t)(b > 255 ? 255 : b + 0.5f);
+        }
+    }
+}
+
+/* 1: *px (BGRA, free with texpack_free) is the texture with the buttons of
+ * the set in use drawn on; 0: not a button texture, or the title's own
+ * buttons are wanted. orig: the texture as decoded (BGRA). */
+int texpack_prompt(uint64_t key, const uint32_t *orig, uint32_t w, uint32_t h,
+                   uint32_t **px, uint32_t *ow, uint32_t *oh)
+{
+    const PTex *pt = NULL;
+    uint32_t *base = NULL, bw = 0, bh = 0, x, y;
+    const char *set;
+    float k;
+    int i;
+
+    init();
+    if (!s_prompt || !(set = s_prompt_set[s_prompt]))
+        return 0;
+    if (s_nptex < 0)
+        prompt_layout();
+    for (i = 0; i < s_nptex; i++)
+        if (s_ptex[i].key == key)
+            pt = &s_ptex[i];
+    if (!pt)
+        return 0;
+
+    /* The HD pack's version, else the original at 4x. */
+    if (s_use) {
+        char path[MAX_PATH];
+        Slot *sl;
+        path[0] = 0;
+        AcquireSRWLockShared(&s_lock);
+        if ((sl = set_find(&s_repl, key, 0)) != NULL && sl->path)
+            strncpy(path, sl->path, sizeof path - 1);
+        ReleaseSRWLockShared(&s_lock);
+        if (path[0]) {
+            int iw, ih, n;
+            uint32_t *p = (uint32_t *)stbi_load(path, &iw, &ih, &n, 4);
+            if (p && iw >= (int)w && ih >= (int)h) {
+                for (x = 0; x < (uint32_t)(iw * ih); x++) {
+                    uint32_t c = p[x];
+                    p[x] = (c & 0xFF00FF00u) | ((c >> 16) & 0xFF) | ((c & 0xFF) << 16);
+                }
+                base = p; bw = (uint32_t)iw; bh = (uint32_t)ih;
+            } else if (p) {
+                stbi_image_free(p);
+            }
+        }
+    }
+    if (!base) {
+        bw = w * 4; bh = h * 4;
+        if (!(base = (uint32_t *)malloc((size_t)bw * bh * 4)))
+            return 0;
+        for (y = 0; y < bh; y++)
+            for (x = 0; x < bw; x++) {
+                /* Bilinear on the straight BGRA channels. */
+                float sx = (x + 0.5f) / 4 - 0.5f, sy = (y + 0.5f) / 4 - 0.5f, v[4] = { 0, 0, 0, 0 };
+                int x0 = (int)floorf(sx), y0 = (int)floorf(sy), dx, dy, ch;
+                float fx = sx - x0, fy = sy - y0;
+                for (dy = 0; dy < 2; dy++)
+                    for (dx = 0; dx < 2; dx++) {
+                        int xi = x0 + dx, yi = y0 + dy;
+                        float wt = (dx ? fx : 1 - fx) * (dy ? fy : 1 - fy);
+                        uint32_t c;
+                        xi = xi < 0 ? 0 : xi >= (int)w ? (int)w - 1 : xi;
+                        yi = yi < 0 ? 0 : yi >= (int)h ? (int)h - 1 : yi;
+                        c = orig[(size_t)yi * w + xi];
+                        for (ch = 0; ch < 4; ch++)
+                            v[ch] += ((c >> (8 * ch)) & 0xFF) * wt;
+                    }
+                base[(size_t)y * bw + x] = (uint32_t)(v[0] + 0.5f) | ((uint32_t)(v[1] + 0.5f) << 8)
+                    | ((uint32_t)(v[2] + 0.5f) << 16) | ((uint32_t)(v[3] + 0.5f) << 24);
+            }
+    }
+    k = (float)bw / (float)w;
+
+    for (i = 0; i < pt->n; i++) {
+        const PSprite *sp = &pt->s[i];
+        int l = 1 << 30, t = 1 << 30, r = -1, b = -1, iw, ih, n, dw, dh, sx, sy;
+        char path[MAX_PATH];
+        uint8_t *img;
+        float fit, cx, cy;
+        /* The sprite: what is opaque in its search box. */
+        for (sy = sp->t; sy < sp->b && sy < (int)h; sy++)
+            for (sx = sp->l; sx < sp->r && sx < (int)w; sx++)
+                if ((orig[(size_t)sy * w + sx] >> 24) > 40) {
+                    if (sx < l) l = sx;
+                    if (sy < t) t = sy;
+                    if (sx + 1 > r) r = sx + 1;
+                    if (sy + 1 > b) b = sy + 1;
+                }
+        if (r < 0)
+            continue;
+        snprintf(path, sizeof path, PROMPT_ICONS "%s\\%016llX_%s.png", set,
+                 (unsigned long long)key, sp->button);
+        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+            snprintf(path, sizeof path, PROMPT_ICONS "%s\\%s.png", set, sp->button);
+        if (!(img = stbi_load(path, &iw, &ih, &n, 4)))
+            continue;
+        /* Clear the old sprite: a round icon on an oval gem would leave
+         * the gem's ends showing. */
+        for (sy = (int)(t * k + 0.5f); sy < (int)(b * k + 0.5f) && sy < (int)bh; sy++)
+            for (sx = (int)(l * k + 0.5f); sx < (int)(r * k + 0.5f) && sx < (int)bw; sx++)
+                base[(size_t)sy * bw + sx] = 0;
+        fit = (r - l + sp->grow) * k / iw;
+        if ((b - t) * k / ih < fit)
+            fit = (b - t) * k / ih;
+        dw = (int)(iw * fit + 0.5f);
+        dh = (int)(ih * fit + 0.5f);
+        cx = (l + r) / 2.0f * k;
+        cy = (t + b) / 2.0f * k;
+        if (dw > 0 && dh > 0)
+            icon_draw(base, bw, bh, img, iw, ih, (int)floorf(cx - dw / 2.0f + 0.5f),
+                      (int)floorf(cy - dh / 2.0f + 0.5f), dw, dh);
+        stbi_image_free(img);
+    }
+    *px = base; *ow = bw; *oh = bh;
+    return 1;
 }
 
 /* The prompt style as a folder name under mods\ (kernel_path.c), where a
