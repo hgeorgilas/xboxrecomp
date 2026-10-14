@@ -162,3 +162,53 @@ const char *xbox_settings_path(void)
 {
     return s_path;
 }
+
+/* ---- title quirks ------------------------------------------------------------
+ *
+ * Behaviour one title needs and another would not want, off unless the game
+ * project turns it on (from main, before the title starts):
+ *
+ *   xbox_SetQuirk("ui_bottom_nudge", 5)    2D drawn wholly in the bottom
+ *                                          bar (below 84% of the height) moves
+ *                                          down that many lines (at 480), once
+ *                                          the 2D layer fills the screen
+ *   xbox_SetQuirk("drop_wide_rhw0", 1)     drop a batch of pre-transformed
+ *                                          vertices that all have RHW 0 and
+ *                                          reach past the right of the target
+ *   xbox_SetQuirk("bloom_composites", 1)   RHW-0 composites blended onto the
+ *                                          frame (src alpha with one, or with
+ *                                          1 - src alpha) are the bloom, which
+ *                                          RECOMP_BLOOM (0..1) scales; also
+ *                                          shows the overlay's Bloom slider
+ *
+ * Unknown names are kept too, so a quirk can be read before its user is. */
+#define QUIRK_MAX 32
+
+static struct { char name[32]; float value; } s_quirk[QUIRK_MAX];
+static int s_nquirk;
+
+void xbox_SetQuirk(const char *name, float value)
+{
+    int i;
+    for (i = 0; i < s_nquirk; i++)
+        if (!strcmp(s_quirk[i].name, name)) {
+            s_quirk[i].value = value;
+            return;
+        }
+    if (s_nquirk < QUIRK_MAX) {
+        strncpy(s_quirk[s_nquirk].name, name, sizeof s_quirk[0].name - 1);
+        s_quirk[s_nquirk].value = value;
+        s_nquirk++;
+        fprintf(stderr, "[SETTINGS] quirk %s = %g\n", name, value);
+    }
+}
+
+/* The quirk's value, 0 if the title did not set it. */
+float xbox_Quirk(const char *name)
+{
+    int i;
+    for (i = 0; i < s_nquirk; i++)
+        if (!strcmp(s_quirk[i].name, name))
+            return s_quirk[i].value;
+    return 0.0f;
+}

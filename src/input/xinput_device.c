@@ -187,16 +187,38 @@ enum {
 };
 #define MAX_BIND 3
 
+/* A generic layout; a title sets its own with xbox_InputSetDefaultBinding
+ * (Spartan's: spartan/src/settings_menu.c). */
 static const struct { const char *name, *keys; } k_controls[C_COUNT] = {
-    { "A", "MOUSE1,ENTER" }, { "B", "E,BACKSPACE" }, { "X", "Q" },
-    { "Y", "SPACE" }, { "BLACK", "C" }, { "WHITE", "R" },
-    { "LT", "MOUSE2" }, { "RT", "SHIFT" }, { "START", "ESC" }, { "BACK", "TAB" },
-    { "LS", "F" }, { "RS", "MOUSE3" },
+    { "A", "SPACE,ENTER" }, { "B", "BACKSPACE" }, { "X", "MOUSE1" },
+    { "Y", "MOUSE2" }, { "BLACK", "C" }, { "WHITE", "R" },
+    { "LT", "Q" }, { "RT", "E" }, { "START", "ESC" }, { "BACK", "TAB" },
+    { "LS", "SHIFT" }, { "RS", "MOUSE3" },
     { "UP", "UP" }, { "DOWN", "DOWN" }, { "LEFT", "LEFT" }, { "RIGHT", "RIGHT" },
     { "MOVE_UP", "W" }, { "MOVE_DOWN", "S" }, { "MOVE_LEFT", "A" }, { "MOVE_RIGHT", "D" },
 };
 
 static int s_bind[C_COUNT][MAX_BIND];
+static const char *s_default[C_COUNT];          /* the title's, over k_controls */
+static volatile LONG s_default_gen;
+
+static const char *default_keys(int c)
+{
+    return s_default[c] ? s_default[c] : k_controls[c].keys;
+}
+
+/* A title's own default keys for a control ("A", "LT", "MOVE_UP", ...; keys
+ * as the settings write them, "MOUSE1,ENTER"). The string must stay valid. */
+void xbox_InputSetDefaultBinding(const char *control, const char *keys)
+{
+    int c;
+    for (c = 0; c < C_COUNT; c++)
+        if (!_stricmp(control, k_controls[c].name)) {
+            s_default[c] = keys;
+            InterlockedIncrement(&s_default_gen);
+            return;
+        }
+}
 
 static int key_code(const char *name)
 {
@@ -215,17 +237,18 @@ static void bindings_update(void)
 {
     extern const char *xbox_setting_get(const char *key);
     extern long xbox_settings_gen(void);
-    static long gen = -1;
+    static long gen = -1, dgen = -1;
     int c, n;
-    if (gen == xbox_settings_gen())
+    if (gen == xbox_settings_gen() && dgen == s_default_gen)
         return;
     gen = xbox_settings_gen();
+    dgen = s_default_gen;
     for (c = 0; c < C_COUNT; c++) {
         char key[40], list[96], *tok, *ctx = NULL;
         const char *v;
         snprintf(key, sizeof key, "RECOMP_BIND_%s", k_controls[c].name);
         v = xbox_setting_get(key);
-        strncpy(list, v && *v ? v : k_controls[c].keys, sizeof list - 1);
+        strncpy(list, v && *v ? v : default_keys(c), sizeof list - 1);
         list[sizeof list - 1] = 0;
         _strupr(list);
         memset(s_bind[c], 0, sizeof s_bind[c]);
@@ -266,7 +289,7 @@ const char *xbox_InputBindLabel(int i)
 
 const char *xbox_InputBindDefault(int i)
 {
-    return k_controls[i].keys;
+    return default_keys(i);
 }
 
 /* A key's name as the bindings write it, or NULL for one they cannot. */

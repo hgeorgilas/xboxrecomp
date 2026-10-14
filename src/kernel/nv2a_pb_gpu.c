@@ -324,6 +324,7 @@ static UINT msaa_supported(UINT want)
  * down to the guest size (surf_logical). A change re-creates the surfaces. */
 extern float xbox_DisplayAspect(void);
 extern float xbox_setting_float(const char *key, float def);
+extern float xbox_Quirk(const char *name);
 static float s_res_sx = 1, s_res_sy = 1;
 static volatile UINT s_window_h;        /* client height at the last present */
 static int s_res_auto;
@@ -2252,16 +2253,22 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
     long aoff, ioff;
     int k, ok = 0;
 
-    if (slot[0] >= 0 && nverts && st->clip_w && !getenv("RECOMP_DRAW_RHW0")) {
-        /* Pre-transformed vertices with RHW 0 (position w 0) are drawn as
-         * w 1, as the hardware does (the shader takes an infinite 1/w as
-         * 1): Spartan composites its bloom and colour grade onto the frame
-         * that way, and dropping those batches took the glow out of every
-         * scene. One such batch is dropped: the pause screen's, each frame
-         * a 640-wide quad over a 320-wide blur buffer -- drawn, it
-         * magnified the frozen frame's left half into the buffer the next
-         * frame reads, and the background collapsed to its left edge and
-         * smeared. So: every vertex w 0, and wider than the target. */
+    /* Pre-transformed vertices with RHW 0 (position w 0) are drawn as w 1,
+     * as the hardware does (the shader takes an infinite 1/w as 1): Spartan
+     * composites its bloom and colour grade onto the frame that way. Two
+     * title quirks (xbox_settings.c) act on such batches. */
+    static int q_drop = -1, q_bloom;
+    if (q_drop < 0) {
+        q_drop = xbox_Quirk("drop_wide_rhw0") != 0;
+        q_bloom = xbox_Quirk("bloom_composites") != 0;
+    }
+    if ((q_drop || q_bloom) && slot[0] >= 0 && nverts && st->clip_w
+            && !getenv("RECOMP_DRAW_RHW0")) {
+        /* drop_wide_rhw0: Spartan's pause screen sends, each frame, a
+         * 640-wide quad over a 320-wide blur buffer; drawn, it magnified
+         * the frozen frame's left half into the buffer the next frame
+         * reads, and the background collapsed to its left edge and smeared.
+         * So: every vertex w 0, and wider than the target. */
         uint32_t v;
         float right = -1e30f;
         for (v = 0; v < nverts; v++) {
@@ -2271,14 +2278,14 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
             if (p[0] > right)
                 right = p[0];
         }
-        if (v == nverts && right > (float)(st->clip_x + st->clip_w) + 2.0f)
+        if (q_drop && v == nverts && right > (float)(st->clip_x + st->clip_w) + 2.0f)
             return 1;
-        /* The rest are composites onto the frame. Two blend onto it: the
-         * glow, added (src alpha, one), and a blurred copy laid over it
-         * at half strength (src alpha, 1 - src alpha) -- the bloom and the
-         * haze around it. RECOMP_BLOOM (0..1, 1 as the game) scales the
-         * one's colour and the other's alpha. */
-        if (v == nverts && st->blend_enable && st->blend_sfactor == 0x302
+        /* bloom_composites: of the rest, two blend onto the frame in
+         * Spartan: the glow, added (src alpha, one), and a blurred copy
+         * laid over it at half strength (src alpha, 1 - src alpha) -- the
+         * bloom and the haze around it. RECOMP_BLOOM (0..1, 1 as the game)
+         * scales the one's colour and the other's alpha. */
+        if (q_bloom && v == nverts && st->blend_enable && st->blend_sfactor == 0x302
                 && (st->blend_dfactor == 0x0001 || st->blend_dfactor == 0x0303)) {
             static long gen;
             static float k = 1.0f;
@@ -2410,8 +2417,14 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
                 if (x > right) right = x;
             }
             top += pg.ui2[0];          /* the title's own offset, as drawn */
-            if (top > H * 0.84f)
-                pg.ui2[3] += 5.0f * H / 480.0f;
+            {
+                /* A title quirk (xbox_settings.c): Spartan's. */
+                static float nudge = -1.0f;
+                if (nudge < 0)
+                    nudge = xbox_Quirk("ui_bottom_nudge");
+                if (nudge > 0 && top > H * 0.84f)
+                    pg.ui2[3] += nudge * H / 480.0f;
+            }
             /* A draw across the whole width -- a menu backdrop, the rune
              * bands, a fade, the cutscene bars -- is a full-screen layer, not
              * text: it keeps the whole width. Narrowed with the rest of the

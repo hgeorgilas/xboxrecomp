@@ -27,6 +27,7 @@ extern "C" {
 const char *xbox_setting_get(const char *key);
 int   xbox_setting_int(const char *key, int def);
 float xbox_setting_float(const char *key, float def);
+float xbox_Quirk(const char *name);
 void  xbox_setting_set(const char *key, const char *val);
 void  xbox_FramebufferSetFullscreen(int on);
 int   texpack_scan_memory(void);
@@ -210,7 +211,7 @@ void panel()
                               " picture; MSAA is sharper but costs more, most at high"
                               " resolutions.");
     }
-    {
+    if (xbox_Quirk("bloom_composites")) {     /* a title that says where its bloom is */
         int pct = (int)(xbox_setting_float("RECOMP_BLOOM", 1.0f) * 100.0f + 0.5f);
         if (ImGui::SliderInt("Bloom", &pct, 0, 100, "%d%%"))
             set_float("RECOMP_BLOOM", (float)pct / 100.0f);
