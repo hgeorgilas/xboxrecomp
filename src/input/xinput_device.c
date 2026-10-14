@@ -188,7 +188,7 @@ enum {
 #define MAX_BIND 3
 
 static const struct { const char *name, *keys; } k_controls[C_COUNT] = {
-    { "A", "MOUSE2,ENTER" }, { "B", "E,BACKSPACE" }, { "X", "MOUSE1" },
+    { "A", "MOUSE1,ENTER" }, { "B", "E,BACKSPACE" }, { "X", "MOUSE2" },
     { "Y", "SPACE" }, { "BLACK", "C" }, { "WHITE", "R" },
     { "LT", "Q" }, { "RT", "SHIFT" }, { "START", "ESC" }, { "BACK", "TAB" },
     { "LS", "F" }, { "RS", "MOUSE3" },
