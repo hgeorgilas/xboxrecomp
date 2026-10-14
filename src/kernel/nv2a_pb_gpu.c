@@ -2378,10 +2378,13 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
              * bands, a fade, the cutscene bars -- is a full-screen layer, not
              * text: it keeps the whole width. Narrowed with the rest of the
              * layer it left the sides of a widescreen screen bare. Height
-             * stays mapped with the layer, so the bands keep their text. */
+             * stays mapped with the layer, so the bands keep their text.
+             * Such a layer stops at the edges; a batch of particles that
+             * happens to reach both (the menus' smoke) runs past them, and
+             * stretched on the frames it did, it flickered. */
             left += pg.ui[0];
             right += pg.ui[0];
-            if (left <= 1.0f && right >= W - 2.0f) {
+            if (left <= 1.0f && left >= -1.5f && right >= W - 2.0f && right <= W + 1.0f) {
                 pg.ui[0] = 0;
                 pg.ui[2] = 1;
                 pg.ui[3] = 0;
