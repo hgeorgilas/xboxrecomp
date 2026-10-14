@@ -327,6 +327,21 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 static volatile LONG g_rumble[XBOX_MAX_CONTROLLERS];     /* left << 16 | right */
 static HANDLE g_rumble_event;
 
+/* RECOMP_RUMBLE: vibration intensity in percent, 0 (off) to 100 (as the
+ * title asks), read live -- the thread also wakes a few times a second, so
+ * a change applies to a rumble already running. */
+static ULONG rumble_scaled(LONG v)
+{
+    extern int xbox_setting_int(const char *key, int def);
+    int pct = xbox_setting_int("RECOMP_RUMBLE", 100);
+    ULONG l = (ULONG)v >> 16, r = (ULONG)v & 0xFFFF;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    l = l * (ULONG)pct / 100;
+    r = r * (ULONG)pct / 100;
+    return l << 16 | r;
+}
+
 static DWORD WINAPI rumble_thread(LPVOID unused)
 {
     LONG sent[XBOX_MAX_CONTROLLERS];
@@ -335,9 +350,9 @@ static DWORD WINAPI rumble_thread(LPVOID unused)
     for (p = 0; p < XBOX_MAX_CONTROLLERS; p++)
         sent[p] = -1;
     for (;;) {
-        WaitForSingleObject(g_rumble_event, INFINITE);
+        WaitForSingleObject(g_rumble_event, 250);
         for (p = 0; p < XBOX_MAX_CONTROLLERS; p++) {
-            LONG v = g_rumble[p];
+            LONG v = (LONG)rumble_scaled(g_rumble[p]);
             if (v != sent[p]) {
                 XINPUT_VIBRATION xi_vib;
                 LARGE_INTEGER t0;

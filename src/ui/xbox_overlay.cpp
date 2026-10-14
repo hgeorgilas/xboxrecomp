@@ -160,6 +160,11 @@ void panel()
         ImGui::SetItemTooltip("Which buttons the game's prompts show. Automatic: the"
                               " original art with an Xbox pad, PlayStation symbols with"
                               " a DualShock or DualSense.");
+        int rumble = xbox_setting_int("RECOMP_RUMBLE", 100);
+        if (ImGui::SliderInt("Vibration", &rumble, 0, 100, rumble ? "%d%%" : "Off",
+                             ImGuiSliderFlags_AlwaysClamp))
+            set_int("RECOMP_RUMBLE", rumble);
+        ImGui::SetItemTooltip("Controller vibration strength. 0 turns it off.");
         bool hid = xbox_setting_int("RECOMP_HID_PADS", 1) != 0;
         if (ImGui::Checkbox("DualShock / DualSense support", &hid))
             set_int("RECOMP_HID_PADS", hid ? 1 : 0);
