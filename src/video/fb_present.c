@@ -186,7 +186,8 @@ static void fb_set_fullscreen(HWND h, int on)
         s_fb_place.length = sizeof s_fb_place;
         GetWindowPlacement(h, &s_fb_place);
         GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi);
-        SetWindowLongPtrA(h, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        /* WS_SYSMENU: without it Windows has no Close for Alt+F4. */
+        SetWindowLongPtrA(h, GWL_STYLE, WS_POPUP | WS_SYSMENU | WS_VISIBLE);
         SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
                      mi.rcMonitor.right - mi.rcMonitor.left,
                      mi.rcMonitor.bottom - mi.rcMonitor.top,
@@ -256,8 +257,16 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         fb_set_fullscreen(h, (int)w);
         return 0;
     }
+    /* Alt+F4 closes the game whatever the window's style; logged, as is
+     * Alt+Enter, so a log says whether the keys arrived at all. */
+    if (m == WM_SYSKEYDOWN && w == VK_F4 && (l & (1 << 29))) {
+        fprintf(stderr, "  [KEY] Alt+F4\n");
+        PostMessageA(h, WM_CLOSE, 0, 0);
+        return 0;
+    }
     if (m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30))) {
         extern void xbox_setting_set(const char *key, const char *val);
+        fprintf(stderr, "  [KEY] Alt+Enter\n");
         fb_set_fullscreen(h, !s_fb_full);
         xbox_setting_set("RECOMP_FULLSCREEN", s_fb_full ? "1" : "0");
         return 0;
