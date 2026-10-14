@@ -210,6 +210,13 @@ void panel()
                               " picture; MSAA is sharper but costs more, most at high"
                               " resolutions.");
     }
+    {
+        int pct = (int)(xbox_setting_float("RECOMP_BLOOM", 1.0f) * 100.0f + 0.5f);
+        if (ImGui::SliderInt("Bloom", &pct, 0, 100, "%d%%"))
+            set_float("RECOMP_BLOOM", (float)pct / 100.0f);
+        ImGui::SetItemTooltip("The glow around bright things, and its haze. 100%% is the"
+                              " game as it shipped.");
+    }
 
     ImGui::SeparatorText("Textures");
     {

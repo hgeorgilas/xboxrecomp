@@ -1372,7 +1372,7 @@ static void gen_ps(const PsKey *k, Sb *b)
               "    if (!(%s)) discard; }\n",
            (f >= 0x200 && f <= 0x207) ? cmp[f - 0x200] : "true");
     }
-    sb(b, "  return o; }\n");
+    sb(b, "  o.rgb *= misc.y; o.a *= misc.z;\n  return o; }\n");    /* s_out_scale */
 }
 
 static ID3D11PixelShader *ps_get(const PsKey *k)
@@ -1709,6 +1709,10 @@ static void cap_log_draw(const PbGpuState *st, const PbGpuVertex *v, uint32_t co
 
 }
 
+/* What the pixel shader's output is scaled by: colour, alpha. 1, 1 but for
+ * the bloom (RECOMP_BLOOM, pbgpu_draw_program). */
+static float s_out_scale[2] = { 1.0f, 1.0f };
+
 /* Everything a draw needs except its vertices and vertex shader: target,
  * pixel shader and its constants, textures, blend/depth/stencil/raster state.
  * Shared by the screen-space path (pbgpu_draw) and the vertex-program path
@@ -1803,6 +1807,8 @@ static int draw_begin(const PbGpuState *st, Surface **so, Zeta **zo)
     unpack(st->rc.final_c1, pc.fc1);
     memcpy(pc.fogc, st->fog_color, sizeof pc.fogc);
     pc.misc[0] = (float)(st->alpha_ref & 0xFF);
+    pc.misc[1] = s_out_scale[0];
+    pc.misc[2] = s_out_scale[1];
 
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_ps_cb, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -2241,23 +2247,50 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
     long aoff, ioff;
     int k, ok = 0;
 
-    if (slot[0] >= 0 && nverts && !getenv("RECOMP_DRAW_RHW0")) {
-        /* A batch whose every vertex has position w 0 -- a pre-transformed
-         * vertex's RHW -- draws nothing: 1/0 sends it to infinity. Spartan's
-         * pause screen sends one each frame (a 640-wide quad over a 320-wide
-         * blur buffer, rhw 0); drawn, it magnified the frozen frame's left
-         * half twice over into the buffer the next frame reads, and the
-         * background collapsed to its left edge and smeared. */
+    if (slot[0] >= 0 && nverts && st->clip_w && !getenv("RECOMP_DRAW_RHW0")) {
+        /* Pre-transformed vertices with RHW 0 (position w 0) are drawn as
+         * w 1, as the hardware does (the shader takes an infinite 1/w as
+         * 1): Spartan composites its bloom and colour grade onto the frame
+         * that way, and dropping those batches took the glow out of every
+         * scene. One such batch is dropped: the pause screen's, each frame
+         * a 640-wide quad over a 320-wide blur buffer -- drawn, it
+         * magnified the frozen frame's left half into the buffer the next
+         * frame reads, and the background collapsed to its left edge and
+         * smeared. So: every vertex w 0, and wider than the target. */
         uint32_t v;
-        for (v = 0; v < nverts; v++)
-            if (attr[(v * stride + (uint32_t)slot[0]) * 4 + 3] != 0.0f)
+        float right = -1e30f;
+        for (v = 0; v < nverts; v++) {
+            const float *p = &attr[(v * stride + (uint32_t)slot[0]) * 4];
+            if (p[3] != 0.0f)
                 break;
-        if (v == nverts)
+            if (p[0] > right)
+                right = p[0];
+        }
+        if (v == nverts && right > (float)(st->clip_x + st->clip_w) + 2.0f)
             return 1;
+        /* The rest are composites onto the frame. Two blend onto it: the
+         * glow, added (src alpha, one), and a blurred copy laid over it
+         * at half strength (src alpha, 1 - src alpha) -- the bloom and the
+         * haze around it. RECOMP_BLOOM (0..1, 1 as the game) scales the
+         * one's colour and the other's alpha. */
+        if (v == nverts && st->blend_enable && st->blend_sfactor == 0x302
+                && (st->blend_dfactor == 0x0001 || st->blend_dfactor == 0x0303)) {
+            static long gen;
+            static float k = 1.0f;
+            if (gen != xbox_settings_gen()) {
+                gen = xbox_settings_gen();
+                k = xbox_setting_float("RECOMP_BLOOM", 1.0f);
+                if (k < 0) k = 0;
+                if (k > 1) k = 1;
+            }
+            s_out_scale[st->blend_dfactor == 0x0001 ? 0 : 1] = k;
+        }
     }
 
-    if (!nidx || !nverts || !pbgpu_enabled())
+    if (!nidx || !nverts || !pbgpu_enabled()) {
+        s_out_scale[0] = s_out_scale[1] = 1.0f;
         return 1;
+    }
     EnterCriticalSection(&s_lock);
     if (!pg_init() || !(vs = pg_get()))
         goto out;                          /* caller keeps it on the CPU */
@@ -2451,6 +2484,7 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
     }
     draw_end(s);
 out:
+    s_out_scale[0] = s_out_scale[1] = 1.0f;
     LeaveCriticalSection(&s_lock);
     return ok;
 }
