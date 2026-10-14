@@ -107,8 +107,9 @@ void panel()
             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Applies after a restart.");
     }
     {
-        static const char *names[] = { "Match window", "480p (original)", "720p", "1080p",
-                                       "1440p", "4K (2160p)" };
+        static const char *names[] = { "Match window", "854x480 (original)", "1280x720 (HD)",
+                                       "1920x1080 (Full HD)", "2560x1440 (2K)",
+                                       "3840x2160 (4K)" };
         static const float values[] = { 0.0f, 1.0f, 1.5f, 2.25f, 3.0f, 4.5f };
         float cur = xbox_setting_float("RECOMP_RES_SCALE", 0.0f);
         int sel = 0;
