@@ -2379,15 +2379,44 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
              * text: it keeps the whole width. Narrowed with the rest of the
              * layer it left the sides of a widescreen screen bare. Height
              * stays mapped with the layer, so the bands keep their text.
-             * Such a layer stops at the edges; a batch of particles that
-             * happens to reach both (the menus' smoke) runs past them, and
-             * stretched on the frames it did, it flickered. */
+             *
+             * The menus' smoke is several particle batches of one texture,
+             * each running off the screen: some across both edges, some
+             * past one only, and one whose far end hovers at the edge
+             * crossed it every few frames -- stretched, then not, a
+             * flicker. So the decision is the texture's: once a batch of
+             * it runs off the screen across the whole width, every batch
+             * of it that runs off the screen is part of that layer.
+             * Text and menu pieces never leave the screen. */
             left += pg.ui[0];
             right += pg.ui[0];
-            if (left <= 1.0f && left >= -1.5f && right >= W - 2.0f && right <= W + 1.0f) {
-                pg.ui[0] = 0;
-                pg.ui[2] = 1;
-                pg.ui[3] = 0;
+            {
+                static uint32_t fill_tex[8];
+                static DWORD fill_ms[8];
+                uint32_t tex = st->tex[0].addr;
+                int off = left < -1.5f || right > W + 1.0f, full = left <= 1.0f && right >= W - 2.0f;
+                int i, slot_free = 0;
+                DWORD now = GetTickCount();
+                if (off && tex) {
+                    for (i = 0; i < 8; i++) {
+                        if (fill_tex[i] == tex && now - fill_ms[i] < 5000) {
+                            full = 1;
+                            fill_ms[i] = now;
+                            break;
+                        }
+                        if (now - fill_ms[i] > now - fill_ms[slot_free])
+                            slot_free = i;
+                    }
+                    if (full && i == 8) {
+                        fill_tex[slot_free] = tex;
+                        fill_ms[slot_free] = now;
+                    }
+                }
+                if (full) {
+                    pg.ui[0] = 0;
+                    pg.ui[2] = 1;
+                    pg.ui[3] = 0;
+                }
             }
         }
     }

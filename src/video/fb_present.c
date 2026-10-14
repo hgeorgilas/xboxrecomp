@@ -206,8 +206,52 @@ void xbox_FramebufferSetFullscreen(int on)
         PostMessageA(s_fb_hwnd, WM_FB_FULLSCREEN, (WPARAM)(on != 0), 0);
 }
 
+/* The pointer, held at the middle of the window while the game has the
+ * focus and is played with the mouse: windowed, it would otherwise wander
+ * off the window while turning the camera, and a click there would take the
+ * focus away. Movement still arrives as raw input. Let go while the overlay
+ * is open, while the window is moved or sized, and when the focus goes
+ * (Alt+Tab). Re-applied a few times a second, since Windows drops a clip
+ * whenever the focus changes. */
+static volatile LONG s_sizing;
+
+static void pin_cursor(HWND h)
+{
+    extern int xbox_setting_int(const char *key, int def);
+    extern int xbox_overlay_visible(void);
+    static int pinned;
+    static DWORD last;
+    RECT rc;
+    int want = GetForegroundWindow() == h && !IsIconic(h) && !s_sizing
+            && xbox_setting_int("RECOMP_KEYBOARD", 1) && !xbox_overlay_visible()
+            && GetClientRect(h, &rc) && rc.right > 0 && rc.bottom > 0;
+    if (!want) {
+        if (pinned) {
+            ClipCursor(NULL);
+            pinned = 0;
+        }
+        return;
+    }
+    if (pinned && GetTickCount() - last < 250)
+        return;
+    {
+        POINT c = { rc.right / 2, rc.bottom / 2 };
+        RECT pin;
+        ClientToScreen(h, &c);
+        pin.left = c.x; pin.top = c.y; pin.right = c.x + 1; pin.bottom = c.y + 1;
+        ClipCursor(&pin);
+        pinned = 1;
+        last = GetTickCount();
+    }
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    if (m == WM_ENTERSIZEMOVE || m == WM_EXITSIZEMOVE) {
+        InterlockedExchange(&s_sizing, m == WM_ENTERSIZEMOVE);
+        if (m == WM_ENTERSIZEMOVE)
+            ClipCursor(NULL);
+    }
     if (m == WM_FB_FULLSCREEN) {
         fb_set_fullscreen(h, (int)w);
         return 0;
@@ -455,7 +499,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
-                           WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                           WS_OVERLAPPEDWINDOW,
                            CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top,
                            NULL, NULL, GetModuleHandleA(NULL), NULL);
@@ -463,6 +507,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         InterlockedExchange(&s_fb_running, 0);
         return 0;
     }
+    /* RECOMP_NO_ACTIVATE=1 opens the window behind the one in use: a test
+     * run then does not take the keys being typed somewhere else. */
+    ShowWindow(hwnd, getenv("RECOMP_NO_ACTIVATE") ? SW_SHOWNOACTIVATE : SW_SHOW);
     hdc = GetDC(hwnd);
     s_fb_hwnd = hwnd;
     {
@@ -499,6 +546,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
+        pin_cursor(hwnd);
         if (s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
