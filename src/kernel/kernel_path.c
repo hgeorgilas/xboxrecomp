@@ -418,6 +418,21 @@ static void mods_override(const WCHAR *remainder, WCHAR *host_path, DWORD n)
     }
     if (state < 0 || !*remainder)
         return;
+    /* mods\<device>\ first: the files that name the buttons in words, in
+     * the words of the device in use when the title opens them. */
+    {
+        extern const char *xbox_prompt_device_dir(void);
+        const char *dev = xbox_prompt_device_dir();
+        if (dev) {
+            swprintf_s(cand, MAX_PATH, L"%s\\%S\\%s", dir, dev, remainder);
+            attr = GetFileAttributesW(cand);
+            if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                wcscpy_s(host_path, n, cand);
+                fprintf(stderr, "  [PATH] -> mods\\%s\\%S\n", dev, remainder);
+                return;
+            }
+        }
+    }
     swprintf_s(cand, MAX_PATH, L"%s\\%s", dir, remainder);
     attr = GetFileAttributesW(cand);
     if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY))

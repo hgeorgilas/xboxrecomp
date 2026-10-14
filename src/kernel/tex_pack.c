@@ -383,6 +383,18 @@ int texpack_lookup(uint64_t key, uint32_t **px, uint32_t *w, uint32_t *h)
     return r;
 }
 
+/* The prompt style as a folder name under mods\ (kernel_path.c), where a
+ * title's files that name the buttons in words have that device's words;
+ * NULL for the console's own. */
+const char *xbox_prompt_device_dir(void)
+{
+    switch (prompt_style()) {
+    case PROMPT_PLAYSTATION: return "playstation";
+    case PROMPT_KEYBOARD:    return "keyboard";
+    }
+    return NULL;
+}
+
 /* RECOMP_TEXPACK and the button prompt style, live: nonzero when either
  * changed since the last call, so the renderer re-uploads its textures --
  * replaced or original. Called once a frame. */

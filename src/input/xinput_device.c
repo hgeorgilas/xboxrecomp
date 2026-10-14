@@ -57,13 +57,29 @@ static int later(LONG a, LONG b)          /* tick a after tick b (wraps) */
     return a && (!b || (LONG)((DWORD)a - (DWORD)b) > 0);
 }
 
+static BOOL keyboard_enabled(void);
+void xbox_InputInit(void);
+
 int xbox_InputActiveKind(void)
 {
     LONG xi = g_xi_active_ms, hid = g_hid_active_ms, kb = g_kb_active_ms;
     if (later(kb, xi) && later(kb, hid))
         return 2;
-    if (!xi && !hid)
-        return hidpad_count() > 0;
+    if (!xi && !hid) {
+        /* Nothing pressed yet (the title opens its files at boot, and the
+         * prompts' words come with them: kernel_path.c): a PlayStation pad
+         * if one is there, else an Xbox one, else the keyboard. */
+        static LONG probed;
+        int i;
+        if (hidpad_count() > 0)
+            return 1;
+        if (!InterlockedExchange(&probed, 1))
+            xbox_InputInit();
+        for (i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+            if (g_controller_connected[i])
+                return 0;
+        return keyboard_enabled() ? 2 : 0;
+    }
     return hid && (LONG)((DWORD)xi - (DWORD)hid) <= 2000;
 }
 
