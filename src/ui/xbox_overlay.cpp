@@ -148,14 +148,14 @@ void panel()
     ImGui::SeparatorText("Controls");
     {
         static const char *names[] = { "Automatic (follows the pad)", "Original (Xbox)",
-                                       "Xbox Series", "PlayStation" };
-        static const char *values[] = { "auto", "original", "xbox", "playstation" };
+                                       "Xbox Series", "PlayStation", "Keyboard & Mouse" };
+        static const char *values[] = { "auto", "original", "xbox", "playstation", "keyboard" };
         const char *cur = xbox_setting_get("RECOMP_BUTTON_PROMPTS");
         int sel = 0;
-        for (int i = 1; i < 4; i++)
+        for (int i = 1; i < 5; i++)
             if (cur && !_stricmp(cur, values[i]))
                 sel = i;
-        if (ImGui::Combo("Button prompts", &sel, names, 4))
+        if (ImGui::Combo("Button prompts", &sel, names, 5))
             xbox_setting_set("RECOMP_BUTTON_PROMPTS", values[sel]);
         ImGui::SetItemTooltip("Which buttons the game's prompts show. Automatic: the"
                               " original art with an Xbox pad, PlayStation symbols with"
@@ -171,7 +171,8 @@ void panel()
         ImGui::SetItemTooltip("Reads PlayStation pads directly, over USB or Bluetooth."
                               " Turn off if Steam Input or DS4Windows already does.");
         ImGui::TextDisabled("%d PlayStation pad(s) connected; using %s", hidpad_count(),
-                            xbox_InputActiveKind() ? "PlayStation" : "Xbox");
+                            xbox_InputActiveKind() == 2 ? "keyboard and mouse"
+                            : xbox_InputActiveKind() ? "PlayStation" : "Xbox");
     }
 
     ImGui::SeparatorText("Anti-aliasing");

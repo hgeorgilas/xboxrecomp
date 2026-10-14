@@ -43,23 +43,32 @@ static int hid_for_port(DWORD port)
 }
 
 /* Which kind of pad is in use: what the button prompts should show.
- * 0 an Xbox pad (or none yet), 1 a PlayStation pad.
+ * 0 an Xbox pad (or none yet), 1 a PlayStation pad, 2 keyboard and mouse --
+ * whichever was used last.
  *
  * Steam Input and DS4Windows present a Sony pad as an XInput pad too, so the
  * same press can arrive from both; the PlayStation pad wins whenever it was
  * active within two seconds of the Xbox one, or the prompts would flip with
  * every press. */
-static volatile LONG g_xi_active_ms, g_hid_active_ms;
+static volatile LONG g_xi_active_ms, g_hid_active_ms, g_kb_active_ms;
+
+static int later(LONG a, LONG b)          /* tick a after tick b (wraps) */
+{
+    return a && (!b || (LONG)((DWORD)a - (DWORD)b) > 0);
+}
 
 int xbox_InputActiveKind(void)
 {
-    LONG xi = g_xi_active_ms, hid = g_hid_active_ms;
+    LONG xi = g_xi_active_ms, hid = g_hid_active_ms, kb = g_kb_active_ms;
+    if (later(kb, xi) && later(kb, hid))
+        return 2;
     if (!xi && !hid)
         return hidpad_count() > 0;
     return hid && (LONG)((DWORD)xi - (DWORD)hid) <= 2000;
 }
 
-static void note_activity(const XBOX_INPUT_STATE *st, int sony)
+/* kind: as xbox_InputActiveKind returns. */
+static void note_activity(const XBOX_INPUT_STATE *st, int kind)
 {
     const XBOX_GAMEPAD *g = &st->Gamepad;
     int i, active = g->wButtons != 0 || g->sThumbLX > 16000 || g->sThumbLX < -16000
@@ -67,8 +76,8 @@ static void note_activity(const XBOX_INPUT_STATE *st, int sony)
     for (i = 0; i < 8 && !active; i++)
         active = g->bAnalogButtons[i] > 64;
     if (active)
-        InterlockedExchange(sony ? &g_hid_active_ms : &g_xi_active_ms,
-                            (LONG)(GetTickCount() | 1));
+        InterlockedExchange(kind == 2 ? &g_kb_active_ms : kind ? &g_hid_active_ms
+                            : &g_xi_active_ms, (LONG)(GetTickCount() | 1));
 }
 
 /* Host XInput calls that took a millisecond or more, and the longest, for
@@ -274,6 +283,7 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
 
     pState->Gamepad.sThumbLX = axis_from(C_MOVE_LEFT, C_MOVE_RIGHT);
     pState->Gamepad.sThumbLY = axis_from(C_MOVE_DOWN, C_MOVE_UP);
+    note_activity(pState, 2);           /* the mouse moving alone does not count */
     xbox_FramebufferMouseDelta(&dx, &dy);
     pState->Gamepad.sThumbRX = mouse_axis(dx);
     pState->Gamepad.sThumbRY = mouse_axis(-dy);

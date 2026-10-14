@@ -43,9 +43,10 @@ extern int xbox_setting_int(const char *key, int def);
  * PlayStation set for a DualShock/DualSense; "original", "xbox" and
  * "playstation" fix it. They sit in the replacement set under the texture's
  * key salted with the style, and apply with the HD pack on or off. */
-enum { PROMPT_ORIGINAL, PROMPT_XBOX, PROMPT_PLAYSTATION, PROMPT_STYLES };
+enum { PROMPT_ORIGINAL, PROMPT_XBOX, PROMPT_PLAYSTATION, PROMPT_KEYBOARD, PROMPT_STYLES };
 static const char *const s_prompt_dir[PROMPT_STYLES] = {
-    NULL, "textures\\prompts\\xbox\\", "textures\\prompts\\playstation\\" };
+    NULL, "textures\\prompts\\xbox\\", "textures\\prompts\\playstation\\",
+    "textures\\prompts\\keyboard\\" };
 #define PROMPT_KEY(k, style) ((k) ^ (0xB077011CDA5E0000ull * (uint64_t)(style)))
 static int s_prompt;            /* the style in force */
 
@@ -267,7 +268,13 @@ static int prompt_style(void)
         return PROMPT_XBOX;
     if (v && !_stricmp(v, "playstation"))
         return PROMPT_PLAYSTATION;
-    return xbox_InputActiveKind() ? PROMPT_PLAYSTATION : PROMPT_ORIGINAL;
+    if (v && !_stricmp(v, "keyboard"))
+        return PROMPT_KEYBOARD;
+    switch (xbox_InputActiveKind()) {
+    case 1: return PROMPT_PLAYSTATION;
+    case 2: return PROMPT_KEYBOARD;
+    }
+    return PROMPT_ORIGINAL;
 }
 
 /* The texture's name: its decoded pixels, format and size. */
@@ -393,8 +400,8 @@ int texpack_use_changed(void)
         last_check = GetTickCount();
         if (style != s_prompt) {
             fprintf(stderr, "  [TEXPACK] button prompts: %s\n",
-                    style == PROMPT_PLAYSTATION ? "PlayStation"
-                    : style == PROMPT_XBOX ? "Xbox" : "original");
+                    style == PROMPT_PLAYSTATION ? "PlayStation" : style == PROMPT_XBOX ? "Xbox"
+                    : style == PROMPT_KEYBOARD ? "keyboard" : "original");
             s_prompt = style;
             return 1;
         }
