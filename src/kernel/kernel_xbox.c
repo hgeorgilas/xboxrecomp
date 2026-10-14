@@ -199,9 +199,9 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_TIMEZONE_BIAS:
-        /* UTC-5 (Eastern Time) in minutes: -300 */
+        /* None: the system clock is already local time (kernel_hal.c). */
         if (ValueLength >= sizeof(LONG)) {
-            *(PLONG)Value = -300;
+            *(PLONG)Value = 0;
             if (Type) *Type = 4;
             if (ResultLength) *ResultLength = sizeof(LONG);
         }

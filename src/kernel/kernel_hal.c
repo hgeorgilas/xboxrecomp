@@ -380,8 +380,20 @@ LARGE_INTEGER __stdcall xbox_KeQueryPerformanceFrequency(void)
  * System Time
  *
  * KeQuerySystemTime returns the current time as a FILETIME (100ns since
- * January 1, 1601). Direct Win32 mapping.
+ * January 1, 1601) -- local time. A console's clock is what its owner set in
+ * the dashboard, and titles show it as it is: Spartan stamps its save slots
+ * with it, and read off the host's UTC clock they were hours out. The time
+ * zone settings report no bias to match (kernel_xbox.c).
  * ============================================================================ */
+
+/* The host's clock, as the console's: local time. */
+void xbox_HostLocalFileTime(FILETIME *ft)
+{
+    FILETIME utc;
+    GetSystemTimeAsFileTime(&utc);
+    if (!FileTimeToLocalFileTime(&utc, ft))
+        *ft = utc;
+}
 
 static LONGLONG s_time_anchor_100ns;
 static LONGLONG s_time_anchor_counts;
@@ -394,7 +406,7 @@ static BOOL CALLBACK anchor_system_time(PINIT_ONCE once, PVOID param, PVOID *ctx
     LARGE_INTEGER f, now;
     (void)once; (void)param; (void)ctx;
     QueryPerformanceFrequency(&f);
-    GetSystemTimeAsFileTime(&ft);
+    xbox_HostLocalFileTime(&ft);
     QueryPerformanceCounter(&now);
     s_time_freq_counts = f.QuadPart ? f.QuadPart : 1;
     s_time_anchor_100ns = ((LONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;

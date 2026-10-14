@@ -6454,9 +6454,11 @@ static void bridge_KeInterruptTime(void)
 /* --- KeSystemTime (ordinal 154, 0 args) --- */
 static void bridge_KeSystemTime(void)
 {
-    /* Refresh the 100ns-since-1601 clock before handing out the pointer. */
+    /* Refresh the 100ns-since-1601 clock before handing out the pointer:
+     * local time, like KeQuerySystemTime (kernel_hal.c). */
+    extern void xbox_HostLocalFileTime(FILETIME *ft);
     FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
+    xbox_HostLocalFileTime(&ft);
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 0) = ft.dwLowDateTime;
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME + 4) = ft.dwHighDateTime;
     g_eax = XBOX_KERNEL_DATA_BASE + KDATA_SYSTEM_TIME;
