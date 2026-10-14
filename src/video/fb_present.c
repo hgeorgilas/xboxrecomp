@@ -148,6 +148,27 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+/* Mouse movement since the last call, in raw counts (WM_INPUT: not limited
+ * by the screen's edge, nor changed by pointer acceleration). */
+static volatile LONG s_mouse_dx, s_mouse_dy;
+
+void xbox_FramebufferMouseDelta(int *dx, int *dy)
+{
+    *dx = (int)InterlockedExchange(&s_mouse_dx, 0);
+    *dy = (int)InterlockedExchange(&s_mouse_dy, 0);
+}
+
+/* Mouse buttons go in s_key_down under their VK codes, like keys. */
+static void mouse_button(HWND h, int vk, int down)
+{
+    s_key_down[vk] = (unsigned char)(down != 0);
+    if (down)
+        SetCapture(h);         /* the release arrives even off the window */
+    else if (!s_key_down[VK_LBUTTON] && !s_key_down[VK_RBUTTON] && !s_key_down[VK_MBUTTON]
+             && !s_key_down[VK_XBUTTON1] && !s_key_down[VK_XBUTTON2])
+        ReleaseCapture();
+}
+
 /* Borderless fullscreen: the window, without its frame, over the whole
  * monitor it is on; the swap chain follows the client size. Alt+Enter, the
  * overlay or RECOMP_FULLSCREEN=1. Changed on the window's own thread. */
@@ -251,9 +272,47 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             s_key_down[w] = 0;
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
 
+    case WM_LBUTTONDOWN: mouse_button(h, VK_LBUTTON, 1); return 0;
+    case WM_LBUTTONUP:   mouse_button(h, VK_LBUTTON, 0); return 0;
+    case WM_RBUTTONDOWN: mouse_button(h, VK_RBUTTON, 1); return 0;
+    case WM_RBUTTONUP:   mouse_button(h, VK_RBUTTON, 0); return 0;
+    case WM_MBUTTONDOWN: mouse_button(h, VK_MBUTTON, 1); return 0;
+    case WM_MBUTTONUP:   mouse_button(h, VK_MBUTTON, 0); return 0;
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+        mouse_button(h, GET_XBUTTON_WPARAM(w) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2,
+                     m == WM_XBUTTONDOWN);
+        return TRUE;
+
+    case WM_INPUT: {
+        RAWINPUT ri;
+        UINT n = sizeof ri;
+        if (GetRawInputData((HRAWINPUT)l, RID_INPUT, &ri, &n, sizeof(RAWINPUTHEADER)) != (UINT)-1
+                && ri.header.dwType == RIM_TYPEMOUSE
+                && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+            InterlockedExchangeAdd(&s_mouse_dx, ri.data.mouse.lLastX);
+            InterlockedExchangeAdd(&s_mouse_dy, ri.data.mouse.lLastY);
+        }
+        return DefWindowProcA(h, m, w, l);
+    }
+
+    /* No pointer over the game while it is played with the mouse; the
+     * overlay (which took the message above if it is open) keeps one. */
+    case WM_SETCURSOR:
+        if (LOWORD(l) == HTCLIENT) {
+            extern int xbox_setting_int(const char *key, int def);
+            if (xbox_setting_int("RECOMP_KEYBOARD", 1)) {
+                SetCursor(NULL);
+                return TRUE;
+            }
+        }
+        return DefWindowProcA(h, m, w, l);
+
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
         memset((void *)s_key_down, 0, sizeof s_key_down);
+        InterlockedExchange(&s_mouse_dx, 0);
+        InterlockedExchange(&s_mouse_dy, 0);
         return 0;
     }
     return DefWindowProcA(h, m, w, l);
@@ -405,6 +464,15 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     hdc = GetDC(hwnd);
     s_fb_hwnd = hwnd;
+    {
+        /* Raw mouse movement, while the window is in the foreground. */
+        RAWINPUTDEVICE rid;
+        rid.usUsagePage = 0x01;
+        rid.usUsage = 0x02;
+        rid.dwFlags = 0;
+        rid.hwndTarget = hwnd;
+        RegisterRawInputDevices(&rid, 1, sizeof rid);
+    }
     {
         extern int xbox_setting_int(const char *key, int def);
         if (xbox_setting_int("RECOMP_FULLSCREEN", 0))

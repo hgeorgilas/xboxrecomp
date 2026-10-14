@@ -11,6 +11,7 @@
  */
 
 #include "xinput_xbox.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -94,37 +95,33 @@ void xbox_InputTakeSlowStats(long *slow, long *max_us)
     *max_us = InterlockedExchange(&g_xi_max_us, 0);
 }
 
-/* ---- keyboard, when there is no pad --------------------------------------
+/* ---- keyboard and mouse ---------------------------------------------------
  *
- * A title that waits on PRESS START is unreachable on a machine with no
- * controller plugged in, which is most machines someone brings this up on.
- * The whole point of a recompilation is to be able to look at the thing
- * running, and a build nobody can press a button in cannot be looked at.
+ * Played as player 1's pad: merged on top of a pad on port 0, so either
+ * works at any time. On unless RECOMP_KEYBOARD=0.
  *
- * Off by default, because a keyboard silently acting as player 1 is
- * surprising when a real pad is what you meant to use. RECOMP_KEYBOARD=1
- * turns it on. It only ever answers for port 0, and is merged on top of a
- * pad connected there, so a real controller keeps working.
+ * Each pad control has keys (and mouse buttons) bound to it; the defaults
+ * below are for Spartan, in a PC action game's layout -- WASD to move, the
+ * mouse buttons for the two attacks -- and every one can be rebound in the
+ * settings: RECOMP_BIND_<CONTROL>=<key>[,<key>...], key names as in
+ * k_keys (A-Z, 0-9, SPACE, SHIFT, MOUSE1, F5, NUM4, ...).
  *
- * The keys are the ones a Dreamcast or Saturn emulator would pick, which is
- * the closest thing to a convention here:
- *
- *   arrows        d-pad             Enter      START
- *   Z X A S       A B X Y           Backspace  BACK
- *   Q E           white black       1 3        triggers
- *   numpad 8/2/4/6 left thumb       I/K/J/L    right thumb
+ *   W A S D   move (left stick)      mouse     re-target the bow (right stick)
+ *   Mouse 1   X  centred attack      Space     A  jump
+ *   Mouse 2   Y  sweeping attack     E         B  use
+ *   Shift     left trigger: shield   Q         right trigger: power
+ *   F         left stick click: rage R         white: bow
+ *   C         black                  Mouse 3   right stick click
+ *   Esc       Start (pause)          Tab       Back
+ *   arrows    d-pad (menus)          Enter, Backspace   A, B (menus)
  *
  * Keys come from the framebuffer window, which only receives them while it
  * has the focus, so typing in another window does not drive the game.
  */
 static BOOL keyboard_enabled(void)
 {
-    static int on = -1;
-    if (on < 0) {
-        const char *v = getenv("RECOMP_KEYBOARD");
-        on = (v && *v && *v != '0') ? 1 : 0;
-    }
-    return on ? TRUE : FALSE;
+    extern int xbox_setting_int(const char *key, int def);
+    return xbox_setting_int("RECOMP_KEYBOARD", 1) != 0;
 }
 
 /* The framebuffer window records what is held; see src/video/fb_present.c.
@@ -137,19 +134,111 @@ static BOOL keyboard_enabled(void)
  *
  * Declared rather than included so src/input does not depend on the video
  * module's include path. */
-extern int xbox_FramebufferKeyDown(int vk);
+extern int  xbox_FramebufferKeyDown(int vk);
+extern void xbox_FramebufferMouseDelta(int *dx, int *dy);
 
-static BOOL key_down(int vk)
+static const struct { const char *name; int vk; } k_keys[] = {
+    { "SPACE", VK_SPACE }, { "ENTER", VK_RETURN }, { "ESC", VK_ESCAPE },
+    { "TAB", VK_TAB }, { "BACKSPACE", VK_BACK }, { "SHIFT", VK_SHIFT },
+    { "CTRL", VK_CONTROL }, { "ALT", VK_MENU }, { "CAPSLOCK", VK_CAPITAL },
+    { "UP", VK_UP }, { "DOWN", VK_DOWN }, { "LEFT", VK_LEFT }, { "RIGHT", VK_RIGHT },
+    { "INSERT", VK_INSERT }, { "DELETE", VK_DELETE }, { "HOME", VK_HOME },
+    { "END", VK_END }, { "PGUP", VK_PRIOR }, { "PGDN", VK_NEXT },
+    { "MOUSE1", VK_LBUTTON }, { "MOUSE2", VK_RBUTTON }, { "MOUSE3", VK_MBUTTON },
+    { "MOUSE4", VK_XBUTTON1 }, { "MOUSE5", VK_XBUTTON2 },
+    { "F2", VK_F2 }, { "F3", VK_F3 }, { "F4", VK_F4 }, { "F5", VK_F5 }, { "F6", VK_F6 },
+    { "F7", VK_F7 }, { "F8", VK_F8 }, { "F11", VK_F11 },
+    { "NUM0", VK_NUMPAD0 }, { "NUM1", VK_NUMPAD1 }, { "NUM2", VK_NUMPAD2 },
+    { "NUM3", VK_NUMPAD3 }, { "NUM4", VK_NUMPAD4 }, { "NUM5", VK_NUMPAD5 },
+    { "NUM6", VK_NUMPAD6 }, { "NUM7", VK_NUMPAD7 }, { "NUM8", VK_NUMPAD8 },
+    { "NUM9", VK_NUMPAD9 },
+    { ",", VK_OEM_COMMA }, { ".", VK_OEM_PERIOD }, { ";", VK_OEM_1 }, { "/", VK_OEM_2 },
+};
+
+enum {
+    C_A, C_B, C_X, C_Y, C_BLACK, C_WHITE, C_LT, C_RT,
+    C_START, C_BACK, C_LS, C_RS, C_UP, C_DOWN, C_LEFT, C_RIGHT,
+    C_MOVE_UP, C_MOVE_DOWN, C_MOVE_LEFT, C_MOVE_RIGHT, C_COUNT
+};
+#define MAX_BIND 3
+
+static const struct { const char *name, *keys; } k_controls[C_COUNT] = {
+    { "A", "SPACE,ENTER" }, { "B", "E,BACKSPACE" }, { "X", "MOUSE1" },
+    { "Y", "MOUSE2" }, { "BLACK", "C" }, { "WHITE", "R" },
+    { "LT", "SHIFT" }, { "RT", "Q" }, { "START", "ESC" }, { "BACK", "TAB" },
+    { "LS", "F" }, { "RS", "MOUSE3" },
+    { "UP", "UP" }, { "DOWN", "DOWN" }, { "LEFT", "LEFT" }, { "RIGHT", "RIGHT" },
+    { "MOVE_UP", "W" }, { "MOVE_DOWN", "S" }, { "MOVE_LEFT", "A" }, { "MOVE_RIGHT", "D" },
+};
+
+static int s_bind[C_COUNT][MAX_BIND];
+
+static int key_code(const char *name)
 {
-    return xbox_FramebufferKeyDown(vk) ? TRUE : FALSE;
+    size_t i;
+    if (name[0] && !name[1]
+            && ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= '0' && name[0] <= '9')))
+        return name[0];
+    for (i = 0; i < sizeof k_keys / sizeof k_keys[0]; i++)
+        if (!_stricmp(name, k_keys[i].name))
+            return k_keys[i].vk;
+    return 0;
 }
 
-/* A thumb axis from two keys, at the full deflection a digital key implies. */
-static SHORT axis_from_keys(int negative, int positive)
+/* The bindings, from the settings over the defaults; again when they change. */
+static void bindings_update(void)
+{
+    extern const char *xbox_setting_get(const char *key);
+    extern long xbox_settings_gen(void);
+    static long gen = -1;
+    int c, n;
+    if (gen == xbox_settings_gen())
+        return;
+    gen = xbox_settings_gen();
+    for (c = 0; c < C_COUNT; c++) {
+        char key[40], list[96], *tok, *ctx = NULL;
+        const char *v;
+        snprintf(key, sizeof key, "RECOMP_BIND_%s", k_controls[c].name);
+        v = xbox_setting_get(key);
+        strncpy(list, v && *v ? v : k_controls[c].keys, sizeof list - 1);
+        list[sizeof list - 1] = 0;
+        _strupr(list);
+        memset(s_bind[c], 0, sizeof s_bind[c]);
+        n = 0;
+        for (tok = strtok_s(list, ", ", &ctx); tok && n < MAX_BIND;
+             tok = strtok_s(NULL, ", ", &ctx))
+            if ((s_bind[c][n] = key_code(tok)) != 0)
+                n++;
+    }
+}
+
+static BOOL control_down(int c)
+{
+    int i;
+    for (i = 0; i < MAX_BIND && s_bind[c][i]; i++)
+        if (xbox_FramebufferKeyDown(s_bind[c][i]))
+            return TRUE;
+    return FALSE;
+}
+
+/* A thumb axis from two controls, at the full deflection a key implies. */
+static SHORT axis_from(int negative, int positive)
 {
     int v = 0;
-    if (key_down(negative)) v -= 32767;
-    if (key_down(positive)) v += 32767;
+    if (control_down(negative)) v -= 32767;
+    if (control_down(positive)) v += 32767;
+    return (SHORT)v;
+}
+
+/* Mouse movement as the right stick: RECOMP_MOUSE_SENS (default 1) counts
+ * per poll for full deflection is 25 / sensitivity. */
+static SHORT mouse_axis(int d)
+{
+    extern float xbox_setting_float(const char *key, float def);
+    float sens = xbox_setting_float("RECOMP_MOUSE_SENS", 1.0f);
+    float v = (float)d * sens * (32767.0f / 25.0f);
+    if (v > 32767.0f) v = 32767.0f;
+    if (v < -32767.0f) v = -32767.0f;
     return (SHORT)v;
 }
 
@@ -157,36 +246,37 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
 {
     static DWORD packet;
     WORD b = 0;
+    int dx, dy;
 
+    bindings_update();
     memset(pState, 0, sizeof(*pState));
 
-    if (key_down(VK_UP))     b |= XBOX_GAMEPAD_DPAD_UP;
-    if (key_down(VK_DOWN))   b |= XBOX_GAMEPAD_DPAD_DOWN;
-    if (key_down(VK_LEFT))   b |= XBOX_GAMEPAD_DPAD_LEFT;
-    if (key_down(VK_RIGHT))  b |= XBOX_GAMEPAD_DPAD_RIGHT;
-    if (key_down(VK_RETURN)) b |= XBOX_GAMEPAD_START;
-    if (key_down(VK_BACK))   b |= XBOX_GAMEPAD_BACK;
-    if (key_down(VK_SHIFT))  b |= XBOX_GAMEPAD_LEFT_THUMB;
-    if (key_down(VK_CONTROL))b |= XBOX_GAMEPAD_RIGHT_THUMB;
+    if (control_down(C_UP))    b |= XBOX_GAMEPAD_DPAD_UP;
+    if (control_down(C_DOWN))  b |= XBOX_GAMEPAD_DPAD_DOWN;
+    if (control_down(C_LEFT))  b |= XBOX_GAMEPAD_DPAD_LEFT;
+    if (control_down(C_RIGHT)) b |= XBOX_GAMEPAD_DPAD_RIGHT;
+    if (control_down(C_START)) b |= XBOX_GAMEPAD_START;
+    if (control_down(C_BACK))  b |= XBOX_GAMEPAD_BACK;
+    if (control_down(C_LS))    b |= XBOX_GAMEPAD_LEFT_THUMB;
+    if (control_down(C_RS))    b |= XBOX_GAMEPAD_RIGHT_THUMB;
     pState->Gamepad.wButtons = b;
 
     /* Analog on the console, so a key is 255 rather than a flag -- a title
      * that reads these as a pressure never sees a press if they are 1. */
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = key_down('Z') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = key_down('X') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = key_down('A') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = key_down('S') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = key_down('Q') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = key_down('E') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = key_down('1') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = key_down('3') ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = control_down(C_A) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = control_down(C_B) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = control_down(C_X) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = control_down(C_Y) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = control_down(C_WHITE) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = control_down(C_BLACK) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = control_down(C_LT) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = control_down(C_RT) ? 255 : 0;
 
-    /* W/A/S/D would collide with the face buttons above, so the left thumb
-     * shares the arrow keys' row on the numeric pad instead. */
-    pState->Gamepad.sThumbLX = axis_from_keys(VK_NUMPAD4, VK_NUMPAD6);
-    pState->Gamepad.sThumbLY = axis_from_keys(VK_NUMPAD2, VK_NUMPAD8);
-    pState->Gamepad.sThumbRX = axis_from_keys('J', 'L');
-    pState->Gamepad.sThumbRY = axis_from_keys('K', 'I');
+    pState->Gamepad.sThumbLX = axis_from(C_MOVE_LEFT, C_MOVE_RIGHT);
+    pState->Gamepad.sThumbLY = axis_from(C_MOVE_DOWN, C_MOVE_UP);
+    xbox_FramebufferMouseDelta(&dx, &dy);
+    pState->Gamepad.sThumbRX = mouse_axis(dx);
+    pState->Gamepad.sThumbRY = mouse_axis(-dy);
 
     /* The title's input layer looks for button edges, so the packet number
      * has to move whenever the state does or a press is never noticed. */
