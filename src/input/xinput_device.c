@@ -370,7 +370,11 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     note_activity(pState, 2);           /* the mouse moving alone does not count */
     xbox_FramebufferMouseDelta(&dx, &dy);
     pState->Gamepad.sThumbRX = mouse_axis(dx);
-    pState->Gamepad.sThumbRY = mouse_axis(-dy);
+    {
+        /* RECOMP_MOUSE_INVERT=1: mouse up looks down, as a flight stick. */
+        extern int xbox_setting_int(const char *key, int def);
+        pState->Gamepad.sThumbRY = mouse_axis(xbox_setting_int("RECOMP_MOUSE_INVERT", 0) ? dy : -dy);
+    }
 
     /* The title's input layer looks for button edges, so the packet number
      * has to move whenever the state does or a press is never noticed. */
