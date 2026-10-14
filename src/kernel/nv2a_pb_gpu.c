@@ -2276,15 +2276,31 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
              * wholly in the bar (below 84% of the height) moves down 5 lines
              * (at 480). Not the bottom fifth: the pause menu's last item sits
              * there too, split across two draws, and only half of it moved. */
-            float H = (float)s->h / (float)fy, top = 1e30f;
+            float W = (float)s->w / (float)fx, H = (float)s->h / (float)fy, top = 1e30f;
+            float left = 1e30f, right = -1e30f;
             uint32_t k;
             for (k = 0; k < nverts; k++) {
+                float x = attr[(k * stride + (uint32_t)slot[0]) * 4 + 0];
                 float y = attr[(k * stride + (uint32_t)slot[0]) * 4 + 1];
                 if (y < top) top = y;
+                if (x < left) left = x;
+                if (x > right) right = x;
             }
             top += pg.ui2[0];          /* the title's own offset, as drawn */
             if (top > H * 0.84f)
                 pg.ui2[3] += 5.0f * H / 480.0f;
+            /* A draw across the whole width -- a menu backdrop, the rune
+             * bands, a fade, the cutscene bars -- is a full-screen layer, not
+             * text: it keeps the whole width. Narrowed with the rest of the
+             * layer it left the sides of a widescreen screen bare. Height
+             * stays mapped with the layer, so the bands keep their text. */
+            left += pg.ui[0];
+            right += pg.ui[0];
+            if (left <= 1.0f && right >= W - 2.0f) {
+                pg.ui[0] = 0;
+                pg.ui[2] = 1;
+                pg.ui[3] = 0;
+            }
         }
     }
     memcpy(pg.fog, fog, sizeof pg.fog);
