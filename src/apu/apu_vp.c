@@ -1284,12 +1284,89 @@ static void voice_process(MCPXAPUState *d,
  * Simplified single-threaded version (no worker threads initially)
  * ============================================================ */
 
+/* ---- idle voices: one report at a time ------------------------------------
+ *
+ * A voice the title switched off stays in its list until DirectSound,
+ * told by an SE2FE_IDLE_VOICE trap, takes it out and marks its stop done;
+ * until then the title waits on it (and, past 0.5 s, forces it). The trap
+ * carries one voice (FEDECPARAM). Reporting every idle voice of a pass
+ * overwrote it with each, so when a fight stopped many sounds at once
+ * DirectSound heard about the last of each pass only, and the rest waited
+ * out the timeout -- the 5-15 fps stalls. As the chip does, a report waits
+ * while the front end is trapped: the voice stays in the list and is
+ * reported in a later pass, once the trap before it has been serviced.
+ *
+ * Voices waiting longer than 300 ms are logged ([APUVOICE]), with how often
+ * they were reported and held back, so a stall says where it is. */
+static struct {
+    uint32_t since;       /* ms first seen idle, 0 = not waiting */
+    unsigned reports, held;
+    unsigned seen;        /* pass that last saw it in a list */
+    int logged;
+} s_idle[MCPX_HW_MAX_VOICES];
+static unsigned s_idle_pass;
+
+static uint32_t idle_ms(void)
+{
+    return (uint32_t)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) / 1000);
+}
+
+static void idle_voice_report(MCPXAPUState *d, uint16_t v)
+{
+    int trapped = (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                  == NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
+    if (v < MCPX_HW_MAX_VOICES) {
+        if (!s_idle[v].since) {
+            { uint32_t t = idle_ms(); s_idle[v].since = t ? t : 1; }   /* 0 = not waiting */
+            s_idle[v].reports = s_idle[v].held = 0;
+            s_idle[v].logged = 0;
+        }
+        s_idle[v].seen = s_idle_pass;
+        if (trapped)
+            s_idle[v].held++;
+        else
+            s_idle[v].reports++;
+    }
+    if (!trapped)
+        fe_method(d, SE2FE_IDLE_VOICE, v);
+}
+
+/* After a pass: voices no longer in a list were taken out (their stop
+ * confirmed); voices still waiting long are logged once. */
+static void idle_voice_audit(MCPXAPUState *d)
+{
+    static unsigned lines;
+    uint32_t now = idle_ms();
+    for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        if (!s_idle[v].since)
+            continue;
+        uint32_t waited = now - s_idle[v].since;
+        if (s_idle[v].seen != s_idle_pass) {
+            if (waited > 300 && lines < 200) {
+                lines++;
+                fprintf(stderr, "[APUVOICE] voice %u confirmed after %lu ms"
+                        " (reported %u, held %u)\n", v, (unsigned long)waited,
+                        s_idle[v].reports, s_idle[v].held);
+            }
+            s_idle[v].since = 0;
+        } else if (waited > 300 && !s_idle[v].logged && lines < 200) {
+            lines++;
+            s_idle[v].logged = 1;
+            fprintf(stderr, "[APUVOICE] voice %u unconfirmed for %lu ms"
+                    " (reported %u, held %u, FECTL %08X)\n", v,
+                    (unsigned long)waited, s_idle[v].reports, s_idle[v].held,
+                    d->regs[NV_PAPU_FECTL]);
+        }
+    }
+}
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     unsigned active[3] = { 0, 0, 0 };
     static unsigned frames;
     s_vp_frame++;                           /* resampler state freshness */
+    s_idle_pass++;
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {
@@ -1312,7 +1389,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                fe_method(d, SE2FE_IDLE_VOICE, v);
+                idle_voice_report(d, v);
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
@@ -1326,6 +1403,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
     if (vp_trace() && frames++ % 1500 == 0)       /* 1500 x 32 samples = 1 s */
         fprintf(stderr, "  [APUVP] frame %u: active voices 2D %u 3D %u MP %u\n",
                 frames, active[0], active[1], active[2]);
+    idle_voice_audit(d);
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
