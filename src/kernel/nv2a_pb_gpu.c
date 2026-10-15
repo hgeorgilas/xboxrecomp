@@ -2563,6 +2563,32 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
                 if (nudge > 0 && top > H * 0.84f)
                     pg.ui2[3] += nudge * H / 480.0f;
             }
+            {
+                /* The HUD out at the screen's edges. The layer keeps its
+                 * shapes, so on a wide screen the title's safe box -- and
+                 * the HUD laid out at its sides -- sits in the middle with
+                 * bare bands either side. A draw wholly in the box's left
+                 * 40% moves left, one wholly in its right 40% moves right,
+                 * to 3% of the width from the edge; one across the middle
+                 * (centred text, prompts) stays. Only while the title says
+                 * its HUD is up (quirk hud_edges): menus and pause screens
+                 * lay out tables across the box that would come apart.
+                 * RECOMP_WIDE_HUD=0 keeps the HUD in the box. */
+                static long gen;
+                static int on = 1;
+                float shift = pg.ui[3] + 0.5f - 0.03f * W;
+                if (gen != xbox_settings_gen()) {
+                    gen = xbox_settings_gen();
+                    on = xbox_setting_int("RECOMP_WIDE_HUD", 1) != 0;
+                }
+                if (on && shift > 0 && xbox_Quirk("hud_edges") > 0) {
+                    float bw = W - 2.0f * (pg.ui[0] + 0.5f);   /* the box, as laid out */
+                    if (right <= 0.4f * bw)
+                        pg.ui[3] -= shift;
+                    else if (left >= 0.6f * bw)
+                        pg.ui[3] += shift;
+                }
+            }
             /* A draw across the whole width -- a menu backdrop, the rune
              * bands, a fade, the cutscene bars -- is a full-screen layer, not
              * text: it keeps the whole width. Narrowed with the rest of the

@@ -172,6 +172,11 @@ const char *xbox_settings_path(void)
  *                                          bar (below 84% of the height) moves
  *                                          down that many lines (at 480), once
  *                                          the 2D layer fills the screen
+ *   xbox_SetQuirk("hud_edges", 1)          the HUD is up: 2D drawn wholly at
+ *                                          a side of the layer moves out to
+ *                                          a wide screen's edges (the title
+ *                                          sets it live; RECOMP_WIDE_HUD=0
+ *                                          turns the move off)
  *   xbox_SetQuirk("bloom_composites", 1)   RHW-0 composites blended onto the
  *                                          frame (src alpha with one, or with
  *                                          1 - src alpha) are the bloom, which
