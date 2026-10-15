@@ -2460,6 +2460,13 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
                 st->blend_sfactor, st->blend_dfactor, st->depth_test,
                 st->use_rc ? st->rc.stage_program : 0xFFFFF,
                 st->tex[0].valid ? st->tex[0].addr : 0);
+    if (s_cap.active && s_flip == s_cap.flip && s_cap.log)
+        /* Fog: enable, mode, params; its colour; the final combiner,
+         * which mixes it in (input FOG is register 3). */
+        fprintf(s_cap.log, "          fog %g mode %X params %g %g colour %.2f %.2f %.2f"
+                " final %08X %08X\n", fog[0], (unsigned)fog[1], fog[2], fog[3],
+                st->fog_color[0], st->fog_color[1], st->fog_color[2],
+                st->rc.final0, st->rc.final1);
     if (s_cap.active && s_flip == s_cap.flip && s_cap.log) {
         /* The viewport a program maps to, where Spartan keeps it (c[0]
          * offset, c[1] scale) -- a pass drawn at a different scale shows. */

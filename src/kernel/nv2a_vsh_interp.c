@@ -401,6 +401,10 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
                 write_masked(opos.v, src, omask);
             } else if (oaddr < 13) {
                 write_masked(outregs[oaddr], src, omask);
+                if (oaddr == 5 && omask)
+                    /* oFog: the first component the mask writes lands in
+                     * x, which the fog unit reads (nv2a_vsh_hlsl.c). */
+                    outregs[5][0] = src->v[(omask & 8) ? 0 : (omask & 4) ? 1 : (omask & 2) ? 2 : 3];
             }
         }
         if (field(ins, 3, 0, 1)) {

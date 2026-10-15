@@ -206,6 +206,15 @@ size_t nv2a_vsh_hlsl(char *buf, size_t cap, uint64_t *hash)
                 char d[8];
                 snprintf(d, sizeof d, "o[%u]", oaddr);
                 masked(&o, d, val, omask);
+                if (oaddr == 5) {
+                    /* oFog: the hardware puts the first component the mask
+                     * writes into x, which the fog unit reads (xemu's
+                     * fog_mask_str). Spartan writes its fog distance as
+                     * oFog.z; read from x as written, the distance stayed 0
+                     * and nothing was ever fogged. */
+                    char c = (omask & 8) ? 'x' : (omask & 4) ? 'y' : (omask & 2) ? 'z' : 'w';
+                    put(&o, "    o[5].x = %s.%c;\n", val, c);
+                }
             }
         }
         put(&o, "  }\n");
