@@ -1490,6 +1490,17 @@ static void storm_note(int which, const char *name, uint32_t detail)
         limit = e && atol(e) > 0 ? atol(e) : 1000000;
     }
     if (now - window[which] >= 1000) {
+        /* RECOMP_RATE_LOG=1: each second's count, every 10 s, to see a
+         * rate climb long before it is a storm. */
+        static int rate_log = -1;
+        static LONG reported;
+        if (rate_log < 0)
+            rate_log = getenv("RECOMP_RATE_LOG") != NULL;
+        if (rate_log && window[which] && now - reported >= 10000 && which == 0) {
+            reported = now;
+            fprintf(stderr, "  [RATE] %s %ld/s, KeInsertQueueDpc %ld/s\n",
+                    name, (long)count[0], (long)count[1]);
+        }
         InterlockedExchange(&window[which], now);
         InterlockedExchange(&count[which], 0);
     }

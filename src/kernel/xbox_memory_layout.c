@@ -1260,6 +1260,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
+        {
+            /* RECOMP_TEST_PB_STALL_MS=<ms>: make each pass that long, as a
+             * heavy frame's draws make it -- to test what waits on it. */
+            static int stall = -1;
+            if (stall < 0) {
+                const char *e = getenv("RECOMP_TEST_PB_STALL_MS");
+                stall = e ? atoi(e) : 0;
+            }
+            if (stall > 0)
+                Sleep((DWORD)stall);
+        }
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
     return 0;

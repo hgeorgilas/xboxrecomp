@@ -257,6 +257,15 @@ static void pin_cursor(HWND h)
     }
 }
 
+/* Frames the title finished in the last second -- its flips, the rate its
+ * game logic runs at -- as the title bar shows (the overlay's counter too). */
+static volatile float s_game_fps;
+
+float xbox_FramebufferFps(void)
+{
+    return s_game_fps;
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     if (m == WM_ENTERSIZEMOVE || m == WM_EXITSIZEMOVE) {
@@ -622,9 +631,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (now - t0 >= 1000) {
                 LONG f = s_flips;
                 wchar_t tb[128];
+                s_game_fps = t0 ? (float)((f - f0) * 1000.0 / (now - t0)) : 0.0f;
                 _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
-                           t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
-                           (long)s_frame_draws);
+                           (double)s_game_fps, (long)s_frame_draws);
                 tb[127] = 0;
                 SetWindowTextW(hwnd, tb);
                 t0 = now; f0 = f;

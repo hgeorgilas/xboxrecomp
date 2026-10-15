@@ -28,6 +28,7 @@ const char *xbox_setting_get(const char *key);
 int   xbox_setting_int(const char *key, int def);
 float xbox_setting_float(const char *key, float def);
 float xbox_Quirk(const char *name);
+float xbox_FramebufferFps(void);
 void  xbox_setting_set(const char *key, const char *val);
 void  xbox_FramebufferSetFullscreen(int on);
 int   texpack_scan_memory(void);
@@ -253,7 +254,7 @@ void panel()
         bool fps = xbox_setting_int("RECOMP_SHOW_FPS", 0) != 0;
         if (ImGui::Checkbox("Show frame rate", &fps))
             set_int("RECOMP_SHOW_FPS", fps ? 1 : 0);
-        ImGui::Text("%.1f fps", g_fps);
+        ImGui::Text("%.1f fps", xbox_FramebufferFps());
     }
 
     ImGui::Separator();
@@ -370,7 +371,7 @@ void fps_corner()
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
                  | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing
                  | ImGuiWindowFlags_NoNav);
-    ImGui::Text("%.0f fps", g_fps);
+    ImGui::Text("%.0f fps", xbox_FramebufferFps());
     ImGui::End();
 }
 
