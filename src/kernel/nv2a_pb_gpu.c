@@ -2670,6 +2670,11 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
                  * (centred text, prompts) stays. Only while the title says
                  * its HUD is up (quirk hud_edges): menus and pause screens
                  * lay out tables across the box that would come apart.
+                 * Nor in the bottom bar (below 84% of the height, as the
+                 * nudge above): subtitles are drawn there in pieces -- a
+                 * highlighted word is its own draw -- and one piece wholly
+                 * at a side ("Athena." after "Seek the Blades of") moved
+                 * away from the rest of its line.
                  * RECOMP_WIDE_HUD=0 keeps the HUD in the box. */
                 static long gen;
                 static int on = 1;
@@ -2678,7 +2683,7 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
                     gen = xbox_settings_gen();
                     on = xbox_setting_int("RECOMP_WIDE_HUD", 1) != 0;
                 }
-                if (on && shift > 0 && xbox_Quirk("hud_edges") > 0) {
+                if (on && shift > 0 && top <= H * 0.84f && xbox_Quirk("hud_edges") > 0) {
                     float bw = W - 2.0f * (pg.ui[0] + 0.5f);   /* the box, as laid out */
                     if (right <= 0.4f * bw)
                         pg.ui[3] -= shift;
