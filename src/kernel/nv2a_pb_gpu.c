@@ -2431,18 +2431,27 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
          * laid over it at half strength (src alpha, 1 - src alpha) -- the
          * bloom and the haze around it. RECOMP_BLOOM (0..1, 1 as the game)
          * scales the one's colour and the other's alpha. */
-        if (q_bloom && v == nverts && st->blend_enable && st->blend_sfactor == 0x302
-                && (st->blend_dfactor == 0x0001 || st->blend_dfactor == 0x0303)) {
-            static long gen;
-            static float k = 1.0f;
-            if (gen != xbox_settings_gen()) {
-                gen = xbox_settings_gen();
-                k = xbox_setting_float("RECOMP_BLOOM", 1.0f);
-                if (k < 0) k = 0;
-                if (k > 1) k = 1;
-            }
-            s_out_scale[st->blend_dfactor == 0x0001 ? 0 : 1] = k;
+        static long gen;
+        static float k = 1.0f;
+        const Surface *rt;
+        if (gen != xbox_settings_gen()) {
+            gen = xbox_settings_gen();
+            k = xbox_setting_float("RECOMP_BLOOM", 1.0f);
+            if (k < 0) k = 0;
+            if (k > 1) k = 1;
         }
+        if (v == nverts && st->blend_enable && st->blend_sfactor == 0x302
+                && (st->blend_dfactor == 0x0001 || st->blend_dfactor == 0x0303))
+            s_out_scale[st->blend_dfactor == 0x0001 ? 0 : 1] = k;
+        /* ...and the glow proper: the blurred bright parts (a smaller
+         * target drawn this frame) added onto the frame, one to one. Its
+         * vertices have w 1, so the rule above never saw it, and the slider
+         * left the strongest part of the bloom alone -- in a fog scene,
+         * where the whole screen is bright, a white wash. */
+        else if (st->blend_enable && st->blend_sfactor == 0x0001 && st->blend_dfactor == 0x0001
+                && st->tex[0].valid && st->tex[0].width < st->clip_w
+                && (rt = surface_find(st->tex[0].addr)) != NULL && rt->drawn_flip == s_flip)
+            s_out_scale[0] = k;
     }
 
     if (!nidx || !nverts || !pbgpu_enabled()) {
