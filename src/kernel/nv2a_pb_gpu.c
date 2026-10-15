@@ -993,9 +993,9 @@ static ID3D11RasterizerState *rs_get(const PbGpuState *st)
     /* SET_ZMIN_MAX_CONTROL: geometry past the near and far planes is
      * culled unless ZCLAMP_EN (bits 4-7) says clamp, as xemu does. Spartan
      * asks for culling; clamped, the scenery beyond its far plane was drawn
-     * squashed onto it, where the depth-of-field quad (at the far plane,
-     * LEQUAL) then blurred it -- a hard-edged blurred city in cutscenes
-     * where the console shows fog. */
+     * squashed onto it, where its cutscenes' depth-of-field quad (near the
+     * far plane, LEQUAL) then blurred it -- a hard-edged blurred city where
+     * the console shows fog. */
     clamp = ((st->zminmax >> 4) & 0xF) == 1;
     key = (uint32_t)cull | (uint32_t)ccw << 4 | (uint32_t)clamp << 5
         | ((uint32_t)bias & 0xFFFF) << 8 | ((uint32_t)(slope * 16.0f) & 0xFF) << 24;
@@ -1729,6 +1729,57 @@ static void snap_flip(void)
             ID3D11Texture2D_Release(s_snap.t[i]);
             s_snap.t[i] = NULL;
         }
+        /* The depth buffers as the frame left them (single-sampled ones):
+         * grey from the far plane down, white = exactly far; and how many
+         * pixels hold exactly far. */
+        for (i = 0; i < MAX_ZETA; i++) {
+            Zeta *z = &s_zeta[i];
+            D3D11_TEXTURE2D_DESC td;
+            ID3D11Texture2D *st = NULL;
+            D3D11_MAPPED_SUBRESOURCE m;
+            if (!z->tex || z->samples > 1)
+                continue;
+            ID3D11Texture2D_GetDesc(z->tex, &td);
+            td.Usage = D3D11_USAGE_STAGING;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
+                continue;
+            ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)z->tex);
+            if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
+                                                  D3D11_MAP_READ, 0, &m))) {
+                char path[128];
+                FILE *fp;
+                uint32_t y, x, hdr[13], w = td.Width, h = td.Height, nfar = 0;
+                snprintf(path, sizeof path, "%sdepth_%08X_%ux%u.bmp", dir, z->key, w, h);
+                if ((fp = fopen(path, "wb")) != NULL) {
+                    memset(hdr, 0, sizeof hdr);
+                    fwrite("BM", 1, 2, fp);
+                    hdr[0] = 54 + w * h * 4; hdr[2] = 54; hdr[3] = 40;
+                    hdr[4] = w; hdr[5] = (uint32_t)-(int32_t)h; hdr[6] = 1 | (32 << 16);
+                    fwrite(hdr, 4, 13, fp);
+                    for (y = 0; y < h; y++)
+                        for (x = 0; x < w; x++) {
+                            uint32_t d = ((const uint32_t *)((const uint8_t *)m.pData
+                                          + (size_t)y * m.RowPitch))[x] & 0xFFFFFFu;
+                            uint32_t gap = 0xFFFFFFu - d, g;
+                            uint8_t px[4];
+                            nfar += gap == 0;
+                            /* 0 = far; 1/256 of the range per grey step */
+                            g = gap >= 0x10000u * 255 ? 0 : 255 - gap / 0x10000u;
+                            (void)g;   /* raw: B low, G middle, R high byte */
+                            px[0] = (uint8_t)d; px[1] = (uint8_t)(d >> 8);
+                            px[2] = (uint8_t)(d >> 16); px[3] = 255;
+                            fwrite(px, 1, 4, fp);
+                        }
+                    fclose(fp);
+                }
+                fprintf(stderr, "  [SNAP] depth %08X %ux%u: %u pixel(s) at the far plane\n",
+                        z->key, w, h, nfar);
+                ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+            }
+            ID3D11Texture2D_Release(st);
+        }
         fprintf(stderr, "  [SNAP] %u pass(es) of flip %u -> %s\n", s_snap.n, s_snap.flip, dir);
         s_snap.armed = 0;
         s_snap.n = 0;
@@ -2158,7 +2209,7 @@ static const char k_pg_head[] =
 "  else if (mode == 0x801 || mode == 0x803) f = px + exp2(-d * d * py * py * 32.0) - 1.5;\n"
 "  else f = px + d * py - 1.0;\n"
 "  if (mode == 0x802 || mode == 0x803 || mode == 0x804) f = abs(f);\n"
-"  if (isnan(f)) f = 1.0;\n"
+"  if ((asuint(f) & 0x7F800000u) == 0x7F800000u) f = 1.0;   /* not isnan: see below */\n"
 "  return saturate(f); }\n"
 "VO main(uint vid : SV_VertexID) {\n"
 "  float4 v[16]; int k;\n"
@@ -2171,7 +2222,9 @@ static const char k_pg_head[] =
 
 static const char k_pg_tail[] =
 "  VO r; float w = oPos.w;\n"
-"  if (isinf(w) || isnan(w)) w = 1.0;\n"
+"  /* inf or NaN, by its exponent bits: without IEEE strictness the\n"
+"   * compiler may fold isinf/isnan to false. */\n"
+"  if ((asuint(w) & 0x7F800000u) == 0x7F800000u) w = 1.0;\n"
 "  if (ui.y > 0 && oPos.w == 1) {\n"
 "    if (oPos.x >= ui.y - 1.5 && oPos.x < ui.y) oPos.x = ui.y;\n"
 "    if (oPos.y >= ui2.y - 1.5 && oPos.y < ui2.y) oPos.y = ui2.y; }\n"
@@ -2421,6 +2474,24 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
     static int q_bloom = -1;
     if (q_bloom < 0)
         q_bloom = xbox_Quirk("bloom_composites") != 0;
+    {
+        /* dof_quad (title quirk, set live): the title's depth of field is a
+         * screen quad near the far plane laying a blurred copy of the frame
+         * (a smaller render target) over whatever lies deeper -- no
+         * blending, depth test on, w 0. RECOMP_DOF=0 leaves it out. The
+         * title clears the quirk while a quad of the same kind is its pause
+         * backdrop. */
+        static long gen;
+        static int dof = 1;
+        if (gen != xbox_settings_gen()) {
+            gen = xbox_settings_gen();
+            dof = xbox_setting_int("RECOMP_DOF", 1) != 0;
+        }
+        if (!dof && slot[0] >= 0 && nverts == 4 && !st->blend_enable && st->depth_test
+                && st->tex[0].valid && st->tex[0].width < st->clip_w
+                && attr[(uint32_t)slot[0] * 4 + 3] == 0.0f && xbox_Quirk("dof_quad") > 0)
+            return 1;
+    }
     if (q_bloom && slot[0] >= 0 && nverts && st->clip_w) {
         uint32_t v;
         for (v = 0; v < nverts; v++)
@@ -2473,9 +2544,11 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
         /* Fog: enable, mode, params; its colour; the final combiner,
          * which mixes it in (input FOG is register 3). */
         fprintf(s_cap.log, "          fog %g mode %X params %g %g colour %.2f %.2f %.2f"
-                " final %08X %08X\n", fog[0], (unsigned)fog[1], fog[2], fog[3],
+                " final %08X %08X poly_offset %u scale %g bias %g zminmax %X\n",
+                fog[0], (unsigned)fog[1], fog[2], fog[3],
                 st->fog_color[0], st->fog_color[1], st->fog_color[2],
-                st->rc.final0, st->rc.final1);
+                st->rc.final0, st->rc.final1, st->poly_offset_fill,
+                st->poly_offset_scale, st->poly_offset_bias, st->zminmax);
     if (s_cap.active && s_flip == s_cap.flip && s_cap.log) {
         /* The viewport a program maps to, where Spartan keeps it (c[0]
          * offset, c[1] scale) -- a pass drawn at a different scale shows. */

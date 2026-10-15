@@ -177,6 +177,11 @@ const char *xbox_settings_path(void)
  *                                          a wide screen's edges (the title
  *                                          sets it live; RECOMP_WIDE_HUD=0
  *                                          turns the move off)
+ *   xbox_SetQuirk("dof_quad", 1)           an RHW-0 screen quad drawn with
+ *                                          the depth test and no blending,
+ *                                          a smaller render target as its
+ *                                          texture, is depth of field, which
+ *                                          RECOMP_DOF=0 leaves out (set live)
  *   xbox_SetQuirk("bloom_composites", 1)   RHW-0 composites blended onto the
  *                                          frame (src alpha with one, or with
  *                                          1 - src alpha) are the bloom, which

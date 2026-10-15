@@ -218,6 +218,11 @@ void panel()
             set_float("RECOMP_BLOOM", (float)pct / 100.0f);
         ImGui::SetItemTooltip("The glow around bright things, and its haze. 100%% is the"
                               " game as it shipped.");
+        bool dof = xbox_setting_int("RECOMP_DOF", 1) != 0;
+        if (ImGui::Checkbox("Depth of field", &dof))
+            set_int("RECOMP_DOF", dof ? 1 : 0);
+        ImGui::SetItemTooltip("The blur over the distance in cutscenes. On is the game as"
+                              " it shipped; off keeps the distance sharp.");
     }
 
     ImGui::SeparatorText("Textures");
