@@ -337,6 +337,7 @@ static struct {
              stencil_op_zpass;
     uint32_t cull_enable, cull_face, front_face;
     uint32_t control0, aa_control;      /* SET_CONTROL0, SET_ANTI_ALIASING_CONTROL */
+    uint32_t zminmax;                   /* SET_ZMIN_MAX_CONTROL */
     uint32_t poly_offset_fill;
     float    poly_offset_scale, poly_offset_bias;
 } s_gpu;
@@ -2130,6 +2131,7 @@ static void gpu_state(PbGpuState *g)
     g->stencil_op_zpass = s_gpu.stencil_op_zpass;
     g->surf_format = s_gpu.format;
     g->control0 = s_gpu.control0;
+    g->zminmax = s_gpu.zminmax;
     g->aa_control = s_gpu.aa_control;
     g->cull_enable = s_gpu.cull_enable;
     g->cull_face = s_gpu.cull_face;
@@ -3937,6 +3939,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x0308: s_gpu.cull_enable = param; break;       /* CULL_FACE_ENABLE */
     case 0x039C: s_gpu.cull_face = param; break;         /* CULL_FACE */
     case 0x0290: s_gpu.control0 = param; break;          /* CONTROL0 */
+    case 0x1D78: s_gpu.zminmax = param; break;           /* ZMIN_MAX_CONTROL */
     case 0x1D7C: s_gpu.aa_control = param; break;        /* ANTI_ALIASING_CONTROL */
     case 0x03A0: s_gpu.front_face = param; break;        /* FRONT_FACE */
 

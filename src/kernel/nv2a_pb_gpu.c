@@ -965,7 +965,7 @@ static ID3D11RasterizerState *rs_get(const PbGpuState *st)
     static int n;
     D3D11_RASTERIZER_DESC rd;
     D3D11_CULL_MODE cull = D3D11_CULL_NONE;
-    BOOL ccw;
+    BOOL ccw, clamp;
     int bias = 0, i;
     float slope = 0;
     uint32_t key;
@@ -990,8 +990,15 @@ static ID3D11RasterizerState *rs_get(const PbGpuState *st)
         bias = (int)st->poly_offset_bias;
         slope = st->poly_offset_scale;
     }
-    key = (uint32_t)cull | (uint32_t)ccw << 4 | ((uint32_t)bias & 0xFFFF) << 8
-        | ((uint32_t)(slope * 16.0f) & 0xFF) << 24;
+    /* SET_ZMIN_MAX_CONTROL: geometry past the near and far planes is
+     * culled unless ZCLAMP_EN (bits 4-7) says clamp, as xemu does. Spartan
+     * asks for culling; clamped, the scenery beyond its far plane was drawn
+     * squashed onto it, where the depth-of-field quad (at the far plane,
+     * LEQUAL) then blurred it -- a hard-edged blurred city in cutscenes
+     * where the console shows fog. */
+    clamp = ((st->zminmax >> 4) & 0xF) == 1;
+    key = (uint32_t)cull | (uint32_t)ccw << 4 | (uint32_t)clamp << 5
+        | ((uint32_t)bias & 0xFFFF) << 8 | ((uint32_t)(slope * 16.0f) & 0xFF) << 24;
     for (i = 0; i < n; i++)
         if (keys[i] == key)
             return cache[i];
@@ -1001,7 +1008,7 @@ static ID3D11RasterizerState *rs_get(const PbGpuState *st)
     rd.FrontCounterClockwise = ccw;
     rd.DepthBias = bias;
     rd.SlopeScaledDepthBias = slope;
-    rd.DepthClipEnable = FALSE;
+    rd.DepthClipEnable = !clamp;
     rd.ScissorEnable = TRUE;
     if (n == 64)
         return s_rs;
@@ -2171,6 +2178,7 @@ static const char k_pg_tail[] =
 "  if (ui.z != 0) { oPos.x = (oPos.x - ui.x) * ui.z + ui.w;\n"
 "    oPos.y = (oPos.y - ui2.x) * ui2.z + ui2.w; }\n"
 "  float x = oPos.x * vp.x - 1.0, y = 1.0 - oPos.y * vp.y, z = oPos.z * vp.z;\n"
+"  if (z > 1.0 && z < 1.0 + 1e-5) z = 1.0;   /* on the far plane, not past it */\n"
 "  r.p = float4(x * w, y * w, z * w, w);\n"
 "  r.cd = w - 1e-3;\n"
 "  r.d0 = o[3]; r.d1 = o[4];\n"

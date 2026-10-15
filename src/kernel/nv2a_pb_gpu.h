@@ -73,6 +73,8 @@ typedef struct {
              stencil_op_zpass;        /* NV097 values: GL enums */
     uint32_t cull_enable, cull_face, front_face;
     uint32_t surf_format, control0, aa_control;   /* raw, for diagnostics */
+    uint32_t zminmax;           /* SET_ZMIN_MAX_CONTROL: bits 4-7 ZCLAMP_EN
+                                 * (0 cull, 1 clamp) */
     uint32_t poly_offset_fill;
     float    poly_offset_scale, poly_offset_bias;
     uint32_t blend_enable, blend_sfactor, blend_dfactor, blend_equation;
