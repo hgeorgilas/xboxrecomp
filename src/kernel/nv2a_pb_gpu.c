@@ -27,6 +27,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static ID3D11Device        *s_dev;
 static ID3D11DeviceContext *s_ctx;
+static ID3D11InfoQueue     *s_iq;          /* RECOMP_D3D_DEBUG */
 static CRITICAL_SECTION     s_lock;
 static pD3DCompile          s_compile;
 static uint32_t             s_flip;        /* flips seen, for ageing */
@@ -156,8 +157,23 @@ static int init_device(void)
         fprintf(stderr, "  [PBGPU] d3dcompiler_47.dll not available\n");
         return 0;
     }
-    hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, fl, 1,
-                           D3D11_SDK_VERSION, &s_dev, NULL, &s_ctx);
+    /* RECOMP_D3D_DEBUG=1: the D3D11 debug layer (Windows' optional Graphics
+     * Tools), its warnings printed at each flip -- read/write hazards
+     * between passes show there. */
+    hr = E_FAIL;
+    if (getenv("RECOMP_D3D_DEBUG")) {
+        static const GUID iid_iq = { 0x6543dbb6, 0x1b48, 0x42f5,
+                                     { 0xab, 0x82, 0xe9, 0x7e, 0xc7, 0x43, 0x26, 0xf6 } };
+        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                               D3D11_CREATE_DEVICE_DEBUG, fl, 1, D3D11_SDK_VERSION,
+                               &s_dev, NULL, &s_ctx);
+        if (SUCCEEDED(hr))
+            ID3D11Device_QueryInterface(s_dev, &iid_iq, (void **)&s_iq);
+        fprintf(stderr, "  [PBGPU] debug layer %s\n", s_iq ? "on" : "not available");
+    }
+    if (FAILED(hr))
+        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, fl, 1,
+                               D3D11_SDK_VERSION, &s_dev, NULL, &s_ctx);
     if (FAILED(hr)) {
         fprintf(stderr, "  [PBGPU] D3D11CreateDevice failed 0x%08lX\n", hr);
         return 0;
@@ -1480,9 +1496,17 @@ static void cap_poll(void)
 {
     extern int xbox_FramebufferKeyDown(int vk);
     static int was, env_flip = -2;
+    /* RECOMP_CAP_FRAMES=<n>: one F12 captures n flips in a row (a title
+     * that alternates kinds of frame shows both). */
+    static int more, chain;
     int down = xbox_FramebufferKeyDown(VK_F12);
 
+    chain = 0;
     if (s_cap.active && s_flip >= s_cap.flip) {
+        if (more > 0) {
+            more--;
+            chain = 1;
+        }
         if (s_cap.last) {
             char name[64];
             snprintf(name, sizeof name, "%02u_%08X_final", s_cap.n, s_cap.last->addr);
@@ -1498,7 +1522,11 @@ static void cap_poll(void)
         const char *e = getenv("RECOMP_RT_TRACE");
         env_flip = e ? atoi(e) : -1;
     }
-    if (!s_cap.active && ((down && !was)
+    if (!s_cap.active && down && !was && !chain) {
+        const char *e = getenv("RECOMP_CAP_FRAMES");
+        more = e && atoi(e) > 1 ? atoi(e) - 1 : 0;
+    }
+    if (!s_cap.active && ((down && !was) || chain
                           || (env_flip >= 0 && s_flip + 1 == (uint32_t)env_flip))) {
         int i;
         CreateDirectoryA("capture", NULL);
@@ -1567,6 +1595,10 @@ static void rt_dump(Surface *s, const char *name)
     FILE *fp;
     uint32_t y, w = s->w, h = s->h, hdr[13];
 
+    /* RECOMP_CAP_NODUMP=1: the trace only -- no images, so no wait for the
+     * GPU, which can hide what the trace is for. */
+    if (getenv("RECOMP_CAP_NODUMP"))
+        return;
     if (!dir || !s->staging)
         return;
     snprintf(path, sizeof path, "%s%s.bmp", dir, name);
@@ -1588,6 +1620,124 @@ static void rt_dump(Surface *s, const char *name)
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s->staging, 0);
 }
 
+/* RECOMP_PASS_SNAP=1: F11 keeps every pass of the next frame -- each target
+ * as the frame moves on from it, copied on the GPU (no wait, no state
+ * touched, so the frame draws as it would have) -- written out at the flip
+ * after to capture\snap_NNN\. */
+#define SNAP_MAX 48
+static struct {
+    int on, armed;
+    uint32_t flip, n;
+    Surface *last;
+    ID3D11Texture2D *t[SNAP_MAX];
+    uint32_t addr[SNAP_MAX], w[SNAP_MAX], h[SNAP_MAX];
+} s_snap;
+
+static void snap_take(Surface *s)
+{
+    D3D11_TEXTURE2D_DESC td;
+    uint32_t i = s_snap.n;
+    if (i >= SNAP_MAX)
+        return;
+    memset(&td, 0, sizeof td);
+    td.Width = s->pw; td.Height = s->ph;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_snap.t[i])))
+        return;
+    if (s->ms && s->ms_dirty)
+        ID3D11DeviceContext_ResolveSubresource(s_ctx, (ID3D11Resource *)s_snap.t[i], 0,
+                                               (ID3D11Resource *)s->ms, 0,
+                                               DXGI_FORMAT_B8G8R8A8_UNORM);
+    else
+        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_snap.t[i],
+                                         (ID3D11Resource *)s->tex);
+    s_snap.addr[i] = s->addr; s_snap.w[i] = s->pw; s_snap.h[i] = s->ph;
+    s_snap.n++;
+}
+
+static void snap_target(Surface *s)
+{
+    if (!s_snap.armed || s_flip != s_snap.flip)
+        return;
+    if (s_snap.last && s != s_snap.last)
+        snap_take(s_snap.last);
+    s_snap.last = s;
+}
+
+/* At a flip: arm on F11, or write out the frame just kept. */
+static void snap_flip(void)
+{
+    extern int xbox_FramebufferKeyDown(int vk);
+    static int was;
+    int down;
+    uint32_t i;
+    if (!s_snap.on)
+        return;
+    if (s_snap.armed && s_flip == s_snap.flip) {
+        char dir[64];
+        EnterCriticalSection(&s_lock);
+        if (s_snap.last)
+            snap_take(s_snap.last);
+        CreateDirectoryA("capture", NULL);
+        for (i = 0; i < 1000; i++) {
+            snprintf(dir, sizeof dir, "capture\\snap_%03u\\", i);
+            if (CreateDirectoryA(dir, NULL))
+                break;
+        }
+        for (i = 0; i < s_snap.n; i++) {
+            D3D11_TEXTURE2D_DESC td;
+            ID3D11Texture2D *st = NULL;
+            D3D11_MAPPED_SUBRESOURCE m;
+            ID3D11Texture2D_GetDesc(s_snap.t[i], &td);
+            td.Usage = D3D11_USAGE_STAGING;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st))) {
+                ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st,
+                                                 (ID3D11Resource *)s_snap.t[i]);
+                if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
+                                                      D3D11_MAP_READ, 0, &m))) {
+                    char path[128];
+                    FILE *fp;
+                    uint32_t y, hdr[13], w = s_snap.w[i], h = s_snap.h[i];
+                    snprintf(path, sizeof path, "%s%02u_%08X_%ux%u.bmp", dir, i + 1,
+                             s_snap.addr[i], w, h);
+                    if ((fp = fopen(path, "wb")) != NULL) {
+                        memset(hdr, 0, sizeof hdr);
+                        fwrite("BM", 1, 2, fp);
+                        hdr[0] = 54 + w * h * 4; hdr[2] = 54; hdr[3] = 40;
+                        hdr[4] = w; hdr[5] = (uint32_t)-(int32_t)h; hdr[6] = 1 | (32 << 16);
+                        fwrite(hdr, 4, 13, fp);
+                        for (y = 0; y < h; y++)
+                            fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch, 4, w, fp);
+                        fclose(fp);
+                    }
+                    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+                }
+                ID3D11Texture2D_Release(st);
+            }
+            ID3D11Texture2D_Release(s_snap.t[i]);
+            s_snap.t[i] = NULL;
+        }
+        fprintf(stderr, "  [SNAP] %u pass(es) of flip %u -> %s\n", s_snap.n, s_snap.flip, dir);
+        s_snap.armed = 0;
+        s_snap.n = 0;
+        s_snap.last = NULL;
+        LeaveCriticalSection(&s_lock);
+    }
+    down = xbox_FramebufferKeyDown(VK_F11);
+    if (down && !was && !s_snap.armed) {
+        s_snap.armed = 1;
+        s_snap.flip = s_flip + 1;      /* the frame after this flip */
+        s_snap.n = 0;
+        s_snap.last = NULL;
+    }
+    was = down;
+}
+
 static Surface *bind_target(const PbGpuState *st, Zeta **zout)
 {
     Surface *s;
@@ -1601,6 +1751,7 @@ static Surface *bind_target(const PbGpuState *st, Zeta **zout)
                     (st->clip_y + st->clip_h) * (((st->surf_format >> 12) & 0xF) == 2 ? 2u : 1u));
     if (!s)
         return NULL;
+    snap_target(s);
     if (st->zeta_addr)
         z = zeta_get(st->zeta_addr, s->pw, s->ph);
     {
@@ -2015,8 +2166,8 @@ static const char k_pg_tail[] =
 "  VO r; float w = oPos.w;\n"
 "  if (isinf(w) || isnan(w)) w = 1.0;\n"
 "  if (ui.y > 0 && oPos.w == 1) {\n"
-"    if (oPos.x >= ui.y - 1.5) oPos.x = ui.y;\n"
-"    if (oPos.y >= ui2.y - 1.5) oPos.y = ui2.y; }\n"
+"    if (oPos.x >= ui.y - 1.5 && oPos.x < ui.y) oPos.x = ui.y;\n"
+"    if (oPos.y >= ui2.y - 1.5 && oPos.y < ui2.y) oPos.y = ui2.y; }\n"
 "  if (ui.z != 0) { oPos.x = (oPos.x - ui.x) * ui.z + ui.w;\n"
 "    oPos.y = (oPos.y - ui2.x) * ui2.z + ui2.w; }\n"
 "  float x = oPos.x * vp.x - 1.0, y = 1.0 - oPos.y * vp.y, z = oPos.z * vp.z;\n"
@@ -2103,7 +2254,9 @@ static void ui_fill(const PgEntry *e, float W, float H, PgConsts *pg)
      * uncovered: the "black bars don't cover the screen" seen on real
      * hardware too, where a TV's overscan hides it and a monitor does not.
      * A vertex within a pixel and a half of the right or bottom edge is put
-     * on it. */
+     * on it -- short of it only: a quad past the edge is clipped there.
+     * Snapping those too squeezed Spartan's pause blur (a 640-wide quad
+     * over a 320-wide buffer) to half width on every pass. */
     pg->ui[1] = W;
     pg->ui2[1] = H;
     if (!on)
@@ -2255,32 +2408,17 @@ int pbgpu_draw_program(const PbGpuState *st, const float *attr, uint32_t nverts,
 
     /* Pre-transformed vertices with RHW 0 (position w 0) are drawn as w 1,
      * as the hardware does (the shader takes an infinite 1/w as 1): Spartan
-     * composites its bloom and colour grade onto the frame that way. Two
-     * title quirks (xbox_settings.c) act on such batches. */
-    static int q_drop = -1, q_bloom;
-    if (q_drop < 0) {
-        q_drop = xbox_Quirk("drop_wide_rhw0") != 0;
+     * composites its bloom and colour grade onto the frame that way. A title
+     * quirk (xbox_settings.c) acts on such batches. */
+    static int q_bloom = -1;
+    if (q_bloom < 0)
         q_bloom = xbox_Quirk("bloom_composites") != 0;
-    }
-    if ((q_drop || q_bloom) && slot[0] >= 0 && nverts && st->clip_w
-            && !getenv("RECOMP_DRAW_RHW0")) {
-        /* drop_wide_rhw0: Spartan's pause screen sends, each frame, a
-         * 640-wide quad over a 320-wide blur buffer; drawn, it magnified
-         * the frozen frame's left half into the buffer the next frame
-         * reads, and the background collapsed to its left edge and smeared.
-         * So: every vertex w 0, and wider than the target. */
+    if (q_bloom && slot[0] >= 0 && nverts && st->clip_w) {
         uint32_t v;
-        float right = -1e30f;
-        for (v = 0; v < nverts; v++) {
-            const float *p = &attr[(v * stride + (uint32_t)slot[0]) * 4];
-            if (p[3] != 0.0f)
+        for (v = 0; v < nverts; v++)
+            if (attr[(v * stride + (uint32_t)slot[0]) * 4 + 3] != 0.0f)
                 break;
-            if (p[0] > right)
-                right = p[0];
-        }
-        if (q_drop && v == nverts && right > (float)(st->clip_x + st->clip_w) + 2.0f)
-            return 1;
-        /* bloom_composites: of the rest, two blend onto the frame in
+        /* bloom_composites: of those batches, two blend onto the frame in
          * Spartan: the glow, added (src alpha, one), and a blurred copy
          * laid over it at half strength (src alpha, 1 - src alpha) -- the
          * bloom and the haze around it. RECOMP_BLOOM (0..1, 1 as the game)
@@ -3202,6 +3340,36 @@ void pbgpu_readback_async(uint32_t addr)
 void pbgpu_flip(void)
 {
     cap_poll();
+    {
+        static int init;
+        if (!init) {
+            init = 1;
+            s_snap.on = getenv("RECOMP_PASS_SNAP") != NULL;
+        }
+        snap_flip();
+    }
+    if (s_iq) {
+        /* The debug layer's messages, each kind (ID) shown its first 20
+         * times. */
+        static unsigned shown[4096];
+        UINT64 i, n;
+        EnterCriticalSection(&s_lock);
+        n = ID3D11InfoQueue_GetNumStoredMessages(s_iq);
+        for (i = 0; i < n; i++) {
+            SIZE_T len = 0;
+            D3D11_MESSAGE *m;
+            ID3D11InfoQueue_GetMessage(s_iq, i, NULL, &len);
+            if (!len || !(m = (D3D11_MESSAGE *)malloc(len)))
+                continue;
+            if (SUCCEEDED(ID3D11InfoQueue_GetMessage(s_iq, i, m, &len))
+                    && shown[(unsigned)m->ID % 4096]++ < 20)
+                fprintf(stderr, "  [D3D11] flip %u: %.*s\n", s_flip,
+                        (int)m->DescriptionByteLength, m->pDescription);
+            free(m);
+        }
+        ID3D11InfoQueue_ClearStoredMessages(s_iq);
+        LeaveCriticalSection(&s_lock);
+    }
     s_flip++;
 }
 

@@ -172,9 +172,6 @@ const char *xbox_settings_path(void)
  *                                          bar (below 84% of the height) moves
  *                                          down that many lines (at 480), once
  *                                          the 2D layer fills the screen
- *   xbox_SetQuirk("drop_wide_rhw0", 1)     drop a batch of pre-transformed
- *                                          vertices that all have RHW 0 and
- *                                          reach past the right of the target
  *   xbox_SetQuirk("bloom_composites", 1)   RHW-0 composites blended onto the
  *                                          frame (src alpha with one, or with
  *                                          1 - src alpha) are the bloom, which
