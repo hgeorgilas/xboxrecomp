@@ -1467,9 +1467,59 @@ static void bridge_KeQueryPerformanceFrequency(void)
 }
 
 /* ── KeQuerySystemTime (ordinal 128) ─────────────────────── */
+/* ── Call-storm detector ───────────────────────────────────
+ *
+ * A guest thread polling the kernel in a tight loop (a wait that never
+ * blocks) starves the rest: Spartan once called KeInsertQueueDpc and
+ * KeQuerySystemTime ~3 million times a second each for a minute, and the
+ * frame rate fell to single figures until it passed. Silent normally; when a
+ * call passes 1,000,000 a second, logs (at most once a second each,
+ * 40 times in all) the thread, the code addresses on the guest stack -- the
+ * call chain -- and what the caller passes, so the log names the loop.
+ * RECOMP_STORM_PER_SEC changes the threshold (to test it). */
+
+static volatile LONG g_last_dpc_drain_ms;      /* kernel_drain_dpcs, last run */
+
+static void storm_note(int which, const char *name, uint32_t detail)
+{
+    static volatile LONG count[2], window[2], logged;
+    static LONG limit;
+    LONG now = (LONG)GetTickCount(), n;
+    if (!limit) {
+        const char *e = getenv("RECOMP_STORM_PER_SEC");
+        limit = e && atol(e) > 0 ? atol(e) : 1000000;
+    }
+    if (now - window[which] >= 1000) {
+        InterlockedExchange(&window[which], now);
+        InterlockedExchange(&count[which], 0);
+    }
+    n = InterlockedIncrement(&count[which]);
+    if (n == limit && logged < 40) {
+        char chain[160];
+        int i, k = 0;
+        InterlockedIncrement(&logged);
+        chain[0] = 0;
+        /* Return addresses look like code: 0x10000 .. 0x300000 here. */
+        for (i = 0; i < 48 && k < 8; i++) {
+            uint32_t v = BRIDGE_MEM32(g_esp + i * 4 - 4);
+            size_t len = strlen(chain);
+            if (v >= 0x10000 && v < 0x300000) {
+                snprintf(chain + len, sizeof chain - len, " %08X", v);
+                k++;
+            }
+        }
+        fprintf(stderr, "  [STORM] %s: %d calls within a second on thread %lu;"
+                " detail %08X; DPCs last ran %ld ms ago; stack code:%s\n",
+                name, (int)limit, GetCurrentThreadId(), detail,
+                (long)(now - g_last_dpc_drain_ms), chain);
+        fflush(stderr);
+    }
+}
+
 static void bridge_KeQuerySystemTime(void)
 {
     uint32_t time_ptr = STACK_ARG(0);
+    storm_note(0, "KeQuerySystemTime", 0);
     xbox_KeQuerySystemTime(XBOX_TO_NATIVE(time_ptr));
     g_eax = 0;
 }
@@ -2178,6 +2228,7 @@ static void bridge_KeInsertQueueDpc(void)
     LONG tail, next;
 
     if (!dpc) { g_eax = 0; return; }
+    storm_note(1, "KeInsertQueueDpc", BRIDGE_MEM32(dpc + 12));   /* its routine */
 
     dpc_lock();
     if (BRIDGE_MEM8(dpc + 2)) {                 /* already queued */
@@ -2399,6 +2450,7 @@ static void kernel_vblank_tick(void)
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
 {
+    InterlockedExchange(&g_last_dpc_drain_ms, (LONG)GetTickCount());
     for (;;) {
         PendingDpc d;
         dpc_lock();
