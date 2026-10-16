@@ -559,17 +559,55 @@ static ULONG rumble_scaled(LONG v)
     return l << 16 | r;
 }
 
+/* Title quirk rumble_fade_ms: the longest a rumble is felt. Each motor's
+ * speed starts an envelope when it rises (a new effect) that falls from
+ * there to 0 over that many milliseconds; the motor gets the lower of the
+ * envelope and what the title asks. A title whose effects fade out over
+ * seconds -- tuned to the console pads' heavy motors, which stop turning
+ * long before the speed reaches 0 -- buzzes through the whole fade on a
+ * modern pad. 0 (the default) leaves the title's timing alone. */
+typedef struct { ULONG last, peak; DWORD start; } RumbleEnv;
+
+static ULONG rumble_env(RumbleEnv *e, ULONG raw, DWORD now, DWORD fade_ms,
+                        int *active)
+{
+    ULONG env;
+    DWORD t;
+    if (raw > e->last) {
+        e->peak = raw;
+        e->start = now;
+    }
+    e->last = raw;
+    if (!fade_ms || !raw)
+        return raw;
+    t = now - e->start;
+    env = t >= fade_ms ? 0 : (ULONG)((ULONGLONG)e->peak * (fade_ms - t) / fade_ms);
+    if (env)
+        *active = 1;
+    return raw < env ? raw : env;
+}
+
 static DWORD WINAPI rumble_thread(LPVOID unused)
 {
+    extern float xbox_Quirk(const char *name);
     LONG sent[XBOX_MAX_CONTROLLERS];
-    DWORD p;
+    RumbleEnv env[XBOX_MAX_CONTROLLERS][2];
+    DWORD p, wait = 250;
     (void)unused;
+    memset(env, 0, sizeof env);
     for (p = 0; p < XBOX_MAX_CONTROLLERS; p++)
         sent[p] = -1;
     for (;;) {
-        WaitForSingleObject(g_rumble_event, 250);
+        DWORD now, fade_ms;
+        int active = 0;
+        WaitForSingleObject(g_rumble_event, wait);
+        now = GetTickCount();
+        fade_ms = (DWORD)xbox_Quirk("rumble_fade_ms");
         for (p = 0; p < XBOX_MAX_CONTROLLERS; p++) {
-            LONG v = (LONG)rumble_scaled(g_rumble[p]);
+            ULONG raw = (ULONG)g_rumble[p];
+            ULONG l = rumble_env(&env[p][0], raw >> 16, now, fade_ms, &active);
+            ULONG r = rumble_env(&env[p][1], raw & 0xFFFF, now, fade_ms, &active);
+            LONG v = (LONG)rumble_scaled((LONG)(l << 16 | r));
             if (v != sent[p]) {
                 XINPUT_VIBRATION xi_vib;
                 LARGE_INTEGER t0;
@@ -582,9 +620,19 @@ static DWORD WINAPI rumble_thread(LPVOID unused)
                 else
                     XInputSetState(p, &xi_vib);
                 xi_timed(t0);
+                {
+                    static int trace = -1;
+                    if (trace < 0)
+                        trace = getenv("RECOMP_RUMBLE_TRACE") != NULL;
+                    if (trace)
+                        fprintf(stderr, "[RUMBLE] %lu ms: sent %5u %5u\n",
+                                (unsigned long)now, xi_vib.wLeftMotorSpeed,
+                                xi_vib.wRightMotorSpeed);
+                }
                 sent[p] = v;
             }
         }
+        wait = active ? 16 : 250;       /* a fade in progress steps itself */
     }
 }
 
