@@ -178,6 +178,12 @@ void panel()
                              ImGuiSliderFlags_AlwaysClamp))
             set_int("RECOMP_RUMBLE", rumble);
         ImGui::SetItemTooltip("Controller vibration strength. 0 turns it off.");
+        bool curve = xbox_setting_int("RECOMP_RUMBLE_CURVE", 1) != 0;
+        if (ImGui::Checkbox("Classic vibration feel", &curve))
+            set_int("RECOMP_RUMBLE_CURVE", curve ? 1 : 0);
+        ImGui::SetItemTooltip("Light rumbles stay light, as on the original pad's heavy"
+                              " motors. Off sends the game's strengths as they are, which"
+                              " modern pads play much stronger.");
         bool hid = xbox_setting_int("RECOMP_HID_PADS", 1) != 0;
         if (ImGui::Checkbox("DualShock / DualSense support", &hid))
             set_int("RECOMP_HID_PADS", hid ? 1 : 0);

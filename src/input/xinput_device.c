@@ -544,6 +544,16 @@ static ULONG rumble_scaled(LONG v)
     ULONG l = (ULONG)v >> 16, r = (ULONG)v & 0xFFFF;
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
+    /* RECOMP_RUMBLE_CURVE (default 1): the speed squared. The console's
+     * pads (Duke, S) have heavy motors that barely turn at low and middle
+     * speeds, and titles were tuned to that; a modern pad's motors answer
+     * from the bottom of the range, so every light rumble came out strong.
+     * Squared, light ones stay light and a full one is still full. 0 sends
+     * the title's speeds as they are. */
+    if (xbox_setting_int("RECOMP_RUMBLE_CURVE", 1)) {
+        l = l * l / 0xFFFF;
+        r = r * r / 0xFFFF;
+    }
     l = l * (ULONG)pct / 100;
     r = r * (ULONG)pct / 100;
     return l << 16 | r;
