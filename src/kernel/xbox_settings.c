@@ -177,6 +177,10 @@ const char *xbox_settings_path(void)
  *                                          a wide screen's edges (the title
  *                                          sets it live; RECOMP_WIDE_HUD=0
  *                                          turns the move off)
+ *   xbox_SetQuirk("rumble_fade_ms", N)     each rumble is felt for at most N
+ *                                          ms: a motor's speed fades to 0
+ *                                          over N ms from where an effect
+ *                                          starts (xinput_device.c)
  *   xbox_SetQuirk("dof_quad", 1)           an RHW-0 screen quad drawn with
  *                                          the depth test and no blending,
  *                                          a smaller render target as its
