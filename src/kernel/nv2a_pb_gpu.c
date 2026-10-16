@@ -2293,17 +2293,11 @@ static int ui_const_of(const char *body)
  * box is scaled (uniformly, keeping glyph shapes) to fill the target and
  * centred -- from whatever the target's size and shape. The offset constant
  * is recognised by its shape: positive half-pixel x/y margins, zero z/w.
- * RECOMP_SAFE_AREA_FILL=0 keeps the console layout. */
+ * Always on: the layout follows the display's shape, not a setting. */
 static void ui_fill(const PgEntry *e, float W, float H, PgConsts *pg)
 {
-    static int on;
-    static long gen;
     const float *c;
     float ox, oy, bw, bh, sc;
-    if (gen != xbox_settings_gen()) {
-        gen = xbox_settings_gen();
-        on = xbox_setting_int("RECOMP_SAFE_AREA_FILL", 1) != 0;
-    }
     if (!e || e->ui_const < 0)
         return;
     c = nv2a_vsh_constant((uint32_t)e->ui_const);
@@ -2320,8 +2314,6 @@ static void ui_fill(const PgEntry *e, float W, float H, PgConsts *pg)
      * over a 320-wide buffer) to half width on every pass. */
     pg->ui[1] = W;
     pg->ui2[1] = H;
-    if (!on)
-        return;
     ox = c[0] + 0.5f;
     oy = c[1] + 0.5f;
     if (ox < 1 || oy < 1

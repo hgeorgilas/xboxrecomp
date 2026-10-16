@@ -123,12 +123,6 @@ void panel()
         ImGui::SetItemTooltip("The height the game is rendered at (wider in widescreen)."
                               " Match window renders at the window's own resolution.");
     }
-    {
-        bool fill = xbox_setting_int("RECOMP_SAFE_AREA_FILL", 1) != 0;
-        if (ImGui::Checkbox("HUD and subtitles use the whole screen", &fill))
-            set_int("RECOMP_SAFE_AREA_FILL", fill ? 1 : 0);
-        ImGui::SetItemTooltip("Off: the console's TV-safe layout, with margins.");
-    }
 
     {
         bool full = xbox_setting_int("RECOMP_FULLSCREEN", 0) != 0;
