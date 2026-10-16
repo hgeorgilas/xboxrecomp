@@ -3252,6 +3252,142 @@ static int present_init(HWND hwnd)
     return 1;
 }
 
+/* When pbgpu_present_pixels last showed a picture. */
+static volatile DWORD s_pixels_tick;
+
+/* Size the swap chain to the window's client area. 0 on failure, 1 when the
+ * window is minimised (nothing to draw), 2 when ready. Under s_lock. */
+static int swap_fit(HWND hwnd, UINT *pcw, UINT *pch)
+{
+    RECT rc;
+    UINT cw, ch;
+    GetClientRect(hwnd, &rc);
+    cw = (UINT)(rc.right - rc.left);
+    ch = (UINT)(rc.bottom - rc.top);
+    *pcw = cw;
+    *pch = ch;
+    if (!cw || !ch)
+        return 1;
+    if (cw != s_swap_w || ch != s_swap_h || !s_swap_rtv) {
+        ID3D11Texture2D *bb = NULL;
+        if (s_swap_rtv) {
+            ID3D11RenderTargetView_Release(s_swap_rtv);
+            s_swap_rtv = NULL;
+        }
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+        if (FAILED(IDXGISwapChain1_ResizeBuffers(s_swap, 0, cw, ch,
+                                                 DXGI_FORMAT_UNKNOWN, s_swap_flags)))
+            return 0;
+        if (FAILED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D,
+                                             (void **)&bb)))
+            return 0;
+        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)bb, NULL, &s_swap_rtv);
+        ID3D11Texture2D_Release(bb);
+        s_swap_w = cw;
+        s_swap_h = ch;
+    }
+    return 2;
+}
+
+int pbgpu_present_pixels(const uint32_t *argb, uint32_t width, uint32_t height,
+                         uint32_t stride)
+{
+    static ID3D11Texture2D *tex;
+    static ID3D11ShaderResourceView *srv;
+    static uint32_t tw, th;
+    extern void *xbox_FramebufferWindowHwnd(void);
+    HWND hwnd;
+    UINT cw, ch;
+    int ok = 0;
+
+    if (!pbgpu_enabled() || s_present_state != 1 || !argb || !width || !height)
+        return 0;
+    hwnd = (HWND)xbox_FramebufferWindowHwnd();
+    if (!hwnd)
+        return 0;
+    EnterCriticalSection(&s_lock);
+    if (!tex || tw != width || th != height) {
+        D3D11_TEXTURE2D_DESC td;
+        if (srv) ID3D11ShaderResourceView_Release(srv);
+        if (tex) ID3D11Texture2D_Release(tex);
+        srv = NULL;
+        tex = NULL;
+        memset(&td, 0, sizeof td);
+        td.Width = width;
+        td.Height = height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DYNAMIC;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &tex))
+                || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)tex,
+                                                                NULL, &srv)))
+            goto out;
+        tw = width;
+        th = height;
+    }
+    {
+        D3D11_MAPPED_SUBRESOURCE m;
+        uint32_t y;
+        if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)tex, 0,
+                                           D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            goto out;
+        for (y = 0; y < height; y++)
+            memcpy((uint8_t *)m.pData + (size_t)y * m.RowPitch,
+                   (const uint8_t *)argb + (size_t)y * stride, (size_t)width * 4);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)tex, 0);
+    }
+    switch (swap_fit(hwnd, &cw, &ch)) {
+    case 0: goto out;
+    case 1: ok = 1; goto out;
+    }
+    {
+        static const float black[4] = { 0, 0, 0, 1 };
+        float aspect = (float)width / (float)height;   /* the picture's own */
+        float uv[4] = { 1, 1, 0, 0 };
+        D3D11_VIEWPORT vp, full = { 0, 0, (float)cw, (float)ch, 0, 1 };
+        D3D11_RECT r = { 0, 0, (LONG)cw, (LONG)ch };
+        ID3D11Buffer *cb = s_blit_cb;
+        ID3D11ShaderResourceView *none = NULL;
+        extern void xbox_overlay_render(void);
+
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_swap_rtv, NULL);
+        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_swap_rtv, black);
+        vp.Height = (float)cw / aspect < (float)ch ? (float)cw / aspect : (float)ch;
+        vp.Width = vp.Height * aspect;
+        vp.TopLeftX = ((float)cw - vp.Width) * 0.5f;
+        vp.TopLeftY = ((float)ch - vp.Height) * 0.5f;
+        vp.MinDepth = 0;
+        vp.MaxDepth = 1;
+        ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+        ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &r);
+        blit_consts(uv, 1.0f / vp.Width, 1.0f / vp.Height, 1.0f, 0);
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+        ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+        ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &cb);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &srv);
+        ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
+        ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+        ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &full);
+        xbox_overlay_render();
+        IDXGISwapChain1_Present(s_swap, 0, s_swap_flags ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    }
+    s_pixels_tick = GetTickCount();
+    ok = 1;
+out:
+    LeaveCriticalSection(&s_lock);
+    return ok;
+}
+
 int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height)
 {
     extern void *xbox_FramebufferWindowHwnd(void);
@@ -3278,28 +3414,14 @@ int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height)
     }
     if (!(s = surface_find(addr)) || !width || !height)
         goto out;
-    GetClientRect(hwnd, &rc);
-    cw = (UINT)(rc.right - rc.left);
-    ch = (UINT)(rc.bottom - rc.top);
-    if (!cw || !ch)
-        goto out_ok;                       /* minimised: nothing to show */
-    if (cw != s_swap_w || ch != s_swap_h || !s_swap_rtv) {
-        ID3D11Texture2D *bb = NULL;
-        if (s_swap_rtv) {
-            ID3D11RenderTargetView_Release(s_swap_rtv);
-            s_swap_rtv = NULL;
-        }
-        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
-        if (FAILED(IDXGISwapChain1_ResizeBuffers(s_swap, 0, cw, ch,
-                                                 DXGI_FORMAT_UNKNOWN, s_swap_flags)))
-            goto out;
-        if (FAILED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D,
-                                             (void **)&bb)))
-            goto out;
-        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)bb, NULL, &s_swap_rtv);
-        ID3D11Texture2D_Release(bb);
-        s_swap_w = cw;
-        s_swap_h = ch;
+    /* A movie has the screen (pbgpu_present_pixels): the title's own frames
+     * behind it are not shown until it stops. */
+    if (GetTickCount() - s_pixels_tick < 150)
+        goto out_ok;
+    (void)rc;
+    switch (swap_fit(hwnd, &cw, &ch)) {
+    case 0: goto out;
+    case 1: goto out_ok;                   /* minimised: nothing to show */
     }
     {
         static const float black[4] = { 0, 0, 0, 1 };
@@ -3506,6 +3628,7 @@ void pbgpu_clear(const PbGpuState *s, uint32_t f, uint32_t c, float d, uint32_t 
 void pbgpu_readback(uint32_t a) { (void)a; }
 void pbgpu_readback_async(uint32_t a) { (void)a; }
 int  pbgpu_present(uint32_t a, uint32_t w, uint32_t h) { (void)a; (void)w; (void)h; return 0; }
+int  pbgpu_present_pixels(const uint32_t *p, uint32_t w, uint32_t h, uint32_t s) { (void)p; (void)w; (void)h; (void)s; return 0; }
 void pbgpu_flip(void) {}
 
 #endif

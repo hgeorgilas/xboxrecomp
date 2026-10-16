@@ -123,6 +123,13 @@ void pbgpu_readback_async(uint32_t addr);
  * through a D3D11 swap chain. 0 if not presenting this way (no window yet,
  * RECOMP_PRESENT_GDI, or the swap chain could not be made). */
 int pbgpu_present(uint32_t addr, uint32_t width, uint32_t height);
+/* Show a picture made on the CPU (0xAARRGGBB rows, `stride` bytes apart) in
+ * the window, at its own aspect: a movie the title hands to the video
+ * overlay, which the swap chain would otherwise never show. While pictures
+ * keep coming, the title's frames are not presented. 0 if the swap chain is
+ * not presenting (the caller's GDI path then shows it). */
+int pbgpu_present_pixels(const uint32_t *argb, uint32_t width, uint32_t height,
+                         uint32_t stride);
 
 /* A flip happened: ages render-target aliases and texture checks. */
 void pbgpu_flip(void);
