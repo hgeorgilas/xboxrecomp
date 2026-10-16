@@ -83,6 +83,18 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
 }
 
+/* Which of the cases above resolved an address, for log lines: "img" (inside
+ * the XBE image), "win" (the contiguous window) or "ram". */
+const char *mcpx_apu_phys_class(uint64_t addr)
+{
+    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
+        return "img";
+    if (a < xbox_ContiguousAllocatedBytes())
+        return "win";
+    return "ram";
+}
+
 /* The interrupt line, as the frame thread sees it. update_irq used to call
  * pci_irq_assert, which is an empty stub here, so DirectSound's service
  * routine never ran and no voice completion ever reached it. */
@@ -1335,4 +1347,12 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
         }
     }
     LeaveCriticalSection(&g_mixer_cs);
+}
+
+/* A diagnostic switch (RECOMP_APU_TRACE, ...) is on when set, non-empty and
+ * not starting with '0'. */
+int apu_env_on(const char *name)
+{
+    const char *e = getenv(name);
+    return e && *e && *e != '0';
 }

@@ -21,6 +21,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* Which keys are down, for the pad stand-in in src/input: this window
+ * records them in the shared key table (src/input/keyboard.c).
+ *
+ * GetAsyncKeyState looked like the cheaper way to ask and does not work
+ * here: it reads a state Wine keeps for the X server, and a guest process
+ * drawing through GDI never sees it change. The window that has the focus
+ * is the thing that receives the keys, so that is what has to remember
+ * them. */
+#include "keyboard.h"   /* src/input */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -63,6 +72,16 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
         s_fb_pitch = pitch;
 }
 
+/* Vertical anti-aliasing factor of the surface being shown: 2 for 2x2, where
+ * the surface has twice the rows as well as twice the columns, and 1 for
+ * everything else (2x1 included). Only the pushbuffer executor knows it. */
+static uint32_t s_fb_aa_sy = 1;
+
+void xbox_FramebufferWindowSetAA(uint32_t sy)
+{
+    s_fb_aa_sy = sy ? sy : 1;
+}
+
 /* Called by the pushbuffer executor when the title flips. */
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 {
@@ -84,11 +103,17 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     bpp = pitch / s_fb_width;
     src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
     for (y = 0; y < s_fb_height; y++) {
-        const uint8_t *row = src + (size_t)y * pitch;
+        const uint8_t *row = src + (size_t)y * pitch * (bpp == 8 ? s_fb_aa_sy : 1);
         uint32_t *dst = s_present[next] + (size_t)y * s_fb_width;
 
         if (bpp == 4) {
             memcpy(dst, row, (size_t)s_fb_width * 4);
+        } else if (bpp == 8) {
+            /* 2x-wide anti-aliased 32-bit surface: every other pixel, as in
+             * fb_convert. */
+            const uint32_t *p = (const uint32_t *)row;
+            for (x = 0; x < s_fb_width; x++)
+                dst[x] = p[x * 2];
         } else if (bpp == 2) {
             const uint16_t *p = (const uint16_t *)row;
             for (x = 0; x < s_fb_width; x++) {
@@ -105,19 +130,6 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     /* Published only once it is whole. */
     InterlockedExchange(&s_present_idx, next);
 }
-
-/* Which keys are down, for the pad stand-in in src/input.
- *
- * GetAsyncKeyState looked like the cheaper way to ask and does not work
- * here: it reads a state Wine keeps for the X server, and a guest process
- * drawing through GDI never sees it change. The window that has the focus
- * is the thing that receives the keys, so that is what has to remember
- * them.
- *
- * Reading this needs no lock. Each entry is written only by the window
- * thread and read only by the USB thread, one byte at a time, and a press
- * seen a frame late is indistinguishable from one made a frame later. */
-static volatile unsigned char s_key_down[256];
 
 /* Title bar, the way ps3recomp's window shows it. Written by the flip,
  * read once a second by the window thread; a torn read shows one stale
@@ -141,13 +153,6 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
     InterlockedExchange(&s_frame_draws, (LONG)draws);
 }
 
-int xbox_FramebufferKeyDown(int vk)
-{
-    if ((unsigned)vk > 255)
-        return 0;
-    return s_key_down[vk] != 0;
-}
-
 /* Mouse movement since the last call, in raw counts (WM_INPUT: not limited
  * by the screen's edge, nor changed by pointer acceleration). */
 static volatile LONG s_mouse_dx, s_mouse_dy;
@@ -158,14 +163,16 @@ void xbox_FramebufferMouseDelta(int *dx, int *dy)
     *dy = (int)InterlockedExchange(&s_mouse_dy, 0);
 }
 
-/* Mouse buttons go in s_key_down under their VK codes, like keys. */
+/* Mouse buttons go in the key table (keyboard.c) under their VK codes,
+ * like keys. */
 static void mouse_button(HWND h, int vk, int down)
 {
-    s_key_down[vk] = (unsigned char)(down != 0);
+    xbox_InputKeySet(vk, down != 0);
     if (down)
         SetCapture(h);         /* the release arrives even off the window */
-    else if (!s_key_down[VK_LBUTTON] && !s_key_down[VK_RBUTTON] && !s_key_down[VK_MBUTTON]
-             && !s_key_down[VK_XBUTTON1] && !s_key_down[VK_XBUTTON2])
+    else if (!xbox_FramebufferKeyDown(VK_LBUTTON) && !xbox_FramebufferKeyDown(VK_RBUTTON)
+             && !xbox_FramebufferKeyDown(VK_MBUTTON) && !xbox_FramebufferKeyDown(VK_XBUTTON1)
+             && !xbox_FramebufferKeyDown(VK_XBUTTON2))
         ReleaseCapture();
 }
 
@@ -237,7 +244,8 @@ static void pin_cursor(HWND h)
     /* Not while Alt is held: Alt+Tab and the other Alt keys get the pointer
      * back at once. */
     int want = GetForegroundWindow() == h && !IsIconic(h) && !s_sizing
-            && !s_key_down[VK_MENU] && !s_key_down[VK_LMENU] && !s_key_down[VK_RMENU]
+            && !xbox_FramebufferKeyDown(VK_MENU) && !xbox_FramebufferKeyDown(VK_LMENU)
+            && !xbox_FramebufferKeyDown(VK_RMENU)
             && xbox_setting_int("RECOMP_KEYBOARD", 1) && !xbox_overlay_visible()
             && GetClientRect(h, &rc) && rc.right > 0 && rc.bottom > 0;
     if (!want) {
@@ -303,7 +311,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     {
         extern int xbox_overlay_msg(HWND, UINT, WPARAM, LPARAM);
         if (xbox_overlay_msg(h, m, w, l)) {
-            memset((void *)s_key_down, 0, sizeof s_key_down);
+            xbox_InputKeysClear();
             return 0;
         }
     }
@@ -325,8 +333,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
-        if ((unsigned)w < 256)
-            s_key_down[w] = 1;
+        xbox_InputKeySet((int)w, 1);
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
          *
          * The obvious diagnostic -- sampling which keys are held, once a
@@ -347,8 +354,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYUP:
     case WM_SYSKEYUP:
-        if ((unsigned)w < 256)
-            s_key_down[w] = 0;
+        xbox_InputKeySet((int)w, 0);
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
 
     case WM_LBUTTONDOWN: mouse_button(h, VK_LBUTTON, 1); return 0;
@@ -390,7 +396,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
-        memset((void *)s_key_down, 0, sizeof s_key_down);
+        xbox_InputKeysClear();
         InterlockedExchange(&s_mouse_dx, 0);
         InterlockedExchange(&s_mouse_dy, 0);
         return 0;
@@ -406,11 +412,20 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
     uint32_t x, y;
 
     for (y = 0; y < s_fb_height; y++) {
-        const uint8_t *row = src + (size_t)y * s_fb_pitch;
+        const uint8_t *row = src + (size_t)y * s_fb_pitch
+                           * (bpp == 8 ? s_fb_aa_sy : 1);
         uint32_t *dst = s_rgb + (size_t)y * s_fb_width;
 
         if (bpp == 4) {
             memcpy(dst, row, (size_t)s_fb_width * 4);
+        } else if (bpp == 8) {
+            /* A 2x-wide anti-aliased 32-bit surface (pitch = 2 * width * 4):
+             * take every other pixel. X-Men Legends renders its 640-wide
+             * frame into a 1280-wide surface, which read as "8 bytes per
+             * pixel" and showed black. */
+            const uint32_t *p = (const uint32_t *)row;
+            for (x = 0; x < s_fb_width; x++)
+                dst[x] = p[x * 2];
         } else if (bpp == 2) {
             const uint16_t *p = (const uint16_t *)row;
             for (x = 0; x < s_fb_width; x++) {
@@ -664,13 +679,4 @@ void xbox_FramebufferWindowStart(void)
         InterlockedExchange(&s_fb_running, 0);
 }
 
-#else
-void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
-void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
-void xbox_FramebufferWindowStart(void) {}
-int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
-void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
-void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
-void *xbox_FramebufferWindowHwnd(void) { return 0; }
-void  xbox_FramebufferWindowGpuOwned(int on) { (void)on; }
-#endif
+#endif /* _WIN32: POSIX hosts get the SDL2 window in fb_present_sdl.c */

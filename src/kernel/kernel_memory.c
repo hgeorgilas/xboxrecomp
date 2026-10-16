@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"   /* xbox_PhysNoteRamName */
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -179,9 +180,13 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
      * nothing naming this function.
      */
     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
-    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
-                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-                     ? va - XBOX_CONTIG_BASE : va);
+    if (va >= XBOX_CONTIG_BASE &&
+            (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return (ULONG_PTR)(va - XBOX_CONTIG_BASE);
+    /* The same number can be a window page; record that the title meant RAM
+     * (xbox_PhysNoteRamName says why the APU needs to know). */
+    xbox_PhysNoteRamName(va);
+    return (ULONG_PTR)va;
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)

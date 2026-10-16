@@ -42,6 +42,14 @@ static uint32_t s_cxt_write;
 /* Bumped on every constant write, so a consumer that copies c[] somewhere
  * (the GPU vertex-shader path) can tell when its copy is stale. */
 static uint32_t s_const_gen = 1;
+static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
+
+static int vsh_dump_enabled(void)
+{
+    if (s_const_trace < 0)
+        s_const_trace = getenv("RECOMP_VSH_DUMP") != NULL;
+    return s_const_trace;
+}
 
 static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
 {
@@ -74,12 +82,28 @@ void nv2a_vsh_set_constant_load(uint32_t index)
 {
     s_const_load = index;
     s_const_word = 0;
+    if (vsh_dump_enabled())
+        fprintf(stderr, "  [VSH] constant load -> c[%u]\n", index);
 }
 
 void nv2a_vsh_constant_word(uint32_t word)
 {
     if (s_const_load < NV2A_VSH_CONSTANTS)
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
+    else if (vsh_dump_enabled()) {
+        static int warned;
+        if (warned++ < 8)
+            fprintf(stderr, "  [VSH] constant write DROPPED (c[%u] >= %u)\n",
+                    s_const_load, NV2A_VSH_CONSTANTS);
+    }
+    if (vsh_dump_enabled() && s_const_word == 3 && s_const_load >= 64) {
+        static int shown;
+        if (shown++ < 96)
+            fprintf(stderr, "  [VSH] c[%u] = %.6g %.6g %.6g %.6g\n",
+                    s_const_load, s_const[s_const_load][0],
+                    s_const[s_const_load][1], s_const[s_const_load][2],
+                    s_const[s_const_load][3]);
+    }
     s_const_gen++;
     if (++s_const_word == 4) {
         s_const_word = 0;

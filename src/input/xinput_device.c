@@ -657,6 +657,42 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 
 /* ======================================================================== */
 #else /* !_WIN32 */
+
+#include "keyboard.h"
+#include "mkb_input.h"
+
+/* Merge the keyboard on top of a pad on port 0 rather than only standing in
+ * for a missing one.
+ *
+ * The first version put the keyboard behind XInput's failure, on the
+ * assumption that with nothing plugged in the call would fail. It does
+ * not: under Wine XInputGetState returns ERROR_SUCCESS and a gamepad
+ * with every button at rest, so the fallback was unreachable and
+ * pressing a key did nothing at all.
+ *
+ * Merging is also the better rule. A real pad keeps working -- its
+ * buttons are already in pState and the keyboard only adds to them --
+ * and there is no special case left to get wrong. */
+static void keyboard_merge(XBOX_INPUT_STATE *pState)
+{
+    XBOX_INPUT_STATE kb;
+    int i;
+
+    if (!xbox_InputKeyboardPoll(&kb))
+        return;
+    pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
+    for (i = 0; i < 8; i++)
+        if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
+            pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
+    if (kb.Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
+    if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
+    if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
+    if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
+    /* The input layer records edges, so an unchanged packet number is
+     * read as the same state and the press never happens. */
+    pState->dwPacketNumber = kb.dwPacketNumber;
+}
+
 /* ====================  SDL2 GameController backend  ===================== */
 /* ======================================================================== */
 
@@ -665,6 +701,26 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
+
+/* Set while the framebuffer window's main thread pumps SDL events
+ * (src/video/fb_present_sdl.c). The pump already updates the controllers,
+ * and SDL_GameControllerUpdate pumps events itself, which on macOS must only
+ * happen on the main thread; so then this side only reads them. */
+static volatile int g_main_pump;
+
+void xbox_InputSetMainPump(int on)
+{
+    g_main_pump = on;
+}
+
+/* Whether any controller is open: SDL must stay up for it at shutdown. */
+int xbox_InputAnyOpen(void)
+{
+    for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        if (g_pads[i])
+            return 1;
+    return 0;
+}
 
 /* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
 static void open_controllers(void)
@@ -683,6 +739,9 @@ static void open_controllers(void)
 
 void xbox_InputInit(void)
 {
+    /* Keep the default SIGINT/SIGTERM: SDL would turn them into an SDL_QUIT
+     * that nothing reads without a window, and Ctrl-C would stop working. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
     open_controllers();
@@ -696,10 +755,13 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     SDL_GameController *c = g_pads[dwPort];
     if (!c || !SDL_GameControllerGetAttached(c)) {
         g_controller_connected[dwPort] = FALSE;
+        if (dwPort == 0 && xbox_InputKeyboardPoll(pState))
+            return ERROR_SUCCESS;
         return ERROR_DEVICE_NOT_CONNECTED;
     }
 
-    SDL_GameControllerUpdate();
+    if (!g_main_pump)
+        SDL_GameControllerUpdate();
     g_controller_connected[dwPort] = TRUE;
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
@@ -744,6 +806,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRY =
         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
 
+    if (dwPort == 0)
+        keyboard_merge(pState);
     return ERROR_SUCCESS;
 }
 
