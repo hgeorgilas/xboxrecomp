@@ -1730,8 +1730,13 @@ static inline uint16_t recomp_sat_u16(int32_t v) {
  * the whole register and saturates at the lane width, which is what
  * PSRLW and friends already do. PSHUFW, PINSRW and PEXTRW stay
  * scalar: MSVC demands compile-time immediates for their intrinsics,
- * and the lifter does not guarantee one. */
-#if defined(_M_X64) || defined(__x86_64__)
+ * and the lifter does not guarantee one.
+ *
+ * RECOMP_MMX_SCALAR keeps the portable helpers below instead. MSVC 19.39
+ * (VS 17.9) stops with an internal compiler error (C1001) at /O2 on large
+ * MMX functions built from these, with no single helper to blame: XMV's
+ * decoder in Spartan: Total Warrior hits it. */
+#if (defined(_M_X64) || defined(__x86_64__)) && !defined(RECOMP_MMX_SCALAR)
 
 static inline RecompMmx RECOMP_MM_FROM128(__m128i x) {
     RecompMmx r; r.q = _mm_cvtsi128_si64(x); return r;
