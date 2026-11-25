@@ -14,6 +14,7 @@ set(KERNEL_SOURCES
     kernel_thread.c
     kernel_sync.c
     kernel_hal.c
+    kernel_guest_cpu.c
     kernel_xbox.c
     kernel_ob.c
     kernel_io.c
@@ -26,9 +27,11 @@ set(KERNEL_SOURCES
     guest_vmem.c
     icall_feedback.c
     recomp_trace.c
+    recomp_diff.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
     nv2a_pb_gpu.c
+    nv2a_flip_hold.c
     nv2a_vsh_interp.c
     nv2a_vsh_hlsl.c
     nv2a_combiner.c

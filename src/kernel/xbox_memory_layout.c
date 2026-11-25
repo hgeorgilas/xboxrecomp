@@ -19,6 +19,7 @@
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "kernel_missing.h"
+#include "nv2a_flip_hold.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -655,8 +656,13 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-#if !defined(_WIN32) && defined(__aarch64__)
+#if !defined(_WIN32) && (defined(__aarch64__) \
+        || (defined(__x86_64__) && defined(__linux__)))
+#if defined(__aarch64__)
 #include "../platform/mmio_decode_a64.h"
+#else
+#include "../platform/mmio_decode_x86_64.h"
+#endif
 #include <sys/mman.h>
 static size_t g_ac97_hsize;    /* host page: 16 KB on arm64 Darwin */
 
@@ -704,8 +710,15 @@ int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
         __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
         return 0;
     }
-    ok = mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
+#if defined(__aarch64__)
+    ok = mmio_emulate_a64((ucontext_t *)ucv,
+                          (uint32_t)(fault - (uintptr_t)g_ac97_page),
                           g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+#else
+    ok = mmio_emulate_x86_64((ucontext_t *)ucv,
+                             (uint32_t)(fault - (uintptr_t)g_ac97_page),
+                             g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+#endif
     if (ok)
         ac97_clear_reset_bits();
     mprotect(g_ac97_page, g_ac97_hsize, PROT_READ);
@@ -723,7 +736,8 @@ static void ac97_arm_write_trap(void)
 
     if (!g_mcpx_memory || g_ac97_page)
         return;
-#if !defined(_WIN32) && !defined(__aarch64__)
+#if !defined(_WIN32) && !defined(__aarch64__) \
+        && !(defined(__x86_64__) && defined(__linux__))
     /* No POSIX decoder for this host's stores: a trapped write would be a
      * fault nothing services. Leave the page writable. */
     (void)old;
@@ -830,19 +844,19 @@ int xbox_VehMmioFault(void *exception_pointers)
     return 0;
 }
 #else
-#if defined(__aarch64__)
+#if defined(__aarch64__) || (defined(__x86_64__) && defined(__linux__))
 extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
                                        uint32_t fault_xbox_va, int is_write);
 #endif
 
 /* POSIX: call from the title's SIGBUS/SIGSEGV handler (SA_SIGINFO) with its
  * ucontext_t * and si_addr; on 1, return from the handler and the thread
- * resumes after the emulated instruction. APU, then AC'97, then OHCI. Only
- * arm64 hosts have a decoder; elsewhere nothing is trapped and this returns
- * 0. */
+ * resumes after the emulated instruction. APU, then AC'97, then OHCI. Linux
+ * arm64 and Linux x86-64 have decoders; elsewhere nothing is trapped and this
+ * returns 0. */
 int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
 {
-#if defined(__aarch64__)
+#if defined(__aarch64__) || (defined(__x86_64__) && defined(__linux__))
     uint32_t va;
 
     if (!mmio_fault_va(fault, &va))
@@ -1227,12 +1241,59 @@ static void counter_mirrors_tick(void)
 #define XBOX_MAX_FRAME_COUNTERS 4
 #define XBOX_FRAME_PERIOD_MS    16      /* ~60 Hz */
 
+/* A counter can belong to the title after all. A title may register the
+ * miniport's own vblank count, which D3D's vblank DPC bumps itself once
+ * vblanks reach the title (RECOMP_VBLANK); bumped here per flip as well, it
+ * ran at 60 Hz plus the flip rate, and video and loads timed on it played
+ * several times too fast. So under the flip hold each bump first checks
+ * whether something else moved the counter since the last one; one that
+ * keeps moving on its own is the title's and is left alone for as long as
+ * it keeps moving (nv2a_flip_hold.h). The first bump only seeds: a field
+ * D3D initialised is not the title counting. */
 static struct {
     uint32_t device_ptr_va;
     uint32_t counter_off;
+    XboxFrameCounterBump bump;
 } g_frame_counters[XBOX_MAX_FRAME_COUNTERS];
 static int   g_frame_counter_count = 0;
 static DWORD g_frame_counter_last_ms = 0;
+static uint32_t g_frame_counters_owned;
+
+extern int nv2a_pb_exec_flip_pacing(void);
+
+/* Registered counters the title is moving itself right now. */
+uint32_t xbox_Nv2aFrameCountersOwned(void) { return g_frame_counters_owned; }
+
+static void frame_counter_bump(int i)
+{
+    uint32_t dev;
+    volatile uint32_t *p;
+    int r;
+
+    if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
+        return;
+    dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
+                                 + g_memory_offset);
+    if (!fence_readable(dev + g_frame_counters[i].counter_off, 4))
+        return;
+    p = (volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
+                              + g_memory_offset);
+    r = xbox_FrameCounterBump(&g_frame_counters[i].bump, p,
+                              nv2a_pb_exec_flip_pacing(), GetTickCount());
+    if (r == XBOX_FRAME_COUNTER_HANDED_OVER) {
+        g_frame_counters_owned++;
+        fprintf(stderr, "  Frame counter: device at 0x%08X, count +0x%X keeps"
+                " moving on its own (0x%08X): the title counts it, the"
+                " toolkit stops\n", g_frame_counters[i].device_ptr_va,
+                g_frame_counters[i].counter_off, *p);
+    } else if (r == XBOX_FRAME_COUNTER_HANDED_BACK) {
+        g_frame_counters_owned--;
+        fprintf(stderr, "  Frame counter: device at 0x%08X, count +0x%X has"
+                " stopped moving on its own: the toolkit bumps it again\n",
+                g_frame_counters[i].device_ptr_va,
+                g_frame_counters[i].counter_off);
+    }
+}
 
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off)
 {
@@ -1266,18 +1327,8 @@ void xbox_Nv2aFrameCounterFlip(void)
     g_frame_counter_flip_ms = GetTickCount();
     if (!g_frame_counter_flip_ms)
         g_frame_counter_flip_ms = 1;          /* 0 means "never" */
-    for (i = 0; i < g_frame_counter_count; i++) {
-        uint32_t dev;
-
-        if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
-            continue;
-        dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
-                                     + g_memory_offset);
-        if (!fence_readable(dev + g_frame_counters[i].counter_off, 4))
-            continue;
-        *(volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
-                               + g_memory_offset) += 1;
-    }
+    for (i = 0; i < g_frame_counter_count; i++)
+        frame_counter_bump(i);
 }
 
 static void frame_counters_tick(void)
@@ -1299,18 +1350,8 @@ static void frame_counters_tick(void)
     }
     g_frame_counter_last_ms = now;
 
-    for (i = 0; i < g_frame_counter_count; i++) {
-        uint32_t dev;
-
-        if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
-            continue;
-        dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
-                                     + g_memory_offset);
-        if (!fence_readable(dev + g_frame_counters[i].counter_off, 4))
-            continue;
-        *(volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
-                               + g_memory_offset) += 1;
-    }
+    for (i = 0; i < g_frame_counter_count; i++)
+        frame_counter_bump(i);
 }
 
 /* Set once the pushbuffer executor reports fences as it reaches them: the
@@ -1450,10 +1491,10 @@ static void fence_mirrors_tick(void)
 }
 
 static int s_nv2a_trace = 0;
-/* Per-kick register logging, separate from s_nv2a_trace (which also arms
- * the pushbuffer scan and so is on whenever RECOMP_PB_EXEC is): logging every
- * kick wrote ~40,000 lines a minute in gameplay. RECOMP_NV2A_TRACE only. */
-static int s_nv2a_log = 0;
+/* The per-kick DMA_PUT line, only on an explicit RECOMP_NV2A_TRACE. The
+ * executor sets s_nv2a_trace too, and a line plus an fflush per kick is
+ * hundreds of stderr writes a second on the thread the title waits on. */
+static int s_nv2a_trace_kicks = 0;
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
  * second so a run can answer the only question that matters before building a
@@ -1513,69 +1554,57 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
-/* A vblank in flight (RECOMP_VBLANK).
+/* The PFB flush kick (NV2A_ACK above), which D3D's KickOff waits on. */
+#define NV2A_ACK_PFB_FLUSH          0x100410u
+/* The vblank's two status bits, which the vblank-ack thread owns. */
+#define NV2A_ACK_PMC_INTR_0         0x000100u
+#define NV2A_ACK_PMC_INTR_PCRTC     (1u << 24)
+#define NV2A_ACK_PCRTC_INTR_0       0x600100u
+#define NV2A_ACK_PCRTC_INTR_VBLANK  (1u << 0)
+
+/* Clear the request bits "hardware" would clear on its own.
  *
- * The table above zeroes PMC_INTR and PCRTC_INTR because nothing raised GPU
- * interrupts -- until the kernel's vblank tick did. It sets both, calls the
- * D3D ISR, and the ISR queues a DPC that reads PMC_INTR to decide what to
- * service; this thread usually zeroed them first, so the DPC found nothing
- * and skipped the vblank handler. The D3D vblank count (what
- * GetDisplayFieldStatus reports, and what Spartan's XMV player paces every
- * frame on) then advanced at ~2 Hz and movies never showed a frame.
- *
- * So the tick holds the two registers while it delivers: from setting the
- * bits until it has drained the DPC. The hold lapses after 100 us regardless,
- * because one DPC path acknowledges by writing 1 to PCRTC_INTR and waiting
- * for PMC_INTR to drop -- write-1-to-clear on hardware, which plain memory
- * cannot express, so the clearing has to come from here. */
-static volatile LONGLONG g_nv2a_intr_hold;   /* QPC at hold start, 0 = none */
-
-void xbox_Nv2aIntrHold(int on)
-{
-    LARGE_INTEGER t;
-    if (!on) {
-        InterlockedExchange64(&g_nv2a_intr_hold, 0);
-        return;
-    }
-    QueryPerformanceCounter(&t);
-    InterlockedExchange64(&g_nv2a_intr_hold, t.QuadPart ? t.QuadPart : 1);
-}
-
-static int nv2a_intr_held(void)
-{
-    static LARGE_INTEGER freq;
-    LARGE_INTEGER now;
-    LONGLONG since = g_nv2a_intr_hold;
-    if (!since)
-        return 0;
-    if (!freq.QuadPart)
-        QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&now);
-    return now.QuadPart - since < freq.QuadPart / 10000;   /* 100 us */
-}
-
-/* Clear the request bits "hardware" would clear on its own. Also called by
- * the pushbuffer walker between commands (RECOMP_PB_WALK=dma), so a kickoff
- * is answered while one long pass executes. PMC_INTR and PCRTC_INTR are left
- * alone while a vblank is being delivered: see above. */
-void xbox_Nv2aAckBusyBits(void)
+ * Also called by the pushbuffer walker between commands. This thread executes
+ * the pushbuffer below, and under RECOMP_PB_EXEC one pass can take a whole
+ * rendered frame; with the bits cleared only here, every XDK D3D kickoff --
+ * which sets 0x100410 bit 16 and spins until it clears -- waited that long,
+ * and a level load, thousands of kickoffs long, looked frozen. Clearing them
+ * from inside the walk answers the kickoff within a few hundred commands,
+ * without a thread of its own spinning on a host core. */
+static void nv2a_ack_busy_bits(int flip_held)
 {
     volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
-    int intr_held;
 
     if (!regs)
         return;
-    intr_held = nv2a_intr_held();
     for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
         volatile uint32_t *r =
             (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-        if (intr_held && (NV2A_ACK[i].offset == 0x000100
-                          || NV2A_ACK[i].offset == 0x600100))
+        uint32_t mask = NV2A_ACK[i].busy_mask;
+        if (flip_held && NV2A_ACK[i].offset == NV2A_ACK_PFB_FLUSH)
             continue;
-        if (*r & NV2A_ACK[i].busy_mask) {
-            *r &= ~NV2A_ACK[i].busy_mask;
+        /* Once the vblank is delivered its two bits belong to the
+         * vblank-ack thread (kernel_bridge.c), which clears them on the
+         * DPC's ack. Cleared here too, a pass that landed between the
+         * vblank and the DPC's read of PMC_INTR_0 took the vblank away
+         * from the DPC: no ack, no count, and the title's present at
+         * vblank slipped a frame. */
+        if (xbox_VblankAckHeld()) {
+            if (NV2A_ACK[i].offset == NV2A_ACK_PMC_INTR_0)
+                mask &= ~NV2A_ACK_PMC_INTR_PCRTC;
+            else if (NV2A_ACK[i].offset == NV2A_ACK_PCRTC_INTR_0)
+                mask &= ~NV2A_ACK_PCRTC_INTR_VBLANK;
         }
+        /* Interlocked: the vblank-ack thread and the guest change other
+         * bits of the same word meanwhile. */
+        if (*r & mask)
+            InterlockedAnd((volatile LONG *)r, (LONG)~mask);
     }
+}
+
+void xbox_Nv2aAckBusyBits(void)
+{
+    nv2a_ack_busy_bits(0);
 }
 
 /* One word of the NV2A register file (offset from the register base), or NULL
@@ -1591,7 +1620,20 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        xbox_Nv2aAckBusyBits();
+        /* A flip held for its vblank (nv2a_flip_hold.h): this pass walks
+         * nothing, leaves DMA_GET where it is and acknowledges no PFB flush,
+         * which is how the title feels the console's FLIP_STALL. Nothing is
+         * locked while it waits; the release depends only on the vblank
+         * count and the clock.
+         *
+         * The hold is per submitted segment: the walk that arms it finishes
+         * its segment and sets GET to PUT, and the next segment waits. A
+         * D3D present kicks off right after its stall, so the stall ends
+         * its segment and the two are the same; a segment carrying two
+         * flips paces only the last. */
+        extern int nv2a_pb_exec_flip_poll(void);
+        int flip_held = nv2a_pb_exec_flip_poll();
+        nv2a_ack_busy_bits(flip_held);
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
@@ -1640,7 +1682,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             static uint32_t get_written = 0xFFFFFFFFu;  /* GET as we last left it */
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-            if (put != last_put || (now_ms - last_put_ms) > 2000) {
+            if (!flip_held
+                    && (put != last_put || (now_ms - last_put_ms) > 2000)) {
                 /* Survey the segment the title just submitted, once. */
                 {
                     extern void nv2a_pb_scan(uint32_t);
@@ -1711,7 +1754,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * in its device struct rather than assuming 0xFD800000, and
                  * mirroring the wrong block leaves it spinning on a GET that
                  * never moves. */
-                if (s_nv2a_log) {
+                if (s_nv2a_trace_kicks) {
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
@@ -1719,11 +1762,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                             g == put ? "" : "  (GPU behind)");
                     fflush(stderr);
                 }
-                /* (The flush used to be unconditional: a write syscall on
-                 * every kick, ~5% of this thread in gameplay.) */
             }
         }
-        if (s_nv2a_log) {
+        if (s_nv2a_trace_kicks) {
             static uint32_t last_start = 0xFFFFFFFFu;
             uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
             if (start != last_start) {
@@ -2646,6 +2687,9 @@ RECOMP_TLS uint32_t g_ebp = 0;
  * wrong way. Thread-local, because `std` and the `cld` that undoes it can land
  * in different lifted bodies of the same guest routine. */
 RECOMP_TLS int g_df = 0;
+/* EFLAGS: the image pushfd and popfd use (see recomp_types.h). Bit 1 is
+ * always set and IF is on, as in any guest thread the kernel schedules. */
+RECOMP_TLS uint32_t g_eflags = 0x00000202u;
 
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};
@@ -2919,6 +2963,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         memcpy(XBOX_VA(XBOX_BASE_ADDRESS), xbe, header_size);
         fprintf(stderr, "  XBE header: %u bytes at %p (Xbox VA 0x%08X)\n",
                 header_size, XBOX_VA(XBOX_BASE_ADDRESS), XBOX_BASE_ADDRESS);
+        /* The utility drive's cluster size lives in the init flags; the
+         * file layer reports it for the cache partitions. */
+        if (xbe_size >= 0x128)
+            xbox_file_set_init_flags(*(const DWORD *)(xbe + 0x0124));
     }
 
     /*
@@ -3357,7 +3405,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         g_nv2a_memory = layout_commit_at((LPVOID)nv2a_native, XBOX_NV2A_SIZE);
         /* The pushbuffer survey rides on the same poll, so either
          * variable arms it. */
-        s_nv2a_log = getenv("RECOMP_NV2A_TRACE") != NULL;
+        s_nv2a_trace_kicks = getenv("RECOMP_NV2A_TRACE") != NULL;
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
                     || getenv("RECOMP_PB_SCAN") != NULL
                     || getenv("RECOMP_PB_EXEC") != NULL;
@@ -3947,7 +3995,9 @@ static int g_heap_alloc_count = 0;
  * in bump order, so index order is address order and coalescing is a
  * neighbour check. */
 #define XBOX_HEAP_MAX_BLOCKS 65536
-static struct { uint32_t addr; uint32_t size; uint8_t free; }
+/* `named`: MmGetPhysicalAddress was given an address inside this live block
+ * (xbox_PhysNoteRamName); cleared whenever the block is handed out or freed. */
+static struct { uint32_t addr; uint32_t size; uint8_t free; uint8_t named; }
     g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
 static int g_heap_block_count = 0;
 
@@ -3984,37 +4034,54 @@ static int heap_insert_free(int at, uint32_t addr, uint32_t size)
     }
     g_heap_blocks[at].addr = addr;
     g_heap_blocks[at].size = size;
-    g_heap_blocks[at].free = 1;
+    g_heap_blocks[at].free = 1; g_heap_blocks[at].named = 0;
+    /* The empty slots after a reused one kept addresses from inside the block
+     * that was carved, which can be below `addr` now. Left there they break
+     * the address order heap_block_at searches by: DOAX's replayed movie ring
+     * sat at the front of such a block, lookups in its second half found the
+     * free remainder (not named), and the APU read those pages from the
+     * window instead of the RAM the title wrote. */
+    for (int j = at + 1; j < g_heap_block_count && g_heap_blocks[j].size == 0 &&
+                         g_heap_blocks[j].addr < addr; j++)
+        g_heap_blocks[j].addr = addr;
     return 1;
 }
 
-/* Take exactly `size` bytes, aligned, out of the first free block that has room
- * for them; what is left in front of and behind the piece stays free. Returns 0
- * when no free block fits. Caller holds g_heap_lock. */
+/* Take exactly `size` bytes, aligned, out of free block `i`; what is left in
+ * front of and behind the piece stays free. Returns 0 when the block has no
+ * room for them. Caller holds g_heap_lock. */
+static uint32_t heap_carve_block(int i, uint32_t size, uint32_t alignment)
+{
+    uint32_t a, start, end, front, back;
+    if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size)
+        return 0;
+    a = g_heap_blocks[i].addr;
+    start = (a + alignment - 1) & ~(alignment - 1);
+    end = a + g_heap_blocks[i].size;
+    if (start + size > end || start + size < start)
+        return 0;   /* not enough room once aligned */
+    front = start - a;
+    back = end - (start + size);
+    if (front && !heap_insert_free(i, a, front))
+        return 0;   /* table full: leave this block alone */
+    if (front)
+        i++;        /* the taken piece moved up one slot */
+    g_heap_blocks[i].addr = start;
+    g_heap_blocks[i].size = size;
+    g_heap_blocks[i].free = 0; g_heap_blocks[i].named = 0;
+    if (back && !heap_insert_free(i + 1, start + size, back))
+        g_heap_blocks[i].size += back;   /* table full: keep it attached */
+    memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
+    return start;
+}
+
+/* The same, out of the first free block that has room. */
 static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
 {
     for (int i = 0; i < g_heap_block_count; i++) {
-        uint32_t a, start, end, front, back;
-        if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size)
-            continue;
-        a = g_heap_blocks[i].addr;
-        start = (a + alignment - 1) & ~(alignment - 1);
-        end = a + g_heap_blocks[i].size;
-        if (start + size > end || start + size < start)
-            continue;   /* not enough room once aligned */
-        front = start - a;
-        back = end - (start + size);
-        if (front && !heap_insert_free(i, a, front))
-            continue;   /* table full: leave this block alone */
-        if (front)
-            i++;        /* the taken piece moved up one slot */
-        g_heap_blocks[i].addr = start;
-        g_heap_blocks[i].size = size;
-        g_heap_blocks[i].free = 0;
-        if (back && !heap_insert_free(i + 1, start + size, back))
-            g_heap_blocks[i].size += back;   /* table full: keep it attached */
-        memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
-        return start;
+        uint32_t r = heap_carve_block(i, size, alignment);
+        if (r)
+            return r;
     }
     return 0;
 }
@@ -4263,10 +4330,44 @@ static void contig_take(uint32_t first, uint32_t n)
         g_contig_first_free++;
 }
 
+/* Whether page q may start or extend a new block.
+ *
+ * The first pass also keeps out of the loaded image's physical range. Here
+ * the window and the RAM the image sits in are separate storage, so a block
+ * placed at an image page gives one physical number two meanings, and a
+ * device model holding only the number has to guess. Darkwatch's XPP lost
+ * that guess both ways: a 1200 KB block at 0x0045C000 covered its .data
+ * control-transfer buffer (0x004C20D4), and its OHCI descriptors, allocated
+ * inside the block, resolved to the image and read back zero, so the pad
+ * never enumerated. The console never has the overlap: its kernel keeps the
+ * image's pages out of the pool. The second pass allows them, because an
+ * image whose BSS runs past 48 MB would otherwise leave almost no window.
+ *
+ * Opt-in (RECOMP_CONTIG_AVOID_IMAGE=1): it moves every block above the
+ * image, and game glue names some of them by address (a DSP doorbell, say). */
+static int contig_avoid_image(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_CONTIG_AVOID_IMAGE");
+        on = e && atoi(e) != 0;
+    }
+    return on;
+}
+
+static int contig_page_free(uint32_t q, int avoid_image)
+{
+    if (g_contig_used[q])
+        return 0;
+    return !(avoid_image && g_xbox_image_hi
+             && q >= g_xbox_image_lo / CONTIG_PAGE
+             && q < (g_xbox_image_hi + CONTIG_PAGE - 1) / CONTIG_PAGE);
+}
+
 uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
                                 uint32_t phys_lo, uint32_t phys_hi)
 {
-    uint32_t n, align_pages, lo_page, limit, p, q, result = 0;
+    uint32_t n, align_pages, lo_page, limit, p, q, pass, result = 0;
 
     if (alignment < CONTIG_PAGE) alignment = CONTIG_PAGE;
     if (alignment & (alignment - 1)) {            /* round up to a power of 2 */
@@ -4285,24 +4386,27 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
 
     contig_lock();
     if (lo_page < g_contig_first_free) lo_page = g_contig_first_free;
-    p = (lo_page + align_pages - 1) & ~(align_pages - 1);
-    while ((uint64_t)p + n <= limit) {
-        /* A request free to go above 16 MB steps over the low reserve. */
-        if (limit > CONTIG_LOW_RESERVE_END && p < CONTIG_LOW_RESERVE_END
-                && p + n > CONTIG_LOW_RESERVE_START) {
-            p = (CONTIG_LOW_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
-            continue;
+    for (pass = contig_avoid_image() ? 0 : 1; pass < 2 && !result; pass++) {
+        int avoid = pass == 0;
+        p = (lo_page + align_pages - 1) & ~(align_pages - 1);
+        while ((uint64_t)p + n <= limit) {
+            /* A request free to go above 16 MB steps over the low reserve. */
+            if (limit > CONTIG_LOW_RESERVE_END && p < CONTIG_LOW_RESERVE_END
+                    && p + n > CONTIG_LOW_RESERVE_START) {
+                p = (CONTIG_LOW_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
+                continue;
+            }
+            for (q = p; q < p + n && contig_page_free(q, avoid); q++)
+                ;
+            if (q == p + n) {
+                contig_take(p, n);
+                result = XBOX_CONTIG_BASE + p * CONTIG_PAGE;
+                break;
+            }
+            /* Skip the run that stopped us, then realign. */
+            while (q < limit && !contig_page_free(q, avoid)) q++;
+            p = (q + align_pages - 1) & ~(align_pages - 1);
         }
-        for (q = p; q < p + n && !g_contig_used[q]; q++)
-            ;
-        if (q == p + n) {
-            contig_take(p, n);
-            result = XBOX_CONTIG_BASE + p * CONTIG_PAGE;
-            break;
-        }
-        /* Skip the used run that stopped us, then realign. */
-        while (q < limit && g_contig_used[q]) q++;
-        p = (q + align_pages - 1) & ~(align_pages - 1);
     }
     if (result) {
         g_contig_allocs++;
@@ -4323,9 +4427,15 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
     }
     contig_unlock();
 
-    if (result)
+    /* Freed pages keep any protection the title gave them (MmSetAddressProtect):
+     * make them writable before zeroing. Callers then apply what they asked for. */
+    if (result) {
+        DWORD old;
+        VirtualProtect((void *)((uintptr_t)result + g_memory_offset),
+                       (size_t)n * CONTIG_PAGE, PAGE_READWRITE, &old);
         memset((void *)((uintptr_t)result + g_memory_offset), 0,
                (size_t)n * CONTIG_PAGE);
+    }
     return result;
 }
 
@@ -4479,10 +4589,115 @@ uint32_t xbox_ContiguousInUseBytes(void)
  * most one pass of one voice. */
 static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
 
+/* The heap block holding `va`, live or free, or -1 when none does. Index
+ * order is address order (empty slots keep the address they had), so the
+ * search finds the last slot starting at or below `va` and steps back over
+ * empty ones. Caller holds g_heap_lock (shared is enough). */
+static int heap_block_at(uint32_t va)
+{
+    int lo = 0, hi = g_heap_block_count - 1, at = -1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (g_heap_blocks[mid].addr <= va) {
+            at = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    for (; at >= 0; at--) {
+        if (!g_heap_blocks[at].size)
+            continue;
+        return (uint64_t)va < (uint64_t)g_heap_blocks[at].addr + g_heap_blocks[at].size ? at : -1;
+    }
+    return -1;
+}
+
 void xbox_PhysNoteRamName(uint32_t va)
 {
-    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
+    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE) {
+        int i;
         g_phys_ram_named[va / CONTIG_PAGE] = 1;
+        /* The block too: a page can hold the end of a window buffer and the
+         * start of a heap block the title named, and only the block says
+         * which bytes the name covers (xbox_PhysRamNamedAt). A byte store
+         * under the shared lock: nothing moves the table meanwhile. */
+        AcquireSRWLockShared(&g_heap_lock);
+        i = heap_block_at(va);
+        if (i >= 0 && !g_heap_blocks[i].free)
+            g_heap_blocks[i].named = 1;
+        ReleaseSRWLockShared(&g_heap_lock);
+    }
+}
+
+/* Whether physical byte `pa` is RAM the title named, at byte precision.
+ *
+ * The page map says a heap page was named; a page is 4 KB and is shared.
+ * Def Jam: Fight for NY's six-channel mix buffer is a window allocation
+ * whose last 344 bytes share their physical page with a heap block that
+ * starts after them and that the title named (MmGetPhysicalAddress), so the
+ * page map sent those bytes to RAM: the last 28 frames of every lap of the
+ * buffer played whatever RAM held there, a click 20 times a second in the
+ * opening scene. Here a named page only counts for the bytes inside a live
+ * block that was named. Bytes the heap table does not place in a block keep
+ * the page's answer, as before. */
+int xbox_PhysRamNamedAt(uint32_t pa)
+{
+    int i, named;
+    if (pa >= XBOX_CONTIG_SIZE || !g_phys_ram_named[pa / CONTIG_PAGE])
+        return 0;
+    AcquireSRWLockShared(&g_heap_lock);
+    i = heap_block_at(pa);
+    named = i < 0 || (!g_heap_blocks[i].free && g_heap_blocks[i].named);
+    ReleaseSRWLockShared(&g_heap_lock);
+    return named;
+}
+
+/* A heap page's physical number in the first RAM mirror.
+ *
+ * The record above cannot settle one case: a live heap block the title named
+ * and a live window buffer on the same physical numbers. Whichever copy the
+ * APU picks, one of the two plays the other's bytes. In Def Jam: Fight for NY
+ * the music stream is a window buffer; a string table 21 KB larger (a
+ * translation) moved a named heap page over its numbers, and the stream read
+ * RAM for those pages: about 1,300 one-slice gaps a minute in the opening
+ * scene, heard as crackling.
+ *
+ * So the heap is not given those numbers at all. A heap page below 64 MB is
+ * named va + the RAM size, which is where the first mirror shows the same
+ * bytes; the console's memory controller wraps such an address back onto the
+ * page too. The window keeps every number below 64 MB to itself, and each
+ * device reads the right copy without a guess: the APU and the OHCI wrap the
+ * alias (mcpx_apu_phys, bus_resolve), and the NV2A executor, finding it above
+ * the window's high-water mark, reads it as a guest address in the mirror. The
+ * OHCI cannot read it there: its bounds check admits RAM only below the mapped
+ * size, so without the wrap XAPI's pad report buffer (a heap block) got no
+ * reports and Splinter Cell's pad was dead from the first menu. With no
+ * first mirror (a map too large for one) or RECOMP_PHYS_RAM_ALIAS=0 the name
+ * is the identity and the record above decides, as before. */
+uint32_t xbox_PhysRamAlias(void)
+{
+    static int alias = -1;
+    if (alias < 0) {
+        const char *e = getenv("RECOMP_PHYS_RAM_ALIAS");
+        alias = (e && e[0] == '0' && !e[1]) ? 0 : 1;
+        if (alias)
+            fprintf(stderr, "  Physical names: heap pages below 64 MB alias"
+                            " into the first RAM mirror\n");
+    }
+    return alias && g_mirror_views[0] && g_memory_size >= XBOX_CONTIG_SIZE &&
+           g_memory_size <= 2u * XBOX_CONTIG_SIZE ? (uint32_t)g_memory_size : 0;
+}
+
+uint32_t xbox_PhysRamName(uint32_t va)
+{
+    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE) {
+        uint32_t alias = xbox_PhysRamAlias();
+        if (alias)
+            return va + alias;
+        xbox_PhysNoteRamName(va);
+    }
+    return va;
 }
 
 /* Heap block m is free (and merged with any free neighbours): its pages name
@@ -4577,7 +4792,25 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
             if (g_heap_blocks[i].addr & (alignment - 1)) {
                 continue;   /* wrong alignment for this request */
             }
-            g_heap_blocks[i].free = 0;
+            /* A freed block far bigger than the request is split, not handed
+             * out whole. Kung Fu Chaos frees a level's 6.8 MB buffers when it
+             * leaves a match load with B; the next small requests each took one
+             * of them whole (15 MB of slack in reused blocks), and reloading
+             * the menu then found no room for its own 6.8 MB buffer: malloc
+             * returned 0, the asset stayed empty and the game crashed. Small
+             * slack keeps the old behaviour, so most reuse is unchanged.
+             * RECOMP_HEAP_SPLIT=0 hands blocks out whole again. */
+            static int split = -1;
+            if (split < 0) {
+                const char *e = getenv("RECOMP_HEAP_SPLIT");
+                split = !(e && e[0] == '0');
+            }
+            if (split && g_heap_blocks[i].size - size >= 0x10000u) {
+                result = heap_carve_block(i, (size + 15) & ~15u, alignment);
+                if (result)
+                    return result;
+            }
+            g_heap_blocks[i].free = 0; g_heap_blocks[i].named = 0;
             result = g_heap_blocks[i].addr;
             memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
             return result;
@@ -4631,7 +4864,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
     if (g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
         g_heap_blocks[g_heap_block_count].addr = result;
         g_heap_blocks[g_heap_block_count].size = size;
-        g_heap_blocks[g_heap_block_count].free = 0;
+        g_heap_blocks[g_heap_block_count].free = 0; g_heap_blocks[g_heap_block_count].named = 0;
         g_heap_block_count++;
     }
 
@@ -4701,7 +4934,7 @@ void xbox_HeapFree(uint32_t xbox_va)
         if (g_heap_blocks[i].addr != xbox_va || g_heap_blocks[i].free) {
             continue;
         }
-        g_heap_blocks[i].free = 1;
+        g_heap_blocks[i].free = 1; g_heap_blocks[i].named = 0;
         if (++matched % 512 == 0) {
             fprintf(stderr, "  [HEAP] frees=%d matched=%d blocks=%d\n",
                     frees, matched, g_heap_block_count);
@@ -4713,7 +4946,10 @@ void xbox_HeapFree(uint32_t xbox_va)
          * test. Keeps large contiguous requests satisfiable after a lot of
          * small churn. Under RECOMP_HEAP_RECLAIM the neighbour search steps
          * over the empty slots (size 0) earlier merges leave behind; without
-         * that, one merge stops every later one dead. */
+         * that, one merge stops every later one dead.
+         *
+         * An emptied slot keeps its address: heap_block_at binary-searches
+         * the table by address. */
         {
             int n = i + 1, p = i - 1, m = i;
             if (xbox_HeapReclaimEnabled()) {
@@ -4724,13 +4960,11 @@ void xbox_HeapFree(uint32_t xbox_va)
                 g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[n].addr) {
                 g_heap_blocks[i].size += g_heap_blocks[n].size;
                 g_heap_blocks[n].size = 0;
-                g_heap_blocks[n].addr = 0;
             }
             if (p >= 0 && g_heap_blocks[p].free &&
                 g_heap_blocks[p].addr + g_heap_blocks[p].size == g_heap_blocks[i].addr) {
                 g_heap_blocks[p].size += g_heap_blocks[i].size;
                 g_heap_blocks[i].size = 0;
-                g_heap_blocks[i].addr = 0;
                 m = p;
             }
             /* After the merge, so a page this block shared with a neighbour

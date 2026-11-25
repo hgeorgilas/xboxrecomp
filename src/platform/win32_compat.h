@@ -89,6 +89,8 @@ LONG InterlockedIncrement(volatile LONG *Addend);
 LONG InterlockedDecrement(volatile LONG *Addend);
 LONG InterlockedExchange(volatile LONG *Target, LONG Value);
 LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
+LONG InterlockedAnd(volatile LONG *Destination, LONG Value);
+LONG InterlockedOr(volatile LONG *Destination, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
@@ -129,6 +131,8 @@ int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
 /* After a rename: later path-based operations on h follow the file. */
 void        w32_handle_set_path(HANDLE h, const char *host_path);
+/* Raise the soft RLIMIT_NOFILE as far as the host allows; see the .c. */
+int         w32_raise_fd_limit(unsigned long long *before, unsigned long long *after);
 
 /* ---- Events ----------------------------------------------------------- */
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);
@@ -167,8 +171,21 @@ DWORD  GetCurrentThreadId(void);
 HANDLE GetCurrentThread(void);
 HANDLE GetCurrentProcess(void);
 DWORD  GetCurrentProcessId(void);
+BOOL   CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa);
+BOOL   RemoveDirectoryA(LPCSTR path);
+DWORD  GetTempPathA(DWORD buflen, LPSTR buf);
+DWORD  GetFileAttributesA(LPCSTR path);
+BOOL   DeleteFileA(LPCSTR path);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
+/* Linux: pthread_setaffinity_np on the thread; a new thread gets the
+ * process's mask, as on Win32, not its creator's. macOS has no thread
+ * affinity: the call does nothing and returns 0 (failure), as Win32 does
+ * for an invalid mask. GetProcessAffinityMask is the mask the process
+ * started with (macOS: every online core). */
+DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask);
+BOOL   GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
+                              DWORD_PTR *system_mask);
 VOID   SwitchToThread(void);
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 
@@ -240,6 +257,9 @@ unsigned int _clearfp(void);   /* clear pending FPU exception flags */
 #define FILE_SHARE_READ          0x00000001u
 #define FILE_SHARE_WRITE         0x00000002u
 #define FILE_SHARE_DELETE        0x00000004u
+
+#define FILE_LIST_DIRECTORY           0x0001u
+#define FILE_FLAG_BACKUP_SEMANTICS    0x02000000u
 #define CREATE_NEW               1
 #define CREATE_ALWAYS            2
 #define OPEN_EXISTING            3
@@ -249,6 +269,7 @@ unsigned int _clearfp(void);   /* clear pending FPU exception flags */
 #define FILE_ATTRIBUTE_HIDDEN    0x00000002u
 #define FILE_ATTRIBUTE_SYSTEM    0x00000004u
 #define FILE_ATTRIBUTE_DIRECTORY 0x00000010u
+#define INVALID_FILE_ATTRIBUTES       ((DWORD)-1)
 #define FILE_ATTRIBUTE_ARCHIVE   0x00000020u
 #define FILE_ATTRIBUTE_NORMAL    0x00000080u
 #define INVALID_FILE_SIZE        0xFFFFFFFFu
@@ -390,6 +411,7 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_CALL_NOT_IMPLEMENTED    120u
 #define ERROR_INSUFFICIENT_BUFFER     122u
 #define ERROR_ALREADY_EXISTS          183u
+#define ERROR_DIR_NOT_EMPTY           145u
 #define ERROR_MORE_DATA               234u
 #define ERROR_NOT_OWNER               288u
 #define ERROR_MR_MID_NOT_FOUND        317u

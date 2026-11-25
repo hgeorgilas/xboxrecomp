@@ -65,6 +65,34 @@
 #include <emmintrin.h>
 #endif
 
+/* The x87 transcendentals (fsin, fcos, fptan, fpatan, fyl2x, fyl2xp1, f2xm1).
+ * Hosts' libm need not agree in the last bit, so a project that compares
+ * guest state across machines, such as netplay, defines RECOMP_PORTABLE_MATH
+ * and links one implementation of these for every host. */
+#ifdef RECOMP_PORTABLE_MATH
+#ifdef __cplusplus
+extern "C" {
+#endif
+double recomp_sin(double x);
+double recomp_cos(double x);
+double recomp_tan(double x);
+double recomp_atan2(double y, double x);
+double recomp_log2(double x);
+double recomp_log1p(double x);
+double recomp_expm1(double x);
+#ifdef __cplusplus
+}
+#endif
+#else
+static inline double recomp_sin(double x) { return sin(x); }
+static inline double recomp_cos(double x) { return cos(x); }
+static inline double recomp_tan(double x) { return tan(x); }
+static inline double recomp_atan2(double y, double x) { return atan2(y, x); }
+static inline double recomp_log2(double x) { return log2(x); }
+static inline double recomp_log1p(double x) { return log1p(x); }
+static inline double recomp_expm1(double x) { return expm1(x); }
+#endif
+
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
 #if !defined(_MSC_VER) && !defined(__forceinline)
 #define __forceinline inline __attribute__((always_inline))
@@ -249,7 +277,38 @@ extern RECOMP_TLS uint32_t g_ebp;
  * memmove's overlapping case is the same instruction and the same bug.
  */
 extern RECOMP_TLS int g_df;
+extern RECOMP_TLS uint32_t g_eflags; /* EFLAGS image: pushfd, popfd, calls */
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
+
+/* EFLAGS as pushfd and popfd see it.
+ *
+ * The arithmetic flags are lazy: a jcc rebuilds them from the instruction
+ * that set them, and the lifter writes them into g_eflags (publish_flags in
+ * lifter.py) right before a pushfd, and before a call, a ret or a tail jump
+ * whose other side reads them, so a callee that returns its answer in ZF or
+ * CF reaches its caller.
+ * The rest of the word lives in g_eflags too: popfd loads it, masked to the
+ * bits a P3 lets ring 0 write (CF PF AF ZF SF TF IF DF OF IOPL NT AC ID),
+ * with bit 1 always set. The ID bit (21) round-trips, which is how code
+ * learns the CPU has cpuid; a jcc right after popfd reads its flags from
+ * here.
+ *
+ * recomp_pushfd builds the pushed word from g_eflags, with DF from g_df,
+ * which std/cld keep. cli and sti do not update IF (they have no lift that
+ * touches it), so a pushfd after them reports the IF of the last popfd image:
+ * set, unless the guest popped it clear. */
+#define RECOMP_EFL_WRITABLE 0x00247FD5u
+static inline uint32_t recomp_pushfd(void) {
+    return (g_eflags & ~0x400u) | 0x2u | (g_df ? 0x400u : 0u);
+}
+static inline void recomp_popfd(uint32_t v) {
+    g_eflags = (v & RECOMP_EFL_WRITABLE) | 0x2u;
+    g_df = (int)((v >> 10) & 1u);
+}
+
+/* cpuid: out[0..3] = eax, ebx, ecx, edx for leaf `leaf` (subleaf unused).
+ * The runtime answers as the Xbox's Coppermine-class Pentium III. */
+void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
 
 /* x87 control and status. Thread-local for the same reason the x87 stack
    above is: one guest routine can lift to several C functions, so a compare
@@ -368,6 +427,73 @@ static inline int recomp_fp_trig_in_range(double value) {
     }
     g_fp_cc &= (uint16_t)~0x0400u;
     return 1;
+}
+
+/* x87 FSIN, FCOS, FSINCOS and FPTAN values, for an operand that
+ * recomp_fp_trig_in_range has let through.
+ *
+ * The x87 reduces the operand modulo pi/4 with a 66-bit pi,
+ * 0xC90FDAA22168C234C * 2^-66, not the true pi libm reduces with. The
+ * reduced argument is off by k * (pi - pi66) / 4 for k eighth-turns removed,
+ * so the hardware returns f(x * (1 + D)), D = (pi - pi66) / pi66, where libm
+ * returns f(x). At x = 1e10 the two cosines differ in the 11th digit, and the
+ * x87's fsin(pi) is 1.2246063538223773e-16, not 1.2246467991473532e-16. A
+ * title that runs sin() on an accumulated, never-wrapped angle drifts from
+ * libm that way on a Pentium III, so the recompiled one has to drift too.
+ *
+ * 1 + D rounds to 1, so the shift is applied as a correction to libm's s and
+ * c by angle addition, in the versine form (v = 1 - cos e = 2 sin^2(e/2)):
+ * the correction stays small next to s and the sum rounds once, which keeps a
+ * result near a zero of the function accurate. Below |e| = 2^-26 (|x| under
+ * about 1.16e13) sin e is e and v is below half an ulp, so that costs no
+ * libm call beyond the other one of the pair. tests/x87_trig/model.py derives
+ * the vectors and the error budget (a third of the conformance tolerance).
+ * tan = sin/cos loses relative accuracy as cos(x * (1 + D)) nears 0, as the
+ * hardware's own tan does there; the budget sweep leaves out |cos| < 1e-2.
+ *
+ * For |x| <= pi/4 the hardware does no reduction and libm's value is
+ * returned as it is. No precision-control rounding: PC only narrows FADD,
+ * FSUB, FMUL, FDIV and FSQRT, and the transcendentals always deliver 64 bits.
+ * Inf and NaN give NaN (invalid is masked), as libm's do. */
+#define RECOMP_X87_PI66_D 1.2874146789751208e-21 /* 0x1.8518e2da2e893p-70 */
+static inline int recomp_x87_reduces(double x) {
+    return isfinite(x) && fabs(x) > 0.78539816339744830962;
+}
+static inline void recomp_x87_sincos_pi66(double x, double *s, double *c) {
+    double e = x * RECOMP_X87_PI66_D, se, v, sx = recomp_sin(x), cx = recomp_cos(x);
+    if (fabs(e) < 1.4901161193847656e-08) { /* 2^-26 */
+        se = e; v = 0.0;
+    } else {
+        double h = recomp_sin(0.5 * e);
+        se = recomp_sin(e); v = 2.0 * h * h;
+    }
+    *s = sx + (cx * se - sx * v);
+    *c = cx - (sx * se + cx * v);
+}
+static inline double recomp_x87_sin(double x) {
+    double s, c;
+    if (!recomp_x87_reduces(x)) return recomp_sin(x);
+    recomp_x87_sincos_pi66(x, &s, &c);
+    return s;
+}
+static inline double recomp_x87_cos(double x) {
+    double s, c;
+    if (!recomp_x87_reduces(x)) return recomp_cos(x);
+    recomp_x87_sincos_pi66(x, &s, &c);
+    return c;
+}
+/* Returns the sine; *c is the cosine FSINCOS then pushes. */
+static inline double recomp_x87_sincos(double x, double *c) {
+    double s;
+    if (!recomp_x87_reduces(x)) { *c = recomp_cos(x); return recomp_sin(x); }
+    recomp_x87_sincos_pi66(x, &s, c);
+    return s;
+}
+static inline double recomp_x87_tan(double x) {
+    double s, c;
+    if (!recomp_x87_reduces(x)) return recomp_tan(x);
+    recomp_x87_sincos_pi66(x, &s, &c);
+    return s / c;
 }
 
 static inline double recomp_fscale(double value, double scale) {
@@ -523,6 +649,48 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
 #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
 
+/* FSAVE's protected-mode image. Only state represented by the double-stack
+ * model is restored: CW, TOP, condition codes and eight registers.
+ * Tags, exception bits and the instruction/data pointers are not modeled; the
+ * image holds zeros there until the x87 environment is tracked. */
+static inline void recomp_fnsave(uint32_t address, int short_env) {
+    unsigned stride = short_env ? 2u : 4u;
+    unsigned env = 7u * stride;
+    unsigned i;
+    for (i = 0; i < env; ++i) MEM8(address + i) = 0;
+    MEM16(address) = g_fp_control_word;
+    MEM16(address + stride) = (uint16_t)((g_fp_top << 11) | g_fp_cc);
+    for (i = 0; i < 8; ++i) {
+        uint64_t mant;
+        uint16_t se = recomp_f80_store(g_fp_stack[(g_fp_top + i) & 7u], &mant);
+        uint32_t slot = address + env + 10u * i;
+        MEM32(slot) = (uint32_t)mant;
+        MEM32(slot + 4) = (uint32_t)(mant >> 32);
+        MEM16(slot + 8) = se;
+    }
+    g_fp_control_word = 0x037fu;
+    g_fp_top = 0;
+    g_fp_cc = 0;
+    g_fp_cmp = 0;
+}
+
+static inline void recomp_frstor(uint32_t address, int short_env) {
+    unsigned stride = short_env ? 2u : 4u;
+    unsigned env = 7u * stride;
+    unsigned i;
+    uint16_t status = MEM16(address + stride);
+    g_fp_control_word = MEM16(address);
+    g_fp_top = (status >> 11) & 7u;
+    g_fp_cc = status & 0x4700u;
+    g_fp_cmp = (g_fp_cc & 0x0400u) ? 2 : (g_fp_cc & 0x4000u) ? 0
+        : (g_fp_cc & 0x0100u) ? -1 : 1;
+    for (i = 0; i < 8; ++i) {
+        uint32_t slot = address + env + 10u * i;
+        uint64_t mant = ((uint64_t)MEM32(slot + 4) << 32) | MEM32(slot);
+        g_fp_stack[(g_fp_top + i) & 7u] = recomp_f80_load(mant, MEM16(slot + 8));
+    }
+}
+
 /* ================================================================
  * SSE / XMM register state
  *
@@ -537,9 +705,14 @@ void recomp_trace_esp(const char *name, const char *tag);
  * A function-local declaration would also shadow these, and the local
  * starts zeroed -- a returned float would silently read as 0.0.
  *
- * The helpers are lane-wise C rather than host intrinsics: the guest
- * semantics stay explicit (MINPS returning src on unordered, CMPNEQPS
- * being the unordered form) and the header stays portable.
+ * On x86-64 the packed helpers are SSE intrinsics -- each is one
+ * instruction, and Black's XMV YCbCr->RGB blit is addps/mulps/shufps
+ * almost end to end -- with tests/xmm_helpers pinning the whole set,
+ * lane for lane and bit for bit, against the scalar reference that
+ * stays below for every other host. The guest semantics the scalar
+ * forms spell out (MINPS returning src on unordered, CMPNEQPS being
+ * the unordered form) are exactly the hardware's, so the intrinsic
+ * forms read the same.
  * ================================================================ */
 
 #ifndef RECOMP_XMM_DEFINED
@@ -622,7 +795,156 @@ static inline RecompXmm XMM_MOVE_HIGH_TO_LOW(RecompXmm a, RecompXmm b) {
     RecompXmm r; r.q[0] = b.q[1]; r.q[1] = a.q[1]; return r;
 }
 
-/* -- packed arithmetic -- */
+/* -- packed arithmetic -------------------------------------------
+ *
+ * x86-64: each helper below is one instruction over the register's
+ * 128 bits, carried in and out whole (MOVUPS, through
+ * _mm_loadu_ps/_mm_storeu_ps -- RecompXmm carries no alignment
+ * guarantee, so the unaligned forms are the honest ones). Nothing in
+ * this set preserves upper lanes; the one exception in the family,
+ * cvtpi2ps further down, builds its own register. The XMV decoder's
+ * YCbCr->RGB blit is addps/mulps/shufps almost end to end, and a
+ * lane-at-a-time loop behind a function call paid four times the
+ * arithmetic for it.
+ *
+ * The semantics carried over exactly:
+ *  - MINPS/MAXPS return the second operand when the lanes are
+ *    unordered or equal, which is the same tie-break the scalar
+ *    ternary had -- not a C fminf/fmaxf.
+ *  - the compare masks are the hardware predicates: EQ/LT/LE ordered
+ *    (false when either lane is NaN), NEQ/NLT/NLE unordered (true
+ *    when either lane is NaN).
+ *  - RCPPS/RSQRTPS and the packed conversions are the same datapath
+ *    as their scalar forms; tests/xmm_helpers pins every helper
+ *    against an independent scalar reference over NaN, infinity and
+ *    denormal lanes, which is where the predicates' unordered
+ *    behaviour actually shows up.
+ * XMM_SHUFFLE stays scalar below: SHUFPS takes a compile-time
+ * immediate, MSVC rejects _mm_shuffle_ps with a variable one, and the
+ * lifter's literal lands here through a function parameter -- the
+ * same reason PSHUFW kept its lane loop. */
+/* These instructions deliberately approximate and treat denormals as zero.
+ * Exact division changes Newton refinement and zero-mask idioms. Kept out
+ * of the branch below: the scalar .ss forms are lifter output in their own
+ * right (rcpss/rsqrtss write one lane), and the packed helpers test the
+ * packed forms against exactly these. */
+static inline float recomp_rcpss(float x) {
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return _mm_cvtss_f32(_mm_rcp_ss(_mm_set_ss(x)));
+#else
+    return 1.0f / (fpclassify(x) == FP_SUBNORMAL ? copysignf(0.0f, x) : x);
+#endif
+}
+static inline float recomp_rsqrtss(float x) {
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(x)));
+#else
+    return 1.0f / sqrtf(fpclassify(x) == FP_SUBNORMAL ? copysignf(0.0f, x) : x);
+#endif
+}
+
+/* The full SSE compare predicate set, by CMPPS/CMPSS immediate:
+ * 0 EQ, 1 LT, 2 LE, 3 UNORD, 4 NEQ, 5 NLT, 6 NLE, 7 ORD. The N forms are
+ * the negations, so they are true when either side is NaN. The lifter
+ * emits this directly for the scalar .ss compares (one lane, one call),
+ * so it lives on every host; with a literal predicate at the call site
+ * the switch folds to a comiss+setcc. */
+static inline int recomp_cmp_pred(float a, float b, int p) {
+    switch (p & 7) {
+    case 0:  return a == b;
+    case 1:  return a < b;
+    case 2:  return a <= b;
+    case 3:  return a != a || b != b;
+    case 4:  return !(a == b);
+    case 5:  return !(a < b);
+    case 6:  return !(a <= b);
+    default: return !(a != a || b != b);
+    }
+}
+
+#if defined(_M_X64) || defined(__x86_64__)
+
+static inline RecompXmm RECOMP_XM_FROM128(__m128 x) {
+    RecompXmm r; _mm_storeu_ps(r.f, x); return r;
+}
+static inline RecompXmm RECOMP_XM_FROMI128(__m128i x) {
+    RecompXmm r; _mm_storeu_si128((__m128i *)r.u, x); return r;
+}
+#define RECOMP_XM_A(a) (_mm_loadu_ps((a).f))
+#define RECOMP_XM_B(b) (_mm_loadu_ps((b).f))
+
+#define RECOMP_XMM_INTRIN2(NAME, INTRIN)                                \
+    static inline RecompXmm NAME(RecompXmm a, RecompXmm b) {            \
+        return RECOMP_XM_FROM128(INTRIN(RECOMP_XM_A(a), RECOMP_XM_B(b))); \
+    }
+
+/* The unary forms keep the two-operand signature the lifter emits; the
+ * first argument is ignored, as it was in the scalar lane loops. */
+#define RECOMP_XMM_INTRIN1(NAME, INTRIN)                                \
+    static inline RecompXmm NAME(RecompXmm a, RecompXmm b) {            \
+        (void)a;                                                        \
+        return RECOMP_XM_FROM128(INTRIN(RECOMP_XM_B(b)));               \
+    }
+
+RECOMP_XMM_INTRIN2(XMM_ADD, _mm_add_ps)
+RECOMP_XMM_INTRIN2(XMM_SUB, _mm_sub_ps)
+RECOMP_XMM_INTRIN2(XMM_MUL, _mm_mul_ps)
+RECOMP_XMM_INTRIN2(XMM_DIV, _mm_div_ps)
+/* MINPS/MAXPS return the second operand when the lanes are unordered or
+ * equal -- that is the hardware's tie-break, not a C fmin/fmax. */
+RECOMP_XMM_INTRIN2(XMM_MIN, _mm_min_ps)
+RECOMP_XMM_INTRIN2(XMM_MAX, _mm_max_ps)
+
+RECOMP_XMM_INTRIN2(XMM_AND,  _mm_and_ps)
+RECOMP_XMM_INTRIN2(XMM_OR,   _mm_or_ps)
+RECOMP_XMM_INTRIN2(XMM_XOR,  _mm_xor_ps)
+/* ANDNPS is ~dst & src, not dst & ~src. */
+RECOMP_XMM_INTRIN2(XMM_ANDN, _mm_andnot_ps)
+
+/* Compares produce an all-ones or all-zero mask per lane, and the
+ * compare intrinsics return exactly that mask vector. EQ/LT/LE are the
+ * ordered forms (false when either lane is NaN); NEQ is the unordered
+ * form, so it is true when a lane is NaN. */
+RECOMP_XMM_INTRIN2(XMM_CMP_EQ,  _mm_cmpeq_ps)
+RECOMP_XMM_INTRIN2(XMM_CMP_LT,  _mm_cmplt_ps)
+RECOMP_XMM_INTRIN2(XMM_CMP_LE,  _mm_cmple_ps)
+RECOMP_XMM_INTRIN2(XMM_CMP_NEQ, _mm_cmpneq_ps)
+
+/* The full SSE compare predicate set, by CMPPS/CMPSS immediate:
+ * 0 EQ, 1 LT, 2 LE, 3 UNORD, 4 NEQ, 5 NLT, 6 NLE, 7 ORD. The N forms are
+ * the negations, so they are true when either side is NaN. The lifter
+ * writes the immediate as a literal, but through this parameter MSVC
+ * will not accept it as an intrinsic immediate -- hence the switch,
+ * one named (SSE, not VEX) predicate per case. */
+static inline RecompXmm XMM_CMP_PRED(RecompXmm a, RecompXmm b, int p) {
+    __m128 m;
+    switch (p & 7) {
+    case 0:  m = _mm_cmpeq_ps(RECOMP_XM_A(a), RECOMP_XM_B(b)); break;
+    case 1:  m = _mm_cmplt_ps(RECOMP_XM_A(a), RECOMP_XM_B(b)); break;
+    case 2:  m = _mm_cmple_ps(RECOMP_XM_A(a), RECOMP_XM_B(b)); break;
+    case 3:  m = _mm_cmpunord_ps(RECOMP_XM_A(a), RECOMP_XM_B(b)); break;
+    case 4:  m = _mm_cmpneq_ps(RECOMP_XM_A(a), RECOMP_XM_B(b)); break;
+    case 5:  m = _mm_cmpnlt_ps(RECOMP_XM_A(a), RECOMP_XM_B(b)); break;
+    case 6:  m = _mm_cmpnle_ps(RECOMP_XM_A(a), RECOMP_XM_B(b)); break;
+    default: m = _mm_cmpord_ps(RECOMP_XM_A(a), RECOMP_XM_B(b)); break;
+    }
+    return RECOMP_XM_FROM128(m);
+}
+/* Packed unary ops; the first argument is unused, as for the binary forms. */
+RECOMP_XMM_INTRIN1(XMM_SQRT,  _mm_sqrt_ps)
+RECOMP_XMM_INTRIN1(XMM_RSQRT, _mm_rsqrt_ps)
+RECOMP_XMM_INTRIN1(XMM_RCP,   _mm_rcp_ps)
+
+/** movmskps: the four lane sign bits, packed into the low nibble. */
+static inline uint32_t XMM_MOVEMASK(RecompXmm a) {
+    return (uint32_t)_mm_movemask_ps(RECOMP_XM_A(a));
+}
+
+/** unpcklps / unpckhps: interleave the low or high halves. */
+RECOMP_XMM_INTRIN2(XMM_UNPACK_LOW,  _mm_unpacklo_ps)
+RECOMP_XMM_INTRIN2(XMM_UNPACK_HIGH, _mm_unpackhi_ps)
+
+#else /* x86-64 XMM intrinsics */
 
 #define RECOMP_XMM_LANEWISE(name, expr)                                   \
     static inline RecompXmm name(RecompXmm a, RecompXmm b) {              \
@@ -652,6 +974,8 @@ RECOMP_XMM_BITWISE(XMM_OR,   a.u[i] | b.u[i])
 RECOMP_XMM_BITWISE(XMM_XOR,  a.u[i] ^ b.u[i])
 /* ANDNPS is ~dst & src, not dst & ~src. */
 RECOMP_XMM_BITWISE(XMM_ANDN, (~a.u[i]) & b.u[i])
+/* PCMPGTD: signed dword greater-than, dst = (dst > src). */
+RECOMP_XMM_BITWISE(XMM_PCMPGTD, ((int32_t)a.u[i] > (int32_t)b.u[i]) ? 0xFFFFFFFFu : 0u)
 
 /* Compares produce an all-ones or all-zero mask per lane. EQ/LT/LE are
  * the ordered forms (false when either lane is NaN); NEQ is the
@@ -663,19 +987,8 @@ RECOMP_XMM_BITWISE(XMM_CMP_NEQ, (a.f[i] == b.f[i]) ? 0u : 0xFFFFFFFFu)
 
 /* The full SSE compare predicate set, by CMPPS/CMPSS immediate:
  * 0 EQ, 1 LT, 2 LE, 3 UNORD, 4 NEQ, 5 NLT, 6 NLE, 7 ORD. The N forms are
- * the negations, so they are true when either side is NaN. */
-static inline int recomp_cmp_pred(float a, float b, int p) {
-    switch (p & 7) {
-    case 0:  return a == b;
-    case 1:  return a < b;
-    case 2:  return a <= b;
-    case 3:  return a != a || b != b;
-    case 4:  return !(a == b);
-    case 5:  return !(a < b);
-    case 6:  return !(a <= b);
-    default: return !(a != a || b != b);
-    }
-}
+ * the negations, so they are true when either side is NaN. recomp_cmp_pred,
+ * shared above, is this table. */
 static inline RecompXmm XMM_CMP_PRED(RecompXmm a, RecompXmm b, int p) {
     RecompXmm r; int i;
     for (i = 0; i < 4; ++i)
@@ -684,22 +997,6 @@ static inline RecompXmm XMM_CMP_PRED(RecompXmm a, RecompXmm b, int p) {
 }
 /* Packed unary ops; the first argument is unused, as for the binary forms. */
 RECOMP_XMM_LANEWISE(XMM_SQRT,  sqrtf(b.f[i]))
-/* These instructions deliberately approximate and treat denormals as zero.
- * Exact division changes Newton refinement and zero-mask idioms. */
-static inline float recomp_rcpss(float x) {
-#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
-    return _mm_cvtss_f32(_mm_rcp_ss(_mm_set_ss(x)));
-#else
-    return 1.0f / (fpclassify(x) == FP_SUBNORMAL ? copysignf(0.0f, x) : x);
-#endif
-}
-static inline float recomp_rsqrtss(float x) {
-#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
-    return _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(x)));
-#else
-    return 1.0f / sqrtf(fpclassify(x) == FP_SUBNORMAL ? copysignf(0.0f, x) : x);
-#endif
-}
 RECOMP_XMM_LANEWISE(XMM_RSQRT, recomp_rsqrtss(b.f[i]))
 RECOMP_XMM_LANEWISE(XMM_RCP, recomp_rcpss(b.f[i]))
 
@@ -707,14 +1004,6 @@ RECOMP_XMM_LANEWISE(XMM_RCP, recomp_rcpss(b.f[i]))
 static inline uint32_t XMM_MOVEMASK(RecompXmm a) {
     return ((a.u[0] >> 31) & 1u) | (((a.u[1] >> 31) & 1u) << 1)
          | (((a.u[2] >> 31) & 1u) << 2) | (((a.u[3] >> 31) & 1u) << 3);
-}
-
-/** shufps: lanes 0-1 selected out of `a`, lanes 2-3 out of `b`. */
-static inline RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, uint32_t imm) {
-    RecompXmm r;
-    r.u[0] = a.u[(imm >> 0) & 3u]; r.u[1] = a.u[(imm >> 2) & 3u];
-    r.u[2] = b.u[(imm >> 4) & 3u]; r.u[3] = b.u[(imm >> 6) & 3u];
-    return r;
 }
 
 /** unpcklps / unpckhps: interleave the low or high halves. */
@@ -727,6 +1016,21 @@ static inline RecompXmm XMM_UNPACK_LOW(RecompXmm a, RecompXmm b) {
 static inline RecompXmm XMM_UNPACK_HIGH(RecompXmm a, RecompXmm b) {
     RecompXmm r;
     r.u[0] = a.u[2]; r.u[1] = b.u[2]; r.u[2] = a.u[3]; r.u[3] = b.u[3];
+    return r;
+}
+
+#endif /* x86-64 XMM intrinsics */
+
+/** shufps: lanes 0-1 selected out of `a`, lanes 2-3 out of `b`. Scalar on
+ * every host: the immediate selects a lane index per output lane, MSVC
+ * takes _mm_shuffle_ps only with a compile-time constant, and the lifter's
+ * literal reaches this through a parameter. At real call sites the
+ * compiler inlines the literal and folds the loop to the same moves the
+ * instruction would make. */
+static inline RecompXmm XMM_SHUFFLE(RecompXmm a, RecompXmm b, uint32_t imm) {
+    RecompXmm r;
+    r.u[0] = a.u[(imm >> 0) & 3u]; r.u[1] = a.u[(imm >> 2) & 3u];
+    r.u[2] = b.u[(imm >> 4) & 3u]; r.u[3] = b.u[(imm >> 6) & 3u];
     return r;
 }
 
@@ -922,10 +1226,18 @@ static inline int recomp_parity8(uint32_t x) {
 }
 #define RECOMP_PARITY8(x) recomp_parity8((uint32_t)(x))
 
-/** Pop a 32-bit value from the simulated stack. */
+/**
+ * Pop a 32-bit value from the simulated stack.
+ * Writes dst AFTER incrementing sp: for `pop esp` (dst == sp) x86 leaves ESP
+ * equal to the popped value, not popped value + 4 (Intel SDM, POP). The old
+ * read-then-increment order left every lifted `pop esp` 4 bytes high, so the
+ * round-to-int idiom `push esp; push eax; ...; pop eax; pop esp` drifted the
+ * stack and later pops read the wrong slots.
+ */
 #define POP32(sp, dst) do { \
-    (dst) = MEM32(sp); \
+    uint32_t _pv = MEM32(sp); \
     (sp) += 4; \
+    (dst) = _pv; \
 } while(0)
 
 /* ================================================================
@@ -1073,6 +1385,27 @@ extern volatile uint64_t g_icall_guard_misses;
 #define RECOMP_ICALL_GUARD_HIT()  ((void)0)
 #define RECOMP_ICALL_GUARD_MISS() ((void)0)
 #endif
+
+/* Every loop back edge in code lifted with --back-edge-yield (tools.recomp;
+ * off by default, so a title lifted without it has none): the guest CPU's
+ * quantum check. A guest thread that has waited its quantum for the CPU
+ * (RECOMP_GUEST_LOCK) sets the flag, and the holder hands over at its next
+ * back edge, as the console's timer tick preempted it wherever it was; a
+ * kernel call checks the quantum too, but a frame of lifted code can go
+ * without one. With the lock off the flag is never set: one relaxed atomic
+ * load and a branch not taken per back edge. */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define RECOMP_LOAD_RELAXED32(p) \
+    ((int32_t)__iso_volatile_load32((const volatile __int32 *)(p)))
+#else
+#define RECOMP_LOAD_RELAXED32(p) __atomic_load_n((p), __ATOMIC_RELAXED)
+#endif
+extern int32_t g_xbox_guest_cpu_preempt;
+void xbox_GuestCpuPreempt(uint32_t va);
+#define RECOMP_BACK_EDGE(va) \
+    do { if (RECOMP_LOAD_RELAXED32(&g_xbox_guest_cpu_preempt)) \
+             xbox_GuestCpuPreempt(va); } while (0)
 
 /**
  * RECOMP_ICALL - Indirect call through the dispatch table.
@@ -1311,22 +1644,50 @@ static inline int32_t recomp_sse_d2i(double v, int truncate) {
         ? (int32_t)rounded : INT32_MIN;
 #endif
 }
+#if defined(_M_X64) || defined(__x86_64__)
+/* cvtps2dq / cvttps2dq: the packed forms give exactly the per-lane
+ * results of the scalar cvtss2si / cvttss2si under the same MXCSR,
+ * including integer indefinite (0x80000000) for NaN, infinity and
+ * out-of-range lanes. tests/xmm_helpers pins the rounding corners
+ * (exact halves, the +-2^31 boundary) against the scalar path. */
+static inline RecompXmm XMM_CVT_PS2DQ(RecompXmm v, int truncate) {
+    __m128 f = RECOMP_XM_A(v);
+    __m128i d;
+    if (truncate) d = _mm_cvttps_epi32(f);
+    else          d = _mm_cvtps_epi32(f);
+    return RECOMP_XM_FROMI128(d);
+}
+#else
 static inline RecompXmm XMM_CVT_PS2DQ(RecompXmm v, int truncate) {
     RecompXmm r; int i;
     for (i = 0; i < 4; ++i) r.i[i] = MMX_CVT_F2I(v.f[i], truncate);
     return r;
 }
+#endif
 
 /** cvtpi2ps: two signed dwords in, two singles out, into the LOW half of the
  * destination -- lanes 2 and 3 keep whatever they held. That detail is the
  * whole instruction: code that builds a float4 from two of these relies on
  * the first one surviving the second. */
+#if defined(_M_X64) || defined(__x86_64__)
+/* MOVQ carries the two dwords into the low half, cvtdq2ps converts them,
+ * and the shuffle lays the pair over the destination's low half with
+ * 0xE4 -- lanes 2 and 3 of the destination pass through untouched, the
+ * "first one survives the second" contract the comment above spells out.
+ * Conversion rounding is the current MXCSR mode, as the scalar cast was. */
+static inline RecompXmm XMM_FROM_PI(RecompXmm dst, RecompMmx src)
+{
+    __m128 lo = _mm_cvtepi32_ps(_mm_cvtsi64_si128(src.q));
+    return RECOMP_XM_FROM128(_mm_shuffle_ps(lo, RECOMP_XM_A(dst), 0xE4));
+}
+#else
 static inline RecompXmm XMM_FROM_PI(RecompXmm dst, RecompMmx src)
 {
     dst.f[0] = (float)src.d[0];
     dst.f[1] = (float)src.d[1];
     return dst;
 }
+#endif
 
 static inline RecompMmx MMX_MEM(uint32_t addr) {
     RecompMmx r;
@@ -1356,6 +1717,173 @@ static inline uint8_t recomp_sat_u8(int32_t v) {
 static inline uint16_t recomp_sat_u16(int32_t v) {
     return (uint16_t)(v > 65535 ? 65535 : (v < 0 ? 0 : v));
 }
+
+/* -- integer arithmetic, lane-wise, wrapping --------------------
+ *
+ * x86-64: SSE2 is part of the ABI, so every helper below is one
+ * intrinsic over the value's 64 bits, carried in and out through
+ * MOVQ (_mm_cvtsi64_si128 / _mm_cvtsi128_si64). The same titles run
+ * their video decoders (XMV's IDCT and motion compensation are MMX
+ * throughout) through these, and a lane-at-a-time loop behind a
+ * function call is ten to fifty times the cost of the instruction.
+ * The 64-bit semantics are exact: the count of a variable shift is
+ * the whole register and saturates at the lane width, which is what
+ * PSRLW and friends already do. PSHUFW, PINSRW and PEXTRW stay
+ * scalar: MSVC demands compile-time immediates for their intrinsics,
+ * and the lifter does not guarantee one. */
+#if defined(_M_X64) || defined(__x86_64__)
+
+static inline RecompMmx RECOMP_MM_FROM128(__m128i x) {
+    RecompMmx r; r.q = _mm_cvtsi128_si64(x); return r;
+}
+#define RECOMP_MM_A(a) (_mm_cvtsi64_si128((a).q))
+#define RECOMP_MM_B(b) (_mm_cvtsi64_si128((b).q))
+
+#define RECOMP_MMX_INTRIN2(NAME, INTRIN)                                \
+    static inline RecompMmx NAME(RecompMmx a, RecompMmx b) {            \
+        return RECOMP_MM_FROM128(INTRIN(RECOMP_MM_A(a), RECOMP_MM_B(b))); \
+    }
+
+RECOMP_MMX_INTRIN2(MMX_PADDB, _mm_add_epi8)
+RECOMP_MMX_INTRIN2(MMX_PADDW, _mm_add_epi16)
+RECOMP_MMX_INTRIN2(MMX_PADDD, _mm_add_epi32)
+RECOMP_MMX_INTRIN2(MMX_PSUBB, _mm_sub_epi8)
+RECOMP_MMX_INTRIN2(MMX_PSUBW, _mm_sub_epi16)
+RECOMP_MMX_INTRIN2(MMX_PSUBD, _mm_sub_epi32)
+RECOMP_MMX_INTRIN2(MMX_PADDSB, _mm_adds_epi8)
+RECOMP_MMX_INTRIN2(MMX_PADDSW, _mm_adds_epi16)
+RECOMP_MMX_INTRIN2(MMX_PSUBSB, _mm_subs_epi8)
+RECOMP_MMX_INTRIN2(MMX_PSUBSW, _mm_subs_epi16)
+RECOMP_MMX_INTRIN2(MMX_PADDUSB, _mm_adds_epu8)
+RECOMP_MMX_INTRIN2(MMX_PADDUSW, _mm_adds_epu16)
+RECOMP_MMX_INTRIN2(MMX_PSUBUSB, _mm_subs_epu8)
+RECOMP_MMX_INTRIN2(MMX_PSUBUSW, _mm_subs_epu16)
+RECOMP_MMX_INTRIN2(MMX_PMULLW, _mm_mullo_epi16)
+RECOMP_MMX_INTRIN2(MMX_PMULHW, _mm_mulhi_epi16)
+RECOMP_MMX_INTRIN2(MMX_PAVGB, _mm_avg_epu8)
+RECOMP_MMX_INTRIN2(MMX_PAVGW, _mm_avg_epu16)
+RECOMP_MMX_INTRIN2(MMX_PMINSW, _mm_min_epi16)
+RECOMP_MMX_INTRIN2(MMX_PMAXSW, _mm_max_epi16)
+RECOMP_MMX_INTRIN2(MMX_PCMPEQB, _mm_cmpeq_epi8)
+RECOMP_MMX_INTRIN2(MMX_PCMPEQW, _mm_cmpeq_epi16)
+RECOMP_MMX_INTRIN2(MMX_PCMPEQD, _mm_cmpeq_epi32)
+RECOMP_MMX_INTRIN2(MMX_PCMPGTB, _mm_cmpgt_epi8)
+RECOMP_MMX_INTRIN2(MMX_PCMPGTW, _mm_cmpgt_epi16)
+RECOMP_MMX_INTRIN2(MMX_PCMPGTD, _mm_cmpgt_epi32)
+RECOMP_MMX_INTRIN2(MMX_PMADDWD, _mm_madd_epi16)
+RECOMP_MMX_INTRIN2(MMX_PAND, _mm_and_si128)
+RECOMP_MMX_INTRIN2(MMX_PANDN, _mm_andnot_si128)   /* dst = ~a & b, as the instruction reads */
+RECOMP_MMX_INTRIN2(MMX_POR, _mm_or_si128)
+RECOMP_MMX_INTRIN2(MMX_PXOR, _mm_xor_si128)
+
+/* The variable-count shifts take the whole 64-bit count; the hardware
+ * itself saturates it at the lane width (count >= 16 reads as 16), which
+ * is the same "zero lanes / sign fill" the scalar version clamps to. */
+static inline RecompMmx MMX_PSLLW(RecompMmx a, uint64_t cnt) {
+    return RECOMP_MM_FROM128(_mm_sll_epi16(RECOMP_MM_A(a),
+                                           _mm_cvtsi64_si128(cnt)));
+}
+static inline RecompMmx MMX_PSRLW(RecompMmx a, uint64_t cnt) {
+    return RECOMP_MM_FROM128(_mm_srl_epi16(RECOMP_MM_A(a),
+                                           _mm_cvtsi64_si128(cnt)));
+}
+static inline RecompMmx MMX_PSLLD(RecompMmx a, uint64_t cnt) {
+    return RECOMP_MM_FROM128(_mm_sll_epi32(RECOMP_MM_A(a),
+                                           _mm_cvtsi64_si128(cnt)));
+}
+static inline RecompMmx MMX_PSRLD(RecompMmx a, uint64_t cnt) {
+    return RECOMP_MM_FROM128(_mm_srl_epi32(RECOMP_MM_A(a),
+                                           _mm_cvtsi64_si128(cnt)));
+}
+static inline RecompMmx MMX_PSLLQ(RecompMmx a, uint64_t cnt) {
+    return RECOMP_MM_FROM128(_mm_sll_epi64(RECOMP_MM_A(a),
+                                           _mm_cvtsi64_si128(cnt)));
+}
+static inline RecompMmx MMX_PSRLQ(RecompMmx a, uint64_t cnt) {
+    return RECOMP_MM_FROM128(_mm_srl_epi64(RECOMP_MM_A(a),
+                                           _mm_cvtsi64_si128(cnt)));
+}
+static inline RecompMmx MMX_PSRAW(RecompMmx a, uint64_t cnt) {
+    return RECOMP_MM_FROM128(_mm_sra_epi16(RECOMP_MM_A(a),
+                                           _mm_cvtsi64_si128(cnt)));
+}
+static inline RecompMmx MMX_PSRAD(RecompMmx a, uint64_t cnt) {
+    return RECOMP_MM_FROM128(_mm_sra_epi32(RECOMP_MM_A(a),
+                                           _mm_cvtsi64_si128(cnt)));
+}
+
+/* The high unpacks take the upper half of each 64-bit operand, which is
+ * the lower unpack of each operand shifted down four bytes. The pack
+ * instructions fill a whole 128 bits from two operands; the MMX form's
+ * result is their low half. */
+static inline RecompMmx MMX_PUNPCKLBW(RecompMmx a, RecompMmx b) {
+    return RECOMP_MM_FROM128(_mm_unpacklo_epi8(RECOMP_MM_A(a), RECOMP_MM_B(b)));
+}
+static inline RecompMmx MMX_PUNPCKHBW(RecompMmx a, RecompMmx b) {
+    return RECOMP_MM_FROM128(_mm_unpacklo_epi8(
+        _mm_srli_si128(RECOMP_MM_A(a), 4), _mm_srli_si128(RECOMP_MM_B(b), 4)));
+}
+static inline RecompMmx MMX_PUNPCKLWD(RecompMmx a, RecompMmx b) {
+    return RECOMP_MM_FROM128(_mm_unpacklo_epi16(RECOMP_MM_A(a), RECOMP_MM_B(b)));
+}
+static inline RecompMmx MMX_PUNPCKHWD(RecompMmx a, RecompMmx b) {
+    return RECOMP_MM_FROM128(_mm_unpacklo_epi16(
+        _mm_srli_si128(RECOMP_MM_A(a), 4), _mm_srli_si128(RECOMP_MM_B(b), 4)));
+}
+static inline RecompMmx MMX_PUNPCKLDQ(RecompMmx a, RecompMmx b) {
+    return RECOMP_MM_FROM128(_mm_unpacklo_epi32(RECOMP_MM_A(a), RECOMP_MM_B(b)));
+}
+static inline RecompMmx MMX_PUNPCKHDQ(RecompMmx a, RecompMmx b) {
+    return RECOMP_MM_FROM128(_mm_unpacklo_epi32(
+        _mm_srli_si128(RECOMP_MM_A(a), 4), _mm_srli_si128(RECOMP_MM_B(b), 4)));
+}
+/* The pack instructions are the one place the 64-bit and 128-bit forms
+ * differ in shape: the MMX form's result is [sat(a) low dword, sat(b) high
+ * dword], while the XMM form lays a's sat over the low half and b's over
+ * the high half of 128 bits. Packing each operand against itself and
+ * taking a's low dword next to b's brings the XMM result back to the MMX
+ * layout. */
+static inline RecompMmx MMX_PACKSSWB(RecompMmx a, RecompMmx b) {
+    __m128i pa = _mm_packs_epi16(RECOMP_MM_A(a), RECOMP_MM_A(a));
+    __m128i pb = _mm_packs_epi16(RECOMP_MM_B(b), RECOMP_MM_B(b));
+    return RECOMP_MM_FROM128(_mm_unpacklo_epi32(pa, pb));
+}
+static inline RecompMmx MMX_PACKUSWB(RecompMmx a, RecompMmx b) {
+    __m128i pa = _mm_packus_epi16(RECOMP_MM_A(a), RECOMP_MM_A(a));
+    __m128i pb = _mm_packus_epi16(RECOMP_MM_B(b), RECOMP_MM_B(b));
+    return RECOMP_MM_FROM128(_mm_unpacklo_epi32(pa, pb));
+}
+static inline RecompMmx MMX_PACKSSDW(RecompMmx a, RecompMmx b) {
+    __m128i pa = _mm_packs_epi32(RECOMP_MM_A(a), RECOMP_MM_A(a));
+    __m128i pb = _mm_packs_epi32(RECOMP_MM_B(b), RECOMP_MM_B(b));
+    return RECOMP_MM_FROM128(_mm_unpacklo_epi32(pa, pb));
+}
+
+/* MOVEMASK over the zero-extended value leaves bits 8-15 clear, and SAD
+ * over it leaves the high half's partial sum zero: both read as the MMX
+ * form's 64-bit result without extra work. */
+static inline uint32_t MMX_PMOVMSKB(RecompMmx a) {
+    return (uint32_t)_mm_movemask_epi8(RECOMP_MM_A(a));
+}
+static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
+    return RECOMP_MM_FROM128(_mm_sad_epu8(RECOMP_MM_A(a), RECOMP_MM_B(b)));
+}
+
+/* Lane selectors MSVC refuses to take from a variable: scalar, and rare
+ * enough in a video decoder that it does not matter. */
+static inline RecompMmx MMX_PSHUFW(RecompMmx a, uint32_t imm) {
+    RecompMmx r; int i;
+    for (i = 0; i < 4; i++) r.uw[i] = a.uw[(imm >> (i * 2)) & 3];
+    return r;
+}
+static inline RecompMmx MMX_PINSRW(RecompMmx a, uint32_t v, uint32_t imm) {
+    RecompMmx r = a; r.uw[imm & 3] = (uint16_t)v; return r;
+}
+static inline uint32_t MMX_PEXTRW(RecompMmx a, uint32_t imm) {
+    return (uint32_t)a.uw[imm & 3];
+}
+
+#else /* x86-64 MMX intrinsics */
 
 /* -- integer arithmetic, lane-wise, wrapping -------------------- */
 #define RECOMP_MMX_BINOP(NAME, LANES, FIELD, EXPR)                      \
@@ -1399,8 +1927,8 @@ RECOMP_MMX_BINOP(MMX_PCMPGTD, 2, d, (int32_t)(a.d[i] > b.d[i] ? -1 : 0))
 /* pmaddwd: multiply signed words, add adjacent pairs into dwords. */
 static inline RecompMmx MMX_PMADDWD(RecompMmx a, RecompMmx b) {
     RecompMmx r;
-    r.d[0] = (int32_t)a.w[0] * b.w[0] + (int32_t)a.w[1] * b.w[1];
-    r.d[1] = (int32_t)a.w[2] * b.w[2] + (int32_t)a.w[3] * b.w[3];
+    r.ud[0] = (uint32_t)((int64_t)a.w[0] * b.w[0] + (int64_t)a.w[1] * b.w[1]);
+    r.ud[1] = (uint32_t)((int64_t)a.w[2] * b.w[2] + (int64_t)a.w[3] * b.w[3]);
     return r;
 }
 
@@ -1515,6 +2043,8 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
     r.q = 0; r.uw[0] = (uint16_t)s;
     return r;
 }
+
+#endif /* x86-64 MMX intrinsics */
 
 #define xmm0 g_xmm0
 #define xmm1 g_xmm1

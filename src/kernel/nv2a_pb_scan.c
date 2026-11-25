@@ -51,7 +51,19 @@ static uint32_t s_tot_calls;
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
+
+/* One word to the executor. SET_TRANSFORM_CONSTANT words, the bulk of a
+ * skinning title's stream, take the executor's short path (see
+ * nv2a_pb_exec_constant_word). */
+static void exec_word(uint32_t subch, uint32_t method, uint32_t param)
+{
+    if (subch == 0 && method >= 0x0B80u && method < 0x0C00u
+            && nv2a_pb_exec_constant_word(method, param))
+        return;
+    nv2a_pb_exec_method(subch, method, param);
+}
 static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
 
@@ -140,8 +152,8 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x17FC, "SET_BEGIN_END" },
     { 0x1800, "ARRAY_ELEMENT16" },
     { 0x1808, "ARRAY_ELEMENT32" },
-    { 0x1818, "INLINE_ARRAY" },
     { 0x1810, "DRAW_ARRAYS" },
+    { 0x1818, "INLINE_ARRAY" },
     { 0x1B00, "SET_TEXTURE_OFFSET" },
     { 0x1B04, "SET_TEXTURE_FORMAT" },
     { 0x1B08, "SET_TEXTURE_ADDRESS" },
@@ -295,7 +307,7 @@ static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
          * acts. Keeping them on one decode means they can never
          * disagree about what the stream said. */
         if (s_exec_enabled)
-            nv2a_pb_exec_method(s_pend_subch, m, param);
+            exec_word(s_pend_subch, m, param);
         s_get = (s_get + 4) & PB_PHYS_MASK;
         s_pend_i++;
         s_pend_left--;
@@ -469,6 +481,11 @@ int nv2a_pb_dma_walk(void)
  * wrap is handled by the caller, which scans the two pieces separately.
  * Addresses are physical, like PUT's, and reach guest memory through the
  * contiguous window. */
+/* Whether the walk is inside a pushbuffer CALL, for the executor: a flip
+ * hold is only armed at the top level (nv2a_pb_exec.c). */
+static int s_in_call;
+int nv2a_pb_scan_in_call(void) { return s_in_call; }
+
 static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                                 uint32_t *jumps, uint32_t *unknown)
 {
@@ -516,7 +533,9 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             if (!in_call) {
                 uint32_t sub = 0x80000000u | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
                 s_tot_calls++;
+                s_in_call = 1;
                 words += pb_walk_segment(sub, sub + 0x400000u, 1, jumps, unknown);
+                s_in_call = 0;
             }
             continue;
         }
@@ -530,8 +549,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
                 if (s_exec_enabled)
-                    nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
+                    exec_word(subch, m, *(const uint32_t *)(mem + va));
                 va += 4;
                 words++;
             }
@@ -551,6 +569,10 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 
+    if (s_exec_enabled) {
+        extern void nv2a_pb_exec_walk_begin(void);
+        nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
+    }
     words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
 
     s_tot_words += words;

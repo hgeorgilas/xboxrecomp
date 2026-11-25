@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nv2a_backend.h"
+#include "nv2a_backend_fixture.h"
 
 #define MEM_BYTES 0x10000u
 static uint8_t s_mem[MEM_BYTES];
@@ -40,6 +41,12 @@ void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
 void xbox_Nv2aFrameCounterFlip(void) {}
+/* The flip hold (nv2a_flip_hold.c, linked in). No vblank moves here, so the
+ * executor never holds a flip; the walk is never inside a pushbuffer CALL. */
+int nv2a_pb_scan_in_call(void) { return 0; }
+uint32_t xbox_VblankCount(void) { return 0; }
+uint64_t xbox_HostNowNs(void) { return 0; }
+uint32_t xbox_Nv2aFrameCountersOwned(void) { return 0; }
 
 static volatile uint32_t s_pgraph_400b10;
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
@@ -48,41 +55,7 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
 }
 
 /* ---- the fake back end ------------------------------------------------- */
-static struct {
-    int draws, clears, flips;
-    Nv2aSurface surf;
-    Nv2aRenderState rs;
-    uint32_t count;
-    Nv2aVertex v[8];
-    int textured;
-    uint32_t clear_flags, clear_argb;
-} s_be;
-
-static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
-                     uint32_t flags, uint32_t argb, uint32_t zstencil)
-{
-    (void)s; (void)rs; (void)zstencil;
-    s_be.clears++;
-    s_be.clear_flags = flags;
-    s_be.clear_argb = argb;
-}
-
-static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
-{
-    uint32_t i;
-
-    s_be.draws++;
-    s_be.surf = *s;
-    s_be.rs = *b->state;
-    s_be.count = b->count;
-    s_be.textured = b->texture != NULL;
-    for (i = 0; i < b->count && i < 8; i++)
-        s_be.v[i] = b->vertices[i];
-}
-
-static void be_flip(void) { s_be.flips++; }
-
-static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip };
+static Nv2aBackendFixture s_be;
 
 /* ---- driving the executor ---------------------------------------------- */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
@@ -100,7 +73,15 @@ int main(void)
 {
     uint32_t i;
 
-    nv2a_backend_register(&s_backend);
+    nv2a_backend_fixture_init(&s_be);
+    nv2a_backend_register(nv2a_backend_fixture_bind(&s_be));
+
+    /* The flip hold is opt-in: unset, RECOMP_FLIP_PACING leaves every flip
+     * completing at once and method 0x100 an unhandled no-op, as before. */
+    if (!getenv("RECOMP_FLIP_PACING")) {
+        extern int nv2a_pb_exec_flip_pacing(void);
+        CHECK(nv2a_pb_exec_flip_pacing() == 0);
+    }
 
     /* A 640x480 surface at 2x2 anti-aliasing: SET_SURFACE_CLIP is in logical
      * pixels, the real surface is 1280x960 with a 5120-byte pitch. */
@@ -214,6 +195,29 @@ int main(void)
     CHECK(s_be.surf.aa_sx == 1 && s_be.surf.width == 640);
     CHECK(near_(s_be.v[1].x, 640.0f) && near_(s_be.v[1].y, 480.0f));
 
+    /* A triangle strip of four vertices is two triangles. With
+     * RECOMP_STRIP_ALT_WINDING the second one (odd) is emitted with its first two
+     * vertices swapped so it winds like the first; without it the strip's order
+     * is kept (the test runs once each way). Vertex 3 is at (1, 1). */
+    {
+        const int alt = getenv("RECOMP_STRIP_ALT_WINDING") != NULL;
+
+        putf(0x2024, 1); putf(0x2028, 1); putf(0x202C, 0);
+        put32(0x300C, 0xFF804020u);
+        putf(0x4024, 0); putf(0x4028, 0); putf(0x402C, 1);
+        m(0x17FC, 6); m(0x1810, 3u << 24); m(0x17FC, 0);       /* TRIANGLE_STRIP, 4 vertices */
+        CHECK(s_be.count == 6);
+        /* triangle 0 is vertices 0 1 2 either way */
+        CHECK(near_(s_be.v[0].x, 0.0f)   && near_(s_be.v[1].x, 640.0f) && near_(s_be.v[2].x, 320.0f));
+        if (alt) {                                   /* triangle 1: 2 1 3 */
+            CHECK(near_(s_be.v[3].x, 320.0f) && near_(s_be.v[4].x, 640.0f) && near_(s_be.v[5].x, 640.0f));
+            CHECK(near_(s_be.v[3].y, 0.0f)   && near_(s_be.v[4].y, 480.0f) && near_(s_be.v[5].y, 0.0f));
+        } else {                                     /* triangle 1: 1 2 3 */
+            CHECK(near_(s_be.v[3].x, 640.0f) && near_(s_be.v[4].x, 320.0f) && near_(s_be.v[5].x, 640.0f));
+            CHECK(near_(s_be.v[3].y, 480.0f) && near_(s_be.v[4].y, 0.0f)   && near_(s_be.v[5].y, 0.0f));
+        }
+    }
+
     /* A garbage index (the walk is 32 bits wide now) must not reach outside
      * guest memory: start 0xFFFFFF at a 12-byte stride is 200 MB past the
      * array, and the batch is dropped instead of read. The test buffer is
@@ -263,6 +267,7 @@ int main(void)
     CHECK(s_be.flips == 0);
     m(0x0130, 0);                                     /* FLIP_STALL */
     CHECK(s_be.flips == 1);
+    CHECK(s_be.thread_mismatches == 0 && s_be.dropped_events == 0);
 
     if (!s_fail)
         printf("nv2a fixed-function path through a back end: ok\n");

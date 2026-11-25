@@ -1,5 +1,7 @@
 # The Register Model
 
+> Part of the [Documentation Index](../INDEX.md)
+
 How global registers enable correct static recompilation of x86 Xbox code to C.
 
 ## The Problem
@@ -141,12 +143,13 @@ Push and pop operations read/write through the MEM macros, which translate Xbox 
 } while(0)
 
 #define POP32(sp, dst) do { \
-    (dst) = MEM32(sp); \
+    uint32_t _pv = MEM32(sp); \
     (sp) += 4; \
+    (dst) = _pv; \
 } while(0)
 ```
 
-Note that PUSH32 evaluates `val` before decrementing `sp`. This matches x86 semantics where `push [esp+N]` reads the operand at the old ESP before adjusting.
+Note that PUSH32 evaluates `val` before decrementing `sp`. This matches x86 semantics where `push [esp+N]` reads the operand at the old ESP before adjusting. `POP32` writes `dst` *after* incrementing `sp`, so `pop esp` leaves ESP equal to the popped value, as on x86.
 
 ## Calling Convention: void(void)
 

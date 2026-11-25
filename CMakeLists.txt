@@ -34,8 +34,18 @@ add_subdirectory(src/platform)
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)
 add_subdirectory(src/kernel)
 
-# Graphics: D3D8 → D3D11 compatibility layer
-add_subdirectory(src/d3d)
+# Graphics: bundled D3D8 compatibility layer. Embedding projects that use the
+# pushbuffer executor directly may omit it, or define their own xbox_d3d8
+# target before adding xboxrecomp.
+option(XBOXRECOMP_BUILD_D3D8 "Build the bundled xbox_d3d8 compatibility layer" ON)
+if(NOT TARGET xbox_d3d8)
+    if(XBOXRECOMP_BUILD_D3D8)
+        add_subdirectory(src/d3d)
+    elseif(WIN32)
+        message(FATAL_ERROR
+            "XBOXRECOMP_BUILD_D3D8=OFF on Windows requires a replacement xbox_d3d8 target")
+    endif()
+endif()
 
 # Audio: DirectSound → software mixer compatibility
 add_subdirectory(src/audio)
@@ -62,9 +72,11 @@ endif()
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
-set(XBOXRECOMP_LIBS
-    xbox_kernel
-    xbox_d3d8
+set(XBOXRECOMP_LIBS xbox_kernel)
+if(TARGET xbox_d3d8)
+    list(APPEND XBOXRECOMP_LIBS xbox_d3d8)
+endif()
+list(APPEND XBOXRECOMP_LIBS
     xbox_dsound
     xbox_input
     xbox_usb
@@ -84,5 +96,25 @@ else()
 endif()
 if(WIN32)
     target_link_libraries(xboxrecomp INTERFACE xbox_ui)
+endif()
+
+# ── C regression tests ────────────────────────────────────────
+#
+# The tests under tests/ are self-contained CMake projects that can also be
+# built alone; listing them here puts them under the root build's ctest, so
+# one `cmake --build && ctest` covers them alongside whatever else a
+# workspace builds. The Python side (lifter unit tests, conformance) stays
+# with pytest -- see CONTRIBUTING.md.
+# Off when a game pulls the toolkit in with add_subdirectory.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(_xbr_tests_default ON)
+else()
+    set(_xbr_tests_default OFF)
+endif()
+option(XBOXRECOMP_BUILD_TESTS "Build the C regression tests" ${_xbr_tests_default})
+if(XBOXRECOMP_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests/mmx_helpers)
+    add_subdirectory(tests/xmm_helpers)
 endif()
 

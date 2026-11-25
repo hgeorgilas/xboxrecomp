@@ -163,14 +163,14 @@ def list_categories(translator):
 
 
 def _report_unimplemented(stats):
-    """List the mnemonics that were emitted as TODO comments.
+    """List the mnemonics emitted with RECOMP_UNIMPL runtime markers.
 
-    An unimplemented instruction is not a build error -- it is a comment, and
-    the generated function keeps running with whatever the destination already
-    held. That is the worst kind of failure: it looks like it worked. Wreckless
-    booted for weeks with `bsf eax, ecx` translated to nothing, which made the
-    CRT heap's free-list bitmap scan return its own argument and hand out the
-    address of an empty list head.
+    An unimplemented instruction is not a build error. Its effects remain a
+    no-op, but the generated function calls RECOMP_UNIMPL with the instruction
+    and guest address before it continues. The runtime can therefore report or
+    trap the omission. Wreckless booted for weeks with `bsf eax, ecx`
+    translated to nothing, which made the CRT heap's free-list bitmap scan
+    return its own argument and hand out the address of an empty list head.
 
     Sorted by count, with one example address each so the caller can go and
     look at it.
@@ -179,7 +179,8 @@ def _report_unimplemented(stats):
     if not unimplemented:
         return
     total = sum(len(a) for a in unimplemented.values())
-    print(f"{total} instruction(s) unimplemented, emitted as no-op comments "
+    print(f"{total} instruction(s) unimplemented, emitted as RECOMP_UNIMPL "
+          f"runtime calls "
           f"({len(unimplemented)} distinct mnemonics):", file=sys.stderr)
     ranked = sorted(unimplemented.items(),
                     key=lambda kv: (-len(kv[1]), kv[0]))
@@ -271,6 +272,19 @@ def main():
     parser.add_argument("--coalesce-functions", metavar="JSON", action="append",
                         help="Explicit owner bounds and false interior starts "
                              "to merge before translation; repeatable")
+    parser.add_argument("--entry-stubs", action="store_true",
+                        help="Stub an unresolved target that lies inside a "
+                             "known function with a copy of that function "
+                             "entered at the target, instead of a plain "
+                             "return. Each target is a full copy, so it can "
+                             "grow the generated code a lot. Off by default")
+    parser.add_argument("--back-edge-yield", action="store_true",
+                        help="Call RECOMP_BACK_EDGE, the guest CPU's quantum "
+                             "check, at every loop back edge. The guest CPU "
+                             "lock (RECOMP_GUEST_LOCK=1) needs it to preempt "
+                             "a loop that makes no kernel call; it costs a "
+                             "load and a branch per edge when the lock is "
+                             "off. Off by default: edges stay bare")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -348,6 +362,8 @@ def main():
         icall_sites_json_path=args.icall_sites or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "output",
             "icall_sites.json"),
+        back_edge_yield=args.back_edge_yield,
+        entry_stubs=args.entry_stubs,
     )
 
     t_load = time.time() - t0

@@ -176,11 +176,15 @@ int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
 /* Advance those counters now, because a swap really completed. Called by the
  * pushbuffer executor on FLIP_STALL; while these arrive the 60 Hz fallback
- * stands down, so the count follows what was actually drawn. */
+ * stands down, so the count follows what was actually drawn. A counter the
+ * title is seen to move itself is no longer bumped by either. */
 void xbox_Nv2aFrameCounterFlip(void);
 /* A word of the NV2A register file (offset from the register base); NULL until
  * the aperture is mapped. */
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
+/* Registered counters the title turned out to move itself (its vblank DPC),
+ * which the toolkit has stopped bumping; for the [GPU] report. */
+uint32_t xbox_Nv2aFrameCountersOwned(void);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
@@ -209,11 +213,23 @@ const volatile uint8_t *xbox_ContiguousPageMap(void);
 /* MmGetPhysicalAddress named this VA; recorded if it is a heap page below
  * 64 MB (the image and stacks are not recorded). */
 void xbox_PhysNoteRamName(uint32_t va);
+/* The physical number MmGetPhysicalAddress gives a RAM address (one outside
+ * the window): a heap page below 64 MB gets its alias in the first RAM mirror
+ * (va + xbox_PhysRamAlias()), so no window page shares the number; anything
+ * else, or every address when there is no alias, is the identity, and a heap
+ * page is then recorded with xbox_PhysNoteRamName. */
+uint32_t xbox_PhysRamName(uint32_t va);
+/* What xbox_PhysRamName adds to a heap page: the RAM size when the first
+ * mirror is mapped and RECOMP_PHYS_RAM_ALIAS is not 0, else 0. */
+uint32_t xbox_PhysRamAlias(void);
 /* One byte per 4 KB physical page below 64 MB, nonzero while the title holds
  * a RAM name for a heap page there (see xbox_PhysNoteRamName); cleared when
  * no live heap block covers the page any more. Read without a lock; a device
  * model's view. */
 const volatile uint8_t *xbox_PhysRamNameMap(void);
+/* Whether physical byte `pa` lies in a live heap block the title named:
+ * the page map refined to the block (see xbox_PhysRamNamedAt). */
+int xbox_PhysRamNamedAt(uint32_t pa);
 uint32_t xbox_ContiguousInUseBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
@@ -227,7 +243,6 @@ int xbox_EvalChain(const char *expr, uint32_t *out);
 /* Keep the NV2A interrupt-status registers (PMC_INTR, PCRTC_INTR) from being
  * acknowledged by the runtime while a vblank is delivered (on = 1), then
  * release (on = 0). Lapses on its own after 100 us. */
-void xbox_Nv2aIntrHold(int on);
 /* Where the mirrored fence word is (0 if none is registered or it does not
  * resolve into the contiguous window). For the pushbuffer executor. */
 uint32_t xbox_Nv2aFenceWordVa(void);

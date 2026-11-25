@@ -1,5 +1,7 @@
 # Step 6: Iterative Debugging
 
+> Part of the [Documentation Index](../INDEX.md)
+
 ## The Reality
 
 The game will crash. Constantly. The first boot attempt will fail within milliseconds. You will fix one crash, and the next instruction will crash differently. This is normal and expected.
@@ -316,9 +318,18 @@ Wreckless did exactly this and reached its main loop with no renderer set up.
   `RECOMP_PB_EXEC=1` actually consumes the pushbuffer.
 - `RECOMP_WATCHDOG_SECS=N` dumps registers, PUT/GET and the guest stack when
   the title stops making progress -- it names the wait.
+- `RECOMP_WAIT_LOG=1` prints one `[WAIT]` line to stderr for each
+  single-object wait (`NtWaitForSingleObject`, `NtWaitForSingleObjectEx`,
+  `KeWaitForSingleObject`) that timed out or lasted 500 ms or more, with the
+  thread id, handle, timeout and result. It changes no wait; it shows which
+  handle a stalled thread keeps waiting on.
 - `RECOMP_WATCH=<va>` names the guest code that writes a value (a callback
   table slot, a "ready" flag); `RECOMP_UNIMPL_TRAP=1` stops at the first
   untranslated instruction that is actually reached.
+- `RECOMP_STUB_LOG=1` prints each unresolved stub (code no pass found, in
+  `recomp_stubs_unresolved.c`) the first time it runs, with the return address
+  and esp. Reaching one skips that code, so a stall or a wrong value far
+  downstream can start there.
 
 A shim that makes a wait return without making the thing it waits for happen
 usually moves the stall rather than fixing it. Find the probe that failed.

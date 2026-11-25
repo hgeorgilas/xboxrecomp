@@ -1,3 +1,4 @@
+cmake_minimum_required(VERSION 3.20)
 # d3d8_smoke - offline smoke test for the pure xbox_d3d8 format layer.
 # Compiles the real d3d8_resources.c + d3d8_swizzle.h with lightweight device
 # accessor stubs so the format tables, predicates, swizzle classification and
@@ -35,4 +36,13 @@ if(WIN32)
     )
     target_include_directories(d3d8_a8 PRIVATE ../../src/d3d)
     target_link_libraries(d3d8_a8 PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
+
+    # Combiner shaders: one compile per HLSL text, and no lookup while the
+    # state is unchanged, on WARP.
+    add_executable(d3d8_combiner_reuse
+        test_combiner_reuse.c
+        ../../src/d3d/d3d8_combiners.c
+    )
+    target_include_directories(d3d8_combiner_reuse PRIVATE ../../src/d3d)
+    target_link_libraries(d3d8_combiner_reuse PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
 endif()

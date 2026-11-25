@@ -1,5 +1,7 @@
 # Step 4: x86 to C Lifting
 
+> Part of the [Documentation Index](../INDEX.md)
+
 ## Overview
 
 This is the core of the static recompiler. The lifter takes each x86 instruction from the disassembly output and translates it to equivalent C code. The result is a massive C codebase that, when compiled with a native compiler (MSVC or GCC), produces a Windows executable that behaves identically to the original Xbox code.
@@ -86,14 +88,15 @@ The Xbox stack lives in Xbox memory. `g_esp` is an Xbox virtual address pointing
     MEM32(sp) = _pv;                   \
 } while(0)
 
-// Pop: read value, then increment ESP
+// Pop: read value, increment ESP, then write dst
 #define POP32(sp, dst) do {            \
-    (dst) = MEM32(sp);                 \
+    uint32_t _pv = MEM32(sp);          \
     (sp) += 4;                         \
+    (dst) = _pv;                       \
 } while(0)
 ```
 
-Note that `PUSH32` evaluates the value *before* decrementing `sp`. This matches x86 semantics where `push [esp+N]` reads the operand at the old ESP before adjusting.
+Note that `PUSH32` evaluates the value *before* decrementing `sp`. This matches x86 semantics where `push [esp+N]` reads the operand at the old ESP before adjusting. `POP32` writes `dst` *after* incrementing `sp`, so `pop esp` leaves ESP equal to the popped value, as on x86.
 
 The stack is initialized to `XBOX_STACK_TOP` (0x00F7FFF0) -- the top of an 8 MB region allocated in Xbox memory space.
 

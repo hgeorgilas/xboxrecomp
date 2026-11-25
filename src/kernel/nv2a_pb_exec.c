@@ -4310,3 +4310,18 @@ void nv2a_pb_exec_report(void)
     }
     }    fflush(stderr);
 }
+
+/* Hooks upstream's executor provides for its opt-in flip hold
+ * (RECOMP_FLIP_PACING) and the transform-constant short path. This
+ * executor paces flips itself (RECOMP_FLIP_HZ) and runs every constant
+ * through nv2a_pb_exec_method, so: no pacing, nothing held, and the short
+ * path declines (the caller then takes the method path). */
+int nv2a_pb_exec_flip_pacing(void) { return 0; }
+int nv2a_pb_exec_flip_poll(void) { return 0; }
+void nv2a_pb_exec_walk_begin(void) {}
+int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
+{
+    (void)method;
+    (void)param;
+    return 0;
+}

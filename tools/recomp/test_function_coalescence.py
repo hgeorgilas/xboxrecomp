@@ -44,7 +44,7 @@ def translator(body=CLAMP, splits=SPLITS):
 def test_repaired_clamp_matches_unsplit_translation():
     split = translator()
     old = split.translate_function(SPLITS[1], split.func_db[SPLITS[1]])
-    assert "if (_flags /* jge" in old
+    assert "/* eflags */" in old
     # Translation does not discover ownership, so it is safe to recover here.
     split.coalesce_function(BASE, END, SPLITS)
     repaired = split.translate_function(BASE, split.func_db[BASE])
@@ -1323,6 +1323,34 @@ def test_resync_recomputes_register_jump_edges():
     case_block = next(block for block in blocks if block.start == leader)
     assert continuation in case_block.successors
     assert continuation in subject.lifter.imm_code_refs
+
+
+def test_direct_jump_past_inline_data_is_resynced():
+    # jmp +5; an unreachable nop; then data that decodes as mov eax, imm32
+    # and swallows the ret the jump lands on (DOA3 JP 0x72FB8 -> 0x72FE0
+    # past a jump table). The prune runs on the resynced blocks.
+    raw = bytes.fromhex("e90500000090b8112233c3")
+    target = BASE + 10
+    subject = translator(raw, [])
+
+    instructions, blocks = subject.decode_function(BASE, BASE + len(raw))
+
+    assert [block.start for block in blocks] == [BASE, target]
+    assert [(insn.address, insn.mnemonic) for insn in instructions] == [
+        (BASE, "jmp"), (target, "ret")]
+
+
+def test_resync_evicts_stale_decode_inside_real_instruction():
+    # jmp to BASE+7; data c1 e0 decodes as shl eax,imm8 and swallows the a1
+    # of mov eax,[imm32] at BASE+7, leaving stale sbb/lds decodes inside it
+    # (DOA3 JP 0x18A210, where the leftover lds ran after the real mov).
+    raw = bytes.fromhex("e902000000c1e0a11c8ec500c3")
+    subject = translator(raw, [])
+
+    instructions, _ = subject.decode_function(BASE, BASE + len(raw))
+
+    assert [(insn.address, insn.mnemonic) for insn in instructions] == [
+        (BASE, "jmp"), (BASE + 7, "mov"), (BASE + 12, "ret")]
 
 
 @pytest.mark.parametrize("table_index", [0, 1])
