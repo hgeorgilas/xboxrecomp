@@ -1236,6 +1236,15 @@ static void voice_process(MCPXAPUState *d,
     }
 
     /* HRTF processing for 3D voices */
+    {
+        extern int apu_env_on(const char *name);
+        static int env = -1;
+        if (env < 0) {
+            env = apu_env_on("RECOMP_APU_HRTF");
+            if (env)
+                g_config.audio.hrtf = true;
+        }
+    }
     if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf) {
         uint16_t hrtf_handle =
             (uint16_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,

@@ -370,7 +370,10 @@ static struct {
 } g_config = {
     .audio = {
         .volume_limit = 1.0f,
-        .hrtf = true,       /* xemu's default */
+        /* Off, unlike xemu: on, every positional voice -- Spartan's sound
+         * effects -- came out muffled and pushed behind the music, with a
+         * faint echo. RECOMP_APU_HRTF=1 turns it on (apu_vp.c). */
+        .hrtf = false,
         .vp = { .num_workers = 1 },
     },
 };
