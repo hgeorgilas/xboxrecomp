@@ -3431,6 +3431,8 @@ static int dpc_pop(PendingDpc *d)
 static int kernel_drain_dpcs(int *ran)
 {
     *ran = 0;
+    /* For the [STORM] line: how long ago the timer thread last drained. */
+    InterlockedExchange(&g_last_dpc_drain_ms, (LONG)GetTickCount());
     for (;;) {
         PendingDpc d;
         /* A DPC runs only while the one-CPU gate is free (no thread at
